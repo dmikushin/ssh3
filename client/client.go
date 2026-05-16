@@ -585,13 +585,14 @@ func disableMulticastAll(uc *net.UDPConn) error {
     return serr
 }
 
-// ListenUDPWithAutoMulticast listens on udpAddr.
-// If udpAddr.IP is multicast, it binds to the wildcard address on the same
-// family+port and joins the multicast group. Otherwise it just listens normally.
-//
-// If ifaceName is non-empty, it will join only on that interface.
-// Otherwise it tries all "up" multicast-capable interfaces (excluding loopback).
-func ListenUDPWithAutoMulticast(udpAddr *net.UDPAddr, ifaceName string, conn *net.UDPConn ) (*net.UDPConn, error) {
+// ListenUDPWithAutoMulticast listens on udpAddr.  For a non-multicast
+// destination it is a thin wrapper over net.ListenUDP in the right address
+// family.  For a multicast group it always opens a fresh socket (bound to
+// the wildcard address in the right family with SO_REUSEADDR/REUSEPORT),
+// disables IP_MULTICAST_ALL on Linux and joins the group on every
+// up/multicast-capable interface, or on the named interface if ifaceName
+// is non-empty.
+func ListenUDPWithAutoMulticast(udpAddr *net.UDPAddr, ifaceName string) (*net.UDPConn, error) {
 	if udpAddr == nil {
 		return nil, fmt.Errorf("nil UDPAddr")
 	}
@@ -608,7 +609,9 @@ func ListenUDPWithAutoMulticast(udpAddr *net.UDPAddr, ifaceName string, conn *ne
 		return net.ListenUDP(network, udpAddr)
 	}
 
-	// Multicast: bind to wildcard in the right family.
+	// Multicast: bind to wildcard in the right family.  We must always
+	// open a fresh socket here; sharing a socket across distinct group
+	// memberships defeats per-group join semantics on Linux.
 	var bind *net.UDPAddr
 	var network string
 	if isV4 {
@@ -619,22 +622,16 @@ func ListenUDPWithAutoMulticast(udpAddr *net.UDPAddr, ifaceName string, conn *ne
 		network = "udp6"
 	}
 
-	var err error
-	conn = nil
-	//It must be always a new connection. Otherwise, we are not subscribing correctly.
-	if conn == nil {
-		//conn, err = net.ListenUDP(network, bind)
-		conn, err = ListenUDPReuse(context.Background(), network, bind)		
-		if err != nil {
-			return nil, fmt.Errorf("listen: %w", err)
-		}
-		// Linux: ensure we only receive groups we actually join.
-		if err := disableMulticastAll(conn); err != nil {
-			// consider returning the error; otherwise log loudly
-			return nil, fmt.Errorf("disableMulticastAll: %w", err)
-		}
+	conn, err := ListenUDPReuse(context.Background(), network, bind)
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
 	}
-	
+	// Linux: ensure we only receive groups we actually join.
+	if err := disableMulticastAll(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("disableMulticastAll: %w", err)
+	}
+
 	// Join group (same join helpers as before)
 	if isV4 {
 		p := ipv4.NewPacketConn(conn)
@@ -726,13 +723,12 @@ func joinOnInterfacesV6(p *ipv6.PacketConn, group *net.UDPAddr, ifaceName string
 
 
 
-func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remoteUDPAddr *net.UDPAddr, multconn *net.UDPConn) (*net.UDPAddr, *net.UDPConn, error) {
+func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remoteUDPAddr *net.UDPAddr) (*net.UDPAddr, error) {
 	log.Debug().Msgf("start UDP forwarding from %s to %s", localUDPAddr, remoteUDPAddr)
-	//conn, err := net.ListenUDP("udp", localUDPAddr)
-	conn, err := ListenUDPWithAutoMulticast(localUDPAddr,"",multconn)
+	conn, err := ListenUDPWithAutoMulticast(localUDPAddr, "")
 	if err != nil {
 		log.Error().Msgf("could not listen on UDP socket: %s", err)
-		return nil, nil, err
+		return nil, err
 	}
     // Close everything when ctx is canceled.
 
@@ -776,7 +772,7 @@ func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remo
 			}
 		}
 	}()
-	return conn.LocalAddr().(*net.UDPAddr), conn, nil
+	return conn.LocalAddr().(*net.UDPAddr), nil
 }
 
 func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remoteTCPAddr *net.TCPAddr) (*net.TCPAddr, error) {
@@ -811,11 +807,19 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 //
 // Return values:
 //   - ok=true                          listener was opened on the server.
-//   - ok=false, err!=nil               server reported a failure; err carries
-//                                      the reason string sent by the server.
-//   - ok=false, err==nil, legacy=true  timeout or empty/malformed reply;
-//                                      assume a server that predates this
-//                                      handshake (e.g. PR-148 baseline).
+//   - ok=false, err!=nil               server reported a failure (with the
+//                                      reason string it sent), or sent
+//                                      data we cannot interpret as part of
+//                                      this protocol (likely version skew
+//                                      or corruption).
+//   - ok=false, err==nil, legacy=true  the peer never sent any setup data
+//                                      (read timeout, or EOF before any
+//                                      bytes).  Assume a server that
+//                                      predates this handshake.
+//
+// Anything *other* than "no data at all" is treated as a real signal:
+// either a known ack or a protocol error.  Silently ignoring unknown
+// opcodes here would defeat the whole point of the handshake.
 func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, legacy bool, err error) {
 	type readResult struct {
 		msg ssh3Messages.Message
@@ -837,8 +841,14 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 			return false, false, r.err
 		}
 		dm, isData := r.msg.(*ssh3Messages.DataOrExtendedDataMessage)
-		if !isData || len(dm.Data) == 0 {
-			return false, true, nil
+		if !isData {
+			return false, false, fmt.Errorf("unexpected %T on reverse-forward setup channel", r.msg)
+		}
+		if dm.DataType != ssh3Messages.SSH_EXTENDED_DATA_NONE {
+			return false, false, fmt.Errorf("unexpected extended-data type %d on reverse-forward setup channel", dm.DataType)
+		}
+		if len(dm.Data) == 0 {
+			return false, false, fmt.Errorf("empty reverse-forward setup message")
 		}
 		switch dm.Data[0] {
 		case ssh3.ReverseSetupAckOK:
@@ -850,7 +860,7 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 			}
 			return false, false, fmt.Errorf("%s", reason)
 		default:
-			return false, true, nil
+			return false, false, fmt.Errorf("unknown reverse-forward setup opcode 0x%02x", dm.Data[0])
 		}
 	case <-time.After(timeout):
 		channel.CancelRead()

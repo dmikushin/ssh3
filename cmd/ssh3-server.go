@@ -642,15 +642,17 @@ func handleTCPForwardingChannel(ctx context.Context, user *unix_util.User, conv 
 // the client on the same channel using the ssh3.ReverseSetupAck{OK,Fail}
 // constants (see channel.go).
 //
-// writeReverseSetupAck sends one such status message.  Errors are only
-// logged because by the time we get here the listener has already either
-// succeeded or failed and the channel will be closed by the caller in the
-// failure path anyway.
-func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) {
+// writeReverseSetupAck sends one such status message.  The caller is
+// responsible for tearing down any resources (listener, channel) if the
+// write fails: a successful Listen* followed by a failed ack write means
+// the client has timed us out and the listener would otherwise be orphaned
+// on this side.
+func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) error {
 	buf := append([]byte{status}, []byte(reason)...)
 	if _, err := channel.WriteData(buf, ssh3Messages.SSH_EXTENDED_DATA_NONE); err != nil {
-		log.Warn().Msgf("could not write reverse-forward setup ack: %s", err)
+		return fmt.Errorf("write reverse-forward setup ack: %w", err)
 	}
+	return nil
 }
 
 //Copied from client.go ForwardTCP()
@@ -658,11 +660,25 @@ func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 	conn, err := net.ListenTCP("tcp", channel.LocalAddr)
 	if err != nil {
 		log.Error().Msgf("could not listen on TCP %s: %s", channel.LocalAddr, err)
-		writeReverseSetupAck(channel, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen tcp %s: %s", channel.LocalAddr, err))
+		// Best-effort: tell the client why we are giving up.  We do not
+		// care if this ack write also fails - the channel is about to
+		// be closed and the client will see EOF.
+		_ = writeReverseSetupAck(channel, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen tcp %s: %s", channel.LocalAddr, err))
 		channel.Close()
 		return err
 	}
-	writeReverseSetupAck(channel, ssh3.ReverseSetupAckOK, "")
+	if ackErr := writeReverseSetupAck(channel, ssh3.ReverseSetupAckOK, ""); ackErr != nil {
+		// We successfully opened the listener but the client is no
+		// longer there to receive our confirmation (e.g. it hit its
+		// own ack timeout).  Closing the listener here prevents a
+		// resource leak: without this, the socket would stay bound
+		// and silently accept connections that nobody would ever
+		// relay through the QUIC tunnel.
+		log.Error().Msgf("reverse TCP %s: ack write failed, closing orphan listener: %s", channel.LocalAddr, ackErr)
+		conn.Close()
+		channel.Close()
+		return ackErr
+	}
 
 	go func() {
 		for {
@@ -879,11 +895,19 @@ func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 	//conn, err := net.ListenUDP("udp", ch.LocalAddr)
 	if err != nil {
 		log.Error().Msgf("could not listen on UDP %s: %s", ch.LocalAddr, err)
-		writeReverseSetupAck(ch, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen udp %s: %s", ch.LocalAddr, err))
+		_ = writeReverseSetupAck(ch, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen udp %s: %s", ch.LocalAddr, err))
 		ch.Close()
 		return err
 	}
-	writeReverseSetupAck(ch, ssh3.ReverseSetupAckOK, "")
+	if ackErr := writeReverseSetupAck(ch, ssh3.ReverseSetupAckOK, ""); ackErr != nil {
+		// See handleTCPReverseForwardingChannel for the rationale: a
+		// successful Listen followed by a failed ack write must not
+		// leave the listener bound on this side.
+		log.Error().Msgf("reverse UDP %s: ack write failed, closing orphan listener: %s", ch.LocalAddr, ackErr)
+		conn.Close()
+		ch.Close()
+		return ackErr
+	}
 	forwardings := make(map[string]ssh3.Channel)
 	go func() {
 		buf := make([]byte, 1500)

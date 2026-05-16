@@ -151,20 +151,53 @@ type UDPOpenReverseForwardingChannelImpl struct {
 	Channel
 }
 
-// ReverseSetupAck* are the leading bytes the server writes on a
-// request-reverse-{tcp,udp} channel right after attempting to open the
-// listener, to tell the client whether the reverse forward was set up.
+// Reverse-forward setup handshake.
 //
-//	ReverseSetupAckOK   - listener opened, forwarding is active.
-//	ReverseSetupAckFail - listener could not be opened; the bytes that
-//	                      follow carry a UTF-8 reason string the client
-//	                      can surface to the user and use to decide
-//	                      whether to abort (akin to OpenSSH's
-//	                      ExitOnForwardFailure).
+// Server-side reverse forwarding ("-R" in OpenSSH terms) requires the server
+// to bind a listening socket on behalf of the client.  That bind may fail
+// (port already in use, permission denied, address not available...) and
+// the client needs to know about the failure - otherwise it would proceed
+// to exec the user's command on top of a broken forwarding, exactly like
+// OpenSSH does when ExitOnForwardFailure is left at its default.
 //
-// A server that does not send any status (i.e. closes the channel without
-// writing data) is treated by the client as a legacy implementation: the
-// client logs a warning and continues.
+// To convey that result, the client and server use the same channel that
+// already carries the reverse-forward request (the "request-reverse-tcp"
+// or "request-reverse-udp" channel created by Conversation.Request*
+// ReverseChannel).  Immediately after the server attempts to open the
+// listener it writes exactly one data message back on that channel; the
+// client reads it before closing the channel.
+//
+// Wire format of the data message
+// -------------------------------
+//
+// The message body is at least one byte:
+//
+//	+--------+------------------+
+//	| status |   reason (utf-8) |   (reason present only when status == Fail)
+//	+--------+------------------+
+//	  1 byte    0..N bytes
+//
+//   status == ReverseSetupAckOK   (0x00):
+//       listener opened successfully, no reason bytes follow.
+//   status == ReverseSetupAckFail (0x01):
+//       listener could not be opened; the bytes that follow are a UTF-8
+//       reason string suitable for surfacing to the user verbatim.
+//
+// The whole body is framed as a single ssh3 SSH_MSG_CHANNEL_DATA message
+// with DataType = SSH_EXTENDED_DATA_NONE, so framing comes from the SSH3
+// layer; there is no per-handshake length field.
+//
+// Backwards compatibility
+// -----------------------
+//
+// A server that does not implement this handshake (the original PR #148
+// baseline) simply never writes anything on the request channel and lets
+// it close.  The client treats "EOF before any data" and "read timeout"
+// as that legacy case: it logs a warning and continues, so that newer
+// clients keep working against older servers.  Any data *other* than a
+// recognised OK/Fail opcode is treated as a protocol error - silently
+// accepting unknown payloads here would defeat the point of the
+// handshake.
 const (
 	ReverseSetupAckOK   byte = 0x00
 	ReverseSetupAckFail byte = 0x01

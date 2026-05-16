@@ -223,8 +223,8 @@ func parseAddrPort(addrPort string) (localIP net.IP, localPort int, remoteIP net
 	localPort, err = strconv.Atoi(subarray[0])
 	if err != nil {
 		return nil, 0, nil, 0, fmt.Errorf("could not convert %s to int: %s", subarray[0], err)
-	} else if localPort > 0xFFFF {
-		return nil, 0, nil, 0, fmt.Errorf("port too large %d", localPort)
+	} else if localPort < 0 || localPort > 0xFFFF {
+		return nil, 0, nil, 0, fmt.Errorf("port out of range [0, 65535]: %d", localPort)
 	}
 	subarray = strings.Split(array[1], "/")
 	if len(subarray) != 2 {
@@ -237,8 +237,8 @@ func parseAddrPort(addrPort string) (localIP net.IP, localPort int, remoteIP net
 	remotePort, err = strconv.Atoi(subarray[0])
 	if err != nil {
 		return nil, 0, nil, 0, fmt.Errorf("could not convert %s to int: %s", array[0], err)
-	} else if remotePort > 0xFFFF {
-		return nil, 0, nil, 0, fmt.Errorf("UDP port too large %d", remotePort)
+	} else if remotePort < 0 || remotePort > 0xFFFF {
+		return nil, 0, nil, 0, fmt.Errorf("port out of range [0, 65535]: %d", remotePort)
 	}
 	return localIP, localPort, remoteIP, remotePort, err
 }
@@ -785,7 +785,7 @@ func ClientMain() int {
 			log.Error().Msgf("Could not resolve remote address %s: %s", options.URLHostnamePort(), err)
 			return -1
 		}
-		addr, _, err := proxyClient.ForwardUDP(ctx, baseAddr, remoteAddr, nil)
+		addr, err := proxyClient.ForwardUDP(ctx, baseAddr, remoteAddr)
 		if err != nil {
 			log.Error().Msgf("Could not forward UDP for proxy jump: %s", err)
 			return -1
@@ -825,12 +825,6 @@ func ClientMain() int {
 		}
 	}
 
-	// fwUDPmulticonn lets multiple multicast UDP forwards share a single
-	// underlying socket on the client side (a multicast group needs a single
-	// joining socket).  We keep it across all UDP forwards so that several
-	// -forward-udp specs aimed at multicast groups can share it; ForwardUDP
-	// returns the socket it actually opened so we can pass it back in.
-	var fwUDPmulticonn *net.UDPConn
 	for _, pair := range reverseUDPPairs {
 		if _, err := c.ReverseUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
 			log.Error().Msgf("could not reverse UDP %s: %s", pair.source, err)
@@ -838,13 +832,9 @@ func ClientMain() int {
 		}
 	}
 	for _, pair := range forwardUDPPairs {
-		_, conn, err := c.ForwardUDP(ctx, pair.clientLocal, pair.serverRemote, fwUDPmulticonn)
-		if err != nil {
+		if _, err := c.ForwardUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
 			log.Error().Msgf("could not forward UDP %s: %s", pair.source, err)
 			return -1
-		}
-		if pair.clientLocal.IP.IsMulticast() {
-			fwUDPmulticonn = conn
 		}
 	}
 
