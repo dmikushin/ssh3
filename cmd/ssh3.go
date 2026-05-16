@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/francoismichel/ssh3"
@@ -818,22 +819,59 @@ func ClientMain() int {
 			return -1
 		}
 	}
-	for _, pair := range reverseTCPPairs {
-		if _, err := c.ReverseTCP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
-			log.Error().Msgf("could not reverse TCP %s: %s", pair.source, err)
+	for _, pair := range forwardUDPPairs {
+		if _, err := c.ForwardUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
+			log.Error().Msgf("could not forward UDP %s: %s", pair.source, err)
 			return -1
 		}
 	}
 
-	for _, pair := range reverseUDPPairs {
-		if _, err := c.ReverseUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
-			log.Error().Msgf("could not reverse UDP %s: %s", pair.source, err)
-			return -1
+	// Reverse forwards involve a server-side bind plus a setup-ack
+	// handshake.  With a server that does not implement the ack (the
+	// PR-148 baseline) each Reverse* call blocks until its 5-second
+	// fallback timeout fires.  Doing them serially would cost up to
+	// N * 5 seconds at startup for N reverse forwards - bad enough that
+	// it would make legacy interop unusable for the autossh-style
+	// "bundle three forwards in one ssh3 invocation" workflow.  Drive
+	// the setup concurrently and abort the whole batch if any one
+	// fails (OpenSSH ExitOnForwardFailure semantics).
+	if n := len(reverseTCPPairs) + len(reverseUDPPairs); n > 0 {
+		errCh := make(chan error, n)
+		var wg sync.WaitGroup
+		for _, pair := range reverseTCPPairs {
+			pair := pair
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := c.ReverseTCP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
+					errCh <- fmt.Errorf("reverse TCP %s: %w", pair.source, err)
+				}
+			}()
 		}
-	}
-	for _, pair := range forwardUDPPairs {
-		if _, err := c.ForwardUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
-			log.Error().Msgf("could not forward UDP %s: %s", pair.source, err)
+		for _, pair := range reverseUDPPairs {
+			pair := pair
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := c.ReverseUDP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
+					errCh <- fmt.Errorf("reverse UDP %s: %w", pair.source, err)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errCh)
+		var firstErr error
+		for e := range errCh {
+			if firstErr == nil {
+				firstErr = e
+			} else {
+				// Surface every error, but only the first one
+				// causes the non-zero exit so the user sees them all.
+				log.Error().Msgf("%s", e)
+			}
+		}
+		if firstErr != nil {
+			log.Error().Msgf("%s", firstErr)
 			return -1
 		}
 	}

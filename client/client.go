@@ -12,10 +12,9 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-
-	"encoding/binary"
 
 	"golang.org/x/sys/unix"
 	//"syscall" // for RawConn in ListenConfig.Control
@@ -344,6 +343,175 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 type Client struct {
 	qconn quic.EarlyConnection
 	*ssh3.Conversation
+
+	// reverseDispatcher centralises the handling of all server-initiated
+	// channels (open-request-reverse-{tcp,udp} and agent-connection)
+	// arriving on this conversation, so there is exactly one consumer of
+	// Conversation.AcceptChannel.  Previously every Reverse{TCP,UDP}
+	// call started its own competing accept goroutine, and they raced
+	// for incoming channels - any goroutine could grab a channel meant
+	// for any of the configured reverse forwards and dial the wrong
+	// destination.  Routing by the bind address embedded in the channel
+	// header (see Conversation.OpenTCPReverseForwardingChannel and the
+	// UDP variant) makes the wiring deterministic.
+	reverseDispatcher *reverseDispatcher
+}
+
+// reverseDispatcher routes server-initiated data channels to the right
+// handler.  Reverse-forwards register themselves keyed by their server-
+// side bind address; the agent-forwarding setup registers a single
+// "agent-connection" handler.  The dispatcher goroutine is started
+// lazily by start() on first registration so a session that uses no
+// reverse forwards and no agent forwarding does not pay for it.
+type reverseDispatcher struct {
+	mu          sync.Mutex
+	tcpHandlers map[string]reverseTCPHandler // key = server-side bind addr (TCPAddr.String())
+	udpHandlers map[string]reverseUDPHandler // key = server-side bind addr (UDPAddr.String())
+	agentFn     func(channel ssh3.Channel)   // optional handler for "agent-connection" channels
+	started     bool
+}
+
+type reverseTCPHandler struct {
+	clientTarget *net.TCPAddr
+	ctx          context.Context
+}
+
+type reverseUDPHandler struct {
+	clientTarget *net.UDPAddr
+	ctx          context.Context
+}
+
+func newReverseDispatcher() *reverseDispatcher {
+	return &reverseDispatcher{
+		tcpHandlers: make(map[string]reverseTCPHandler),
+		udpHandlers: make(map[string]reverseUDPHandler),
+	}
+}
+
+// registerTCP records the local target a reverse-TCP forward should dial
+// when the server reports a new incoming connection on bindAddr, and
+// starts the dispatch loop if it is not running yet.  ctx scopes the
+// per-connection forwarding goroutines spawned for this handler.
+func (c *Client) registerReverseTCP(ctx context.Context, bindAddr *net.TCPAddr, clientTarget *net.TCPAddr) {
+	c.reverseDispatcher.mu.Lock()
+	c.reverseDispatcher.tcpHandlers[bindAddr.String()] = reverseTCPHandler{
+		clientTarget: clientTarget,
+		ctx:          ctx,
+	}
+	c.reverseDispatcher.startLocked(c)
+	c.reverseDispatcher.mu.Unlock()
+}
+
+func (c *Client) registerReverseUDP(ctx context.Context, bindAddr *net.UDPAddr, clientTarget *net.UDPAddr) {
+	c.reverseDispatcher.mu.Lock()
+	c.reverseDispatcher.udpHandlers[bindAddr.String()] = reverseUDPHandler{
+		clientTarget: clientTarget,
+		ctx:          ctx,
+	}
+	c.reverseDispatcher.startLocked(c)
+	c.reverseDispatcher.mu.Unlock()
+}
+
+// registerAgentForwarding records a handler for "agent-connection" channels.
+// Setting it more than once overwrites the previous handler; in practice
+// it is called at most once per session.
+func (c *Client) registerAgentForwarding(handler func(channel ssh3.Channel)) {
+	c.reverseDispatcher.mu.Lock()
+	c.reverseDispatcher.agentFn = handler
+	c.reverseDispatcher.startLocked(c)
+	c.reverseDispatcher.mu.Unlock()
+}
+
+// startLocked starts the dispatch goroutine the first time any handler is
+// registered.  Caller must hold reverseDispatcher.mu.
+func (d *reverseDispatcher) startLocked(c *Client) {
+	if d.started {
+		return
+	}
+	d.started = true
+	go d.run(c)
+}
+
+func (d *reverseDispatcher) run(c *Client) {
+	for {
+		channel, err := c.AcceptChannel(c.Context())
+		if err != nil {
+			// Conversation cancelled/closed: stop.  At debug level
+			// because this is the normal teardown path.
+			log.Debug().Msgf("reverse-channel dispatcher exiting: %s", err)
+			return
+		}
+		d.dispatch(channel)
+	}
+}
+
+func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
+	switch c := channel.(type) {
+	case *ssh3.TCPOpenReverseForwardingChannelImpl:
+		if c.BindAddr == nil {
+			log.Error().Msgf("open-request-reverse-tcp channel %d arrived without a bind address; closing", channel.ChannelID())
+			channel.Close()
+			return
+		}
+		d.mu.Lock()
+		h, ok := d.tcpHandlers[c.BindAddr.String()]
+		d.mu.Unlock()
+		if !ok {
+			log.Error().Msgf("no reverse-TCP handler registered for bind %s; closing channel %d", c.BindAddr, channel.ChannelID())
+			channel.Close()
+			return
+		}
+		log.Debug().Msgf("reverse TCP: server bind %s -> dialing client target %s", c.BindAddr, h.clientTarget)
+		conn, err := net.DialTCP("tcp", nil, h.clientTarget)
+		if err != nil {
+			log.Error().Msgf("reverse TCP: could not dial client target %s: %s", h.clientTarget, err)
+			channel.Close()
+			return
+		}
+		forwardReverseTCPInBackground(h.ctx, channel, conn)
+
+	case *ssh3.UDPOpenReverseForwardingChannelImpl:
+		if c.BindAddr == nil {
+			log.Error().Msgf("open-request-reverse-udp channel %d arrived without a bind address; closing", channel.ChannelID())
+			channel.Close()
+			return
+		}
+		d.mu.Lock()
+		h, ok := d.udpHandlers[c.BindAddr.String()]
+		d.mu.Unlock()
+		if !ok {
+			log.Error().Msgf("no reverse-UDP handler registered for bind %s; closing channel %d", c.BindAddr, channel.ChannelID())
+			channel.Close()
+			return
+		}
+		log.Debug().Msgf("reverse UDP: server bind %s -> dialing client target %s", c.BindAddr, h.clientTarget)
+		conn, err := net.DialUDP("udp", nil, h.clientTarget)
+		if err != nil {
+			log.Error().Msgf("reverse UDP: could not dial client target %s: %s", h.clientTarget, err)
+			channel.Close()
+			return
+		}
+		forwardReverseUDPInBackground(h.ctx, channel, conn)
+
+	default:
+		// Generic channel: only "agent-connection" is currently
+		// expected through this path.  Anything else is an
+		// unsolicited channel we have no policy for.
+		if channel.ChannelType() == "agent-connection" {
+			d.mu.Lock()
+			fn := d.agentFn
+			d.mu.Unlock()
+			if fn == nil {
+				log.Warn().Msgf("received agent-connection channel %d but agent forwarding is not registered; closing", channel.ChannelID())
+				channel.Close()
+				return
+			}
+			fn(channel)
+			return
+		}
+		log.Warn().Msgf("closing unsolicited channel type %q (id %d)", channel.ChannelType(), channel.ChannelID())
+		channel.Close()
+	}
 }
 
 func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyConnection,
@@ -530,8 +698,9 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	return &Client{
-		qconn:        qconn,
-		Conversation: conv,
+		qconn:             qconn,
+		Conversation:      conv,
+		reverseDispatcher: newReverseDispatcher(),
 	}, nil
 }
 
@@ -888,6 +1057,13 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 // from the server (see readReverseSetupAck) and, if the server reports a
 // failure (e.g. the bind port is already in use), returns that error so the
 // caller can abort - this matches OpenSSH's ExitOnForwardFailure semantics.
+//
+// On success the per-connection data channels the server opens for this
+// forward are routed by the central reverseDispatcher, which keys on the
+// bind address embedded in each open-request-reverse-tcp channel header
+// (see Conversation.OpenTCPReverseForwardingChannel).  That makes
+// multiple concurrent reverse-TCP forwards on the same conversation
+// deterministic instead of letting per-forward accept goroutines race.
 func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, serverBindAddr *net.TCPAddr) (*net.TCPAddr, error) {
 	log.Debug().Msgf("request reverse TCP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
@@ -908,35 +1084,18 @@ func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, 
 		log.Debug().Msgf("server acknowledged reverse TCP setup on %s", serverBindAddr)
 	}
 
-	go func() {
-		for {
-			channel, err := c.AcceptChannel(c.Context())
-			if err != nil {
-				log.Debug().Msgf("Error accepting channel: %s", err)
-				return
-			}
-
-			switch channel.ChannelType() {
-			case "open-request-reverse-tcp":
-				log.Debug().Msgf("accepted reverse TCP forwarding channel; dialing client target %s", clientTargetAddr)
-
-				conn, err := net.DialTCP("tcp", nil, clientTargetAddr)
-				if err != nil {
-					log.Error().Msgf("could not dial client target %s: %s", clientTargetAddr, err)
-					channel.Close()
-					continue
-				}
-				forwardReverseTCPInBackground(ctx, channel, conn)
-			}
-		}
-	}()
+	// Hand the per-connection routing off to the central dispatcher and
+	// release the request channel; further work on this forward happens
+	// asynchronously each time the server opens a new data channel.
+	c.registerReverseTCP(ctx, serverBindAddr, clientTargetAddr)
 	forwardingChannel.Close()
 	return serverBindAddr, nil
 }
 
 // ReverseUDP sets up an SSH-style reverse UDP port forward.
 // See ReverseTCP for the meaning of clientTargetAddr and serverBindAddr,
-// and for the server-side setup-failure handshake.
+// for the server-side setup-failure handshake, and for how per-connection
+// data channels are routed via the central reverseDispatcher.
 func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, serverBindAddr *net.UDPAddr) (*net.UDPAddr, error) {
 	log.Debug().Msgf("request reverse UDP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
@@ -957,127 +1116,9 @@ func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, 
 		log.Debug().Msgf("server acknowledged reverse UDP setup on %s", serverBindAddr)
 	}
 
+	c.registerReverseUDP(ctx, serverBindAddr, clientTargetAddr)
 	forwardingChannel.Close()
 	return serverBindAddr, nil
-}
-
-
-func parseAddrsFromChannelType(typ string) (*net.UDPAddr, *net.UDPAddr, error) {
-	// Prefer HasPrefix to avoid accidental matches.
-
-
-	parts := strings.SplitN(typ, ",", 3)
-	if len(parts) != 3 {
-		return nil, nil, fmt.Errorf("bad format (want: open-request-reverse-udp,<local>,<remote>): %q", typ)
-	}
-
-	localStr := strings.TrimSpace(parts[1])
-	remoteStr := strings.TrimSpace(parts[2])
-
-	// Accept IPv4 or IPv6 (IPv6 with port must be in [addr]:port form).
-	localUDPAddr, err := net.ResolveUDPAddr("udp", localStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse local UDP addr %q: %w", localStr, err)
-	}
-	remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse remote UDP addr %q: %w", remoteStr, err)
-	}
-
-	return localUDPAddr, remoteUDPAddr, nil
-}
-
-func parseUDPRequestReverseHeader(channelID uint64, buf util.Reader) (*net.UDPAddr, *net.UDPAddr, error) {
-	localaddress, localport, remoteaddress, remoteport, err := parseRequestReverseHeader(channelID, buf)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &net.UDPAddr{
-			IP:   localaddress,
-			Port: int(localport),
-		}, &net.UDPAddr{
-			IP:   remoteaddress,
-			Port: int(remoteport),
-		}, nil
-}
-
-func parseRequestReverseHeader(channelID uint64, buf util.Reader) (net.IP, uint16, net.IP, uint16, error) {
-
-	var localaddress net.IP
-	var remoteaddress net.IP
-	var portBuf [2]byte
-
-	//Parse local address and port where the reverse socket is proxied within the client machine
-	//------------------------------------------------------------------------------------------
-	addressFamily, err := util.ReadVarInt(buf)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	if addressFamily == util.SSHAFIpv4 {
-		localaddress = make([]byte, 4)
-	} else if addressFamily == util.SSHAFIpv6 {
-		localaddress = make([]byte, 16)
-	} else {
-		return nil, 0, nil, 0, fmt.Errorf("invalid local address family: %d", addressFamily)
-	}
-
-	_, err = buf.Read(localaddress)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-	localport := binary.BigEndian.Uint16(portBuf[:])
-
-	//Parse remote address and port of the remote service to be proxied within the client machine
-	//-------------------------------------------------------------------------------------------
-	addressFamily, err = util.ReadVarInt(buf)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	if addressFamily == util.SSHAFIpv4 {
-		remoteaddress = make([]byte, 4)
-	} else if addressFamily == util.SSHAFIpv6 {
-		remoteaddress = make([]byte, 16)
-	} else {
-		return nil, 0, nil, 0, fmt.Errorf("invalid remote address family: %d", addressFamily)
-	}
-
-	_, err = buf.Read(remoteaddress)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-	remoteport := binary.BigEndian.Uint16(portBuf[:])
-
-	return localaddress, localport, remoteaddress, remoteport, nil
-}
-
-
-// readFirstMsg returns (msgType, payload, err) from an ssh3.Channel.
-func readFirstMsg(ctx context.Context, ch ssh3.Channel) (byte, []byte, error) {
-    // Try a NextMessage-style API
-    if r, ok := any(ch).(interface {
-        NextMessage(context.Context) (byte, []byte, error)
-    }); ok {
-        return r.NextMessage(ctx)
-    }
-    // Or a ReadMessage-style API
-    if r, ok := any(ch).(interface {
-        ReadMessage(context.Context) (byte, []byte, error)
-    }); ok {
-        return r.ReadMessage(ctx)
-    }
-    return 0, nil, fmt.Errorf("channel doesn't expose a message-read method")
 }
 
 
@@ -1085,43 +1126,12 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 
 	ctx := c.Context()
 
-	//Managing incomming channels globally
-	//TODO: for reverseTCP is required migrating here the management.
-	go func() {
-		for {
-			channel, err := c.AcceptChannel(c.Context())
-			if err != nil {
-				log.Debug().Msgf("Error accepting channel")
-				// ctx canceled, conn closed, or fatal; exit loop
-				return
-			}
-
-			typ := channel.ChannelType()
-			log.Debug().Msgf("New channel type %s \n", typ)
-
-			if  strings.HasPrefix(typ, "open-request-reverse-udp") {
-				//return nil, nil, fmt.Errorf("not a reverse-udp channel: %q", typ)
-				localUDPAddr, remoteUDPAddr, err := parseAddrsFromChannelType(typ)
-				log.Debug().Msgf("start reverse TCP forwarding from %s to %s \n", localUDPAddr, remoteUDPAddr)
-				conn, err := net.DialUDP("udp", nil, remoteUDPAddr)
-				if err != nil {
-					return
-				}
-				forwardReverseUDPInBackground(ctx, channel, conn)
-				if err != nil {
-					channel.Close()
-					return
-				}
-			}
-
-			switch channel.ChannelType() {
-			default:
-				// Unknown/unwanted channel -> close or log
-				channel.Close()
-			}
-		}
-	}()
-
+	// All server-initiated channels - reverse-forward data channels and
+	// agent-connection channels - flow through the central
+	// reverseDispatcher (started lazily on first registration).  No
+	// per-handler AcceptChannel goroutine is started here on purpose:
+	// having two consumers on the same AcceptChannel queue caused the
+	// reverse-forward race that this refactor exists to remove.
 
 	channel, err := c.OpenChannel("session", 30000, 0)
 	if err != nil {
@@ -1137,28 +1147,15 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 			log.Error().Msgf("could not forward agent: %s", err.Error())
 			return err
 		}
-		go func() {
-			for {
-				forwardChannel, err := c.AcceptChannel(ctx)
-				if err != nil {
-					if err != context.Canceled {
-						log.Error().Msgf("could not accept forwarding channel: %s", err.Error())
-					}
-					return
-				} else if forwardChannel.ChannelType() != "agent-connection" {
-					log.Error().Msgf("unexpected server-initiated channel: %s", channel.ChannelType())
-					return
+		c.registerAgentForwarding(func(forwardChannel ssh3.Channel) {
+			log.Debug().Msg("new agent connection, forwarding")
+			go func() {
+				if err := forwardAgent(ctx, forwardChannel); err != nil {
+					log.Error().Msgf("agent forwarding error: %s", err.Error())
+					c.Close()
 				}
-				log.Debug().Msg("new agent connection, forwarding")
-				go func() {
-					err = forwardAgent(ctx, forwardChannel)
-					if err != nil {
-						log.Error().Msgf("agent forwarding error: %s", err.Error())
-						c.Close()
-					}
-				}()
-			}
-		}()
+			}()
+		})
 	}
 
 	if len(command) == 0 {

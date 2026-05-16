@@ -135,7 +135,10 @@ type TCPReverseForwardingChannelImpl struct {
 }
 
 type TCPOpenReverseForwardingChannelImpl struct {
-	RemoteAddr *net.TCPAddr
+	// BindAddr is the server-side listening address that produced this
+	// data channel.  The client uses it to route the channel to the
+	// matching reverse-forward handler (see Client.reverseDispatcher).
+	BindAddr *net.TCPAddr
 	Channel
 }
 
@@ -146,8 +149,9 @@ type UDPReverseForwardingChannelImpl struct {
 }
 
 type UDPOpenReverseForwardingChannelImpl struct {
-	RemoteAddr *net.UDPAddr
-	LocalAddr *net.UDPAddr
+	// BindAddr is the server-side listening address that produced this
+	// data channel; see TCPOpenReverseForwardingChannelImpl.
+	BindAddr *net.UDPAddr
 	Channel
 }
 

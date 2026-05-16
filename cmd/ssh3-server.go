@@ -688,7 +688,7 @@ func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 				return
 			}
 
-			forwardingChannel, err := conv.OpenTCPReverseForwardingChannel(30000, 10, channel.RemoteAddr)
+			forwardingChannel, err := conv.OpenTCPReverseForwardingChannel(30000, 10, channel.LocalAddr)
 			if err != nil {
 				log.Error().Msgf("could not open new TCP reverse forwarding channel: %s", err)
 				return
@@ -919,7 +919,7 @@ func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 			}
 			channel, ok := forwardings[addr.String()]
 			if !ok {
-				channel, err = conv.OpenUDPReverseForwardingChannel(30000, 10, ch.LocalAddr, ch.RemoteAddr)
+				channel, err = conv.OpenUDPReverseForwardingChannel(30000, 10, ch.LocalAddr)
 				if err != nil {
 					log.Error().Msgf("could not open new UDP reverse forwarding channel: %s", err)
 					return
