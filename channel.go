@@ -150,6 +150,26 @@ type UDPOpenReverseForwardingChannelImpl struct {
 	LocalAddr *net.UDPAddr
 	Channel
 }
+
+// ReverseSetupAck* are the leading bytes the server writes on a
+// request-reverse-{tcp,udp} channel right after attempting to open the
+// listener, to tell the client whether the reverse forward was set up.
+//
+//	ReverseSetupAckOK   - listener opened, forwarding is active.
+//	ReverseSetupAckFail - listener could not be opened; the bytes that
+//	                      follow carry a UTF-8 reason string the client
+//	                      can surface to the user and use to decide
+//	                      whether to abort (akin to OpenSSH's
+//	                      ExitOnForwardFailure).
+//
+// A server that does not send any status (i.e. closes the channel without
+// writing data) is treated by the client as a legacy implementation: the
+// client logs a warning and continues.
+const (
+	ReverseSetupAckOK   byte = 0x00
+	ReverseSetupAckFail byte = 0x01
+)
+
 func buildHeader(conversationStreamID uint64, channelType string, maxPacketSize uint64, additionalBytes []byte) []byte {
 	channelTypeBuf := make([]byte, util.SSHStringLen(channelType))
 	util.WriteSSHString(channelTypeBuf, channelType)

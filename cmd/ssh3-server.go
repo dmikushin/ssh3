@@ -636,19 +636,39 @@ func handleTCPForwardingChannel(ctx context.Context, user *unix_util.User, conv 
 	return nil
 }
 
+// Wire-protocol for the reverse-forward setup acknowledgement.  After
+// receiving a request-reverse-{tcp,udp} channel the server attempts to open
+// the requested listener and immediately writes a single status byte back to
+// the client on the same channel using the ssh3.ReverseSetupAck{OK,Fail}
+// constants (see channel.go).
+//
+// writeReverseSetupAck sends one such status message.  Errors are only
+// logged because by the time we get here the listener has already either
+// succeeded or failed and the channel will be closed by the caller in the
+// failure path anyway.
+func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) {
+	buf := append([]byte{status}, []byte(reason)...)
+	if _, err := channel.WriteData(buf, ssh3Messages.SSH_EXTENDED_DATA_NONE); err != nil {
+		log.Warn().Msgf("could not write reverse-forward setup ack: %s", err)
+	}
+}
+
 //Copied from client.go ForwardTCP()
 func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPReverseForwardingChannelImpl) error {
 	conn, err := net.ListenTCP("tcp", channel.LocalAddr)
 	if err != nil {
-		log.Error().Msgf("could listen on TCP socket: %s", err)
-		return nil
+		log.Error().Msgf("could not listen on TCP %s: %s", channel.LocalAddr, err)
+		writeReverseSetupAck(channel, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen tcp %s: %s", channel.LocalAddr, err))
+		channel.Close()
+		return err
 	}
+	writeReverseSetupAck(channel, ssh3.ReverseSetupAckOK, "")
 
 	go func() {
 		for {
 			conn, err := conn.AcceptTCP()
 			if err != nil {
-				log.Error().Msgf("could read on UDP socket: %s", err)
+				log.Error().Msgf("could not accept on TCP listener %s: %s", channel.LocalAddr, err)
 				return
 			}
 
@@ -858,9 +878,12 @@ func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 	conn, err := ListenUDPWithAutoMulticast(ch.LocalAddr,"")
 	//conn, err := net.ListenUDP("udp", ch.LocalAddr)
 	if err != nil {
-		log.Error().Msgf("could not listen on UDP socket: %s", err)
-		return nil
+		log.Error().Msgf("could not listen on UDP %s: %s", ch.LocalAddr, err)
+		writeReverseSetupAck(ch, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen udp %s: %s", ch.LocalAddr, err))
+		ch.Close()
+		return err
 	}
+	writeReverseSetupAck(ch, ssh3.ReverseSetupAckOK, "")
 	forwardings := make(map[string]ssh3.Channel)
 	go func() {
 		buf := make([]byte, 1500)

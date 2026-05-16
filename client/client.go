@@ -804,6 +804,60 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 	return conn.Addr().(*net.TCPAddr), nil
 }
 
+// readReverseSetupAck waits up to `timeout` for the server to write a single
+// setup-acknowledgement message on a request-reverse-{tcp,udp} channel (see
+// ssh3.ReverseSetupAck{OK,Fail}).  The caller is responsible for closing the
+// channel afterwards regardless of the outcome.
+//
+// Return values:
+//   - ok=true                          listener was opened on the server.
+//   - ok=false, err!=nil               server reported a failure; err carries
+//                                      the reason string sent by the server.
+//   - ok=false, err==nil, legacy=true  timeout or empty/malformed reply;
+//                                      assume a server that predates this
+//                                      handshake (e.g. PR-148 baseline).
+func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, legacy bool, err error) {
+	type readResult struct {
+		msg ssh3Messages.Message
+		err error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		msg, e := channel.NextMessage()
+		resultCh <- readResult{msg, e}
+	}()
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			// EOF without any data means the peer closed the channel
+			// without acking - most likely a legacy server.
+			if errors.Is(r.err, io.EOF) {
+				return false, true, nil
+			}
+			return false, false, r.err
+		}
+		dm, isData := r.msg.(*ssh3Messages.DataOrExtendedDataMessage)
+		if !isData || len(dm.Data) == 0 {
+			return false, true, nil
+		}
+		switch dm.Data[0] {
+		case ssh3.ReverseSetupAckOK:
+			return true, false, nil
+		case ssh3.ReverseSetupAckFail:
+			reason := strings.TrimSpace(dm.Data[1:])
+			if reason == "" {
+				reason = "server reported failure with no reason"
+			}
+			return false, false, fmt.Errorf("%s", reason)
+		default:
+			return false, true, nil
+		}
+	case <-time.After(timeout):
+		channel.CancelRead()
+		return false, true, nil
+	}
+}
+
 // ReverseTCP sets up an SSH-style reverse TCP port forward.
 //
 // The "client-local" half (clientTargetAddr) is the address on the client side
@@ -819,6 +873,11 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 // socket on the server machine and RemoteAddr is the socket reached via the
 // client). RequestTCPReverseChannel forwards its (localAddr, remoteAddr)
 // arguments to that header in that order, so we pass serverBindAddr first.
+//
+// After sending the request, ReverseTCP waits for a setup acknowledgement
+// from the server (see readReverseSetupAck) and, if the server reports a
+// failure (e.g. the bind port is already in use), returns that error so the
+// caller can abort - this matches OpenSSH's ExitOnForwardFailure semantics.
 func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, serverBindAddr *net.TCPAddr) (*net.TCPAddr, error) {
 	log.Debug().Msgf("request reverse TCP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
@@ -826,6 +885,17 @@ func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, 
 	if err != nil {
 		log.Error().Msgf("could not open new TCP reverse forwarding channel: %s", err)
 		return serverBindAddr, err
+	}
+
+	ok, legacy, ackErr := readReverseSetupAck(forwardingChannel, 5*time.Second)
+	if ackErr != nil {
+		forwardingChannel.Close()
+		return serverBindAddr, fmt.Errorf("server refused reverse TCP %s -> %s: %s", serverBindAddr, clientTargetAddr, ackErr)
+	}
+	if legacy {
+		log.Warn().Msgf("server did not acknowledge reverse TCP setup for %s within timeout; assuming legacy server (forwarding may silently fail)", serverBindAddr)
+	} else if ok {
+		log.Debug().Msgf("server acknowledged reverse TCP setup on %s", serverBindAddr)
 	}
 
 	go func() {
@@ -855,7 +925,8 @@ func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, 
 }
 
 // ReverseUDP sets up an SSH-style reverse UDP port forward.
-// See ReverseTCP for the meaning of clientTargetAddr and serverBindAddr.
+// See ReverseTCP for the meaning of clientTargetAddr and serverBindAddr,
+// and for the server-side setup-failure handshake.
 func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, serverBindAddr *net.UDPAddr) (*net.UDPAddr, error) {
 	log.Debug().Msgf("request reverse UDP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
@@ -864,6 +935,18 @@ func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, 
 		log.Error().Msgf("could not open new UDP reverse forwarding channel: %s", err)
 		return serverBindAddr, err
 	}
+
+	ok, legacy, ackErr := readReverseSetupAck(forwardingChannel, 5*time.Second)
+	if ackErr != nil {
+		forwardingChannel.Close()
+		return serverBindAddr, fmt.Errorf("server refused reverse UDP %s -> %s: %s", serverBindAddr, clientTargetAddr, ackErr)
+	}
+	if legacy {
+		log.Warn().Msgf("server did not acknowledge reverse UDP setup for %s within timeout; assuming legacy server (forwarding may silently fail)", serverBindAddr)
+	} else if ok {
+		log.Debug().Msgf("server acknowledged reverse UDP setup on %s", serverBindAddr)
+	}
+
 	forwardingChannel.Close()
 	return serverBindAddr, nil
 }
