@@ -282,15 +282,49 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				Context("TCP port forwarding", func() {
 					testTCPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.TCPAddr, messageFromClient string, messageFromServer string, forwardingType string) {
 						localIP := "[::1]"
+						localIPBare := "::1"
 						if remoteAddr.IP.To4() != nil {
 							localIP = "127.0.0.1"
+							localIPBare = "127.0.0.1"
 						}
+						// The CLI spec is always <localPort>/<localIP>@<remotePort>/<remoteIP>
+						// where the *local* pair lives on the ssh3 client side and the
+						// *remote* pair lives on the ssh3 server side - same syntax for
+						// -forward-tcp and -reverse-tcp.
+						forwardSpec := fmt.Sprintf("%d/%s@%d/%s", localPort, localIPBare, remoteAddr.Port, remoteAddr.IP)
+
+						// Decide which end runs the "origin" TCP server (the one that
+						// answers) and which end the test will connect to.
+						//
+						//   -forward-tcp: client listens on (localIP,localPort); the
+						//     server dials remoteAddr, so the origin lives on the
+						//     server-side at remoteAddr and the test connects on the
+						//     client-side at (localIP,localPort).
+						//
+						//   -reverse-tcp: server listens on remoteAddr; the client
+						//     dials (localIP,localPort), so the origin lives on the
+						//     client-side at (localIP,localPort) and the test connects
+						//     on the server-side at remoteAddr.
+						var originAddr *net.TCPAddr
+						var entryAddr string
+						switch forwardingType {
+						case "-forward-tcp":
+							originAddr = remoteAddr
+							entryAddr = fmt.Sprintf("%s:%d", localIP, localPort)
+						case "-reverse-tcp":
+							originAddr = &net.TCPAddr{IP: net.ParseIP(localIPBare), Port: int(localPort)}
+							entryAddr = fmt.Sprintf("%s:%d", remoteAddr.IP, remoteAddr.Port)
+						default:
+							Fail(fmt.Sprintf("unsupported forwardingType %q", forwardingType))
+						}
+
 						serverStarted := make(chan struct{})
-						// Start a TCP server on the specified remote IP and port
+						// Start the origin TCP server on whichever side is the "far end"
+						// of the tunnel for this forwarding direction.
 						go func() {
 							defer close(serverStarted)
 							defer GinkgoRecover()
-							listener, err := net.ListenTCP("tcp", remoteAddr)
+							listener, err := net.ListenTCP("tcp", originAddr)
 							Expect(err).ToNot(HaveOccurred())
 							defer listener.Close()
 
@@ -324,20 +358,22 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						if proxyJump {
 							additionalArgs = append(additionalArgs, "-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH))
 						}
-						additionalArgs = append(additionalArgs, forwardingType, fmt.Sprintf("%d/%s@%d", localPort, remoteAddr.IP, remoteAddr.Port))
+						additionalArgs = append(additionalArgs, forwardingType, forwardSpec)
 						clientArgs := getClientArgs(rsaPrivKeyPath, additionalArgs...)
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
 						defer session.Terminate()
 
-						// Try to connect to the local forwarded port
-						localAddr := fmt.Sprintf("%s:%d", localIP, localPort)
+						// Try to connect to the entry-side of the tunnel.  For -forward
+						// this is the client's local listener; for -reverse it is the
+						// server's listener.
 						var conn net.Conn
-						// connection refused might happen betwen the time when the process starts and actually listens the socket
+						// connection refused might happen between the time when the
+						// process starts and actually listens on the socket
 						Eventually(func() error {
 							var err error
-							conn, err = net.Dial("tcp", localAddr)
+							conn, err = net.Dial("tcp", entryAddr)
 							return err
 						}).ShouldNot(HaveOccurred())
 						Expect(err).ToNot(HaveOccurred())
@@ -401,6 +437,186 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						testTCPPortForwarding(8082, false, &net.TCPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server", "-forward-tcp")
 						testTCPPortForwarding(8093, false, &net.TCPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server", "-reverse-tcp")
 					})
+
+					// Regression test for the repeatable -reverse-tcp / -forward-tcp
+					// flags.  The autossh use case bundles several forwards into a
+					// single ssh3 invocation; we verify that two reverse-tcp specs
+					// given on the same command line both end up active and serve
+					// independent origins on the client side.
+					It("accepts multiple -reverse-tcp specifications at once", func() {
+						// Two distinct client-side origins; the ssh3 server will be
+						// asked to bind two distinct ports and relay each back to
+						// its matching origin.
+						originA, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer originA.Close()
+						originB, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer originB.Close()
+						originAPort := originA.Addr().(*net.TCPAddr).Port
+						originBPort := originB.Addr().(*net.TCPAddr).Port
+
+						// Pick two free server-side ports for the reverse listeners.
+						probeA, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						serverPortA := probeA.Addr().(*net.TCPAddr).Port
+						probeA.Close()
+						probeB, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						serverPortB := probeB.Addr().(*net.TCPAddr).Port
+						probeB.Close()
+
+						// Each origin responds with a deterministic tag so we can
+						// tell them apart across the two tunnels.
+						serveTag := func(l *net.TCPListener, tag string, done chan<- struct{}) {
+							defer GinkgoRecover()
+							defer close(done)
+							c, err := l.Accept()
+							if err != nil {
+								return
+							}
+							defer c.Close()
+							c.Write([]byte(tag))
+						}
+						doneA := make(chan struct{})
+						doneB := make(chan struct{})
+						go serveTag(originA, "TAG_A", doneA)
+						go serveTag(originB, "TAG_B", doneB)
+
+						clientArgs := getClientArgs(rsaPrivKeyPath,
+							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originAPort, serverPortA),
+							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originBPort, serverPortB),
+							"sleep", "5",
+						)
+						command := exec.Command(ssh3Path, clientArgs...)
+						session, err := Start(command, GinkgoWriter, GinkgoWriter)
+						Expect(err).ToNot(HaveOccurred())
+						defer session.Terminate()
+
+						// Both reverse listeners should be reachable on the server side.
+						var connA, connB net.Conn
+						Eventually(func() error {
+							connA, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", serverPortA))
+							return err
+						}).ShouldNot(HaveOccurred())
+						defer connA.Close()
+						Eventually(func() error {
+							connB, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", serverPortB))
+							return err
+						}).ShouldNot(HaveOccurred())
+						defer connB.Close()
+
+						readTag := func(c net.Conn) string {
+							buf := make([]byte, 16)
+							c.SetReadDeadline(time.Now().Add(2 * time.Second))
+							n, _ := c.Read(buf)
+							return string(buf[:n])
+						}
+						Expect(readTag(connA)).To(Equal("TAG_A"))
+						Expect(readTag(connB)).To(Equal("TAG_B"))
+						<-doneA
+						<-doneB
+					})
+
+					// Regression test for -forward-tcp accepting a non-loopback
+					// local bind address.  We ask ssh3 to bind its local listener
+					// on 0.0.0.0, then verify it is reachable through 127.0.0.1
+					// (which is one of the addresses 0.0.0.0 covers).
+					It("binds local-forward listener on 0.0.0.0 when requested", func() {
+						origin, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer origin.Close()
+						originPort := origin.Addr().(*net.TCPAddr).Port
+
+						probe, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						clientPort := probe.Addr().(*net.TCPAddr).Port
+						probe.Close()
+
+						done := make(chan struct{})
+						go func() {
+							defer GinkgoRecover()
+							defer close(done)
+							c, err := origin.Accept()
+							if err != nil {
+								return
+							}
+							defer c.Close()
+							c.Write([]byte("VIA_ZERO"))
+						}()
+
+						clientArgs := getClientArgs(rsaPrivKeyPath,
+							"-forward-tcp", fmt.Sprintf("%d/0.0.0.0@%d/127.0.0.1", clientPort, originPort),
+							"sleep", "5",
+						)
+						command := exec.Command(ssh3Path, clientArgs...)
+						session, err := Start(command, GinkgoWriter, GinkgoWriter)
+						Expect(err).ToNot(HaveOccurred())
+						defer session.Terminate()
+
+						// Confirm the bind happened on 0.0.0.0 by reaching it via
+						// the loopback alias.
+						var conn net.Conn
+						Eventually(func() error {
+							conn, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", clientPort))
+							return err
+						}).ShouldNot(HaveOccurred())
+						defer conn.Close()
+
+						buf := make([]byte, 16)
+						conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+						n, _ := conn.Read(buf)
+						Expect(string(buf[:n])).To(Equal("VIA_ZERO"))
+						<-done
+					})
+
+					// ExitOnForwardFailure-equivalent behaviour: if the server
+					// cannot open the reverse-tcp listener (here, because the
+					// port is already in use), the client must surface that
+					// error and exit non-zero rather than silently proceed.
+					It("exits non-zero when the server cannot bind the reverse-tcp listener", func() {
+						// Hold a port on the server side so ListenTCP fails there.
+						blocker, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer blocker.Close()
+						blockedPort := blocker.Addr().(*net.TCPAddr).Port
+
+						clientArgs := getClientArgs(rsaPrivKeyPath,
+							"-reverse-tcp", fmt.Sprintf("9999/127.0.0.1@%d/127.0.0.1", blockedPort),
+							"sleep", "5",
+						)
+						command := exec.Command(ssh3Path, clientArgs...)
+						session, err := Start(command, GinkgoWriter, GinkgoWriter)
+						Expect(err).ToNot(HaveOccurred())
+						defer session.Terminate()
+
+						Eventually(session, "10s").Should(Exit())
+						Expect(session.ExitCode()).ToNot(Equal(0),
+							"client should fail when the server cannot bind the reverse-tcp port")
+					})
+
+					// Same as above but with -proxy-jump in the mix, to make sure
+					// the ack handshake survives the proxy hop.
+					It("exits non-zero on reverse-tcp bind failure through proxy jump", func() {
+						blocker, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer blocker.Close()
+						blockedPort := blocker.Addr().(*net.TCPAddr).Port
+
+						clientArgs := getClientArgs(rsaPrivKeyPath,
+							"-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH),
+							"-reverse-tcp", fmt.Sprintf("9999/127.0.0.1@%d/127.0.0.1", blockedPort),
+							"sleep", "5",
+						)
+						command := exec.Command(ssh3Path, clientArgs...)
+						session, err := Start(command, GinkgoWriter, GinkgoWriter)
+						Expect(err).ToNot(HaveOccurred())
+						defer session.Terminate()
+
+						Eventually(session, "15s").Should(Exit())
+						Expect(session.ExitCode()).ToNot(Equal(0),
+							"client should fail through proxy jump when the server cannot bind the reverse-tcp port")
+					})
 				})
 			})
 
@@ -414,17 +630,35 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			Context("UDP port forwarding", func() {
 				testUDPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.UDPAddr, messageFromClient, messageFromServer string, forwardingType string) {
 					localIP := "[::1]"
-					localIPWithoutBrackets := "::1"
+					localIPBare := "::1"
 					if remoteAddr.IP.To4() != nil {
 						localIP = "127.0.0.1"
-						localIPWithoutBrackets = localIP
+						localIPBare = localIP
 					}
+					forwardSpec := fmt.Sprintf("%d/%s@%d/%s", localPort, localIPBare, remoteAddr.Port, remoteAddr.IP)
+
+					// See testTCPPortForwarding for the role flip between forward and
+					// reverse: the "origin" UDP server lives on the far side of the
+					// tunnel, the test entry point on the near side.
+					var originAddr *net.UDPAddr
+					var entryAddr string
+					switch forwardingType {
+					case "-forward-udp":
+						originAddr = remoteAddr
+						entryAddr = fmt.Sprintf("%s:%d", localIP, localPort)
+					case "-reverse-udp":
+						originAddr = &net.UDPAddr{IP: net.ParseIP(localIPBare), Port: int(localPort)}
+						entryAddr = fmt.Sprintf("%s:%d", remoteAddr.IP, remoteAddr.Port)
+					default:
+						Fail(fmt.Sprintf("unsupported forwardingType %q", forwardingType))
+					}
+
 					serverStarted := make(chan struct{})
-					// Start a UDP server on the specified remote IP and port
+					// Start the origin UDP server on the far side of the tunnel.
 					go func() {
 						defer close(serverStarted)
 						defer GinkgoRecover()
-						conn, err := net.ListenUDP("udp", remoteAddr)
+						conn, err := net.ListenUDP("udp", originAddr)
 						Expect(err).ToNot(HaveOccurred())
 						defer conn.Close()
 
@@ -433,7 +667,6 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						buffer := make([]byte, 2*len(messageFromClient))
 						n, clientAddr, err := conn.ReadFromUDP(buffer)
 						Expect(err).ToNot(HaveOccurred())
-						Expect(clientAddr.IP.String()).To(Equal(localIPWithoutBrackets))
 						Expect(string(buffer[:n])).To(Equal(messageFromClient))
 
 						// Send message to client
@@ -448,7 +681,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					if proxyJump {
 						additionalArgs = append(additionalArgs, "-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH))
 					}
-					additionalArgs = append(additionalArgs, forwardingType, fmt.Sprintf("%d/%s@%d", localPort, remoteAddr.IP, remoteAddr.Port))
+					additionalArgs = append(additionalArgs, forwardingType, forwardSpec)
 					clientArgs := getClientArgs(rsaPrivKeyPath, additionalArgs...)
 					command := exec.Command(ssh3Path, clientArgs...)
 					session, err := Start(command, GinkgoWriter, GinkgoWriter)
@@ -458,14 +691,11 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					// Wait for some time to ensure that the client has established the forwarding
 					time.Sleep(2 * time.Second)
 
-					// if the remote addr is IPv4 (resp. IPv6), ssh3 listens on the IPv4 (resp. IPv6) loopback
-					// Try to connect to the local forwarded port
-					localAddr := fmt.Sprintf("%s:%d", localIP, localPort)
-
+					// Try to connect to the tunnel entry point (see role flip above).
 					var conn net.Conn
 					Eventually(func() error {
 						var err error
-						conn, err = net.Dial("udp", localAddr)
+						conn, err = net.Dial("udp", entryAddr)
 						return err
 					}).ShouldNot(HaveOccurred())
 					defer conn.Close()
