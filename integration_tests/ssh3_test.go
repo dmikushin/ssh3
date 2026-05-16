@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -281,10 +282,8 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				// for both cases.
 				Context("TCP port forwarding", func() {
 					testTCPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.TCPAddr, messageFromClient string, messageFromServer string, forwardingType string) {
-						localIP := "[::1]"
 						localIPBare := "::1"
 						if remoteAddr.IP.To4() != nil {
-							localIP = "127.0.0.1"
 							localIPBare = "127.0.0.1"
 						}
 						// The CLI spec is always <localPort>/<localIP>@<remotePort>/<remoteIP>
@@ -310,10 +309,10 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						switch forwardingType {
 						case "-forward-tcp":
 							originAddr = remoteAddr
-							entryAddr = fmt.Sprintf("%s:%d", localIP, localPort)
+							entryAddr = net.JoinHostPort(localIPBare, strconv.Itoa(int(localPort)))
 						case "-reverse-tcp":
 							originAddr = &net.TCPAddr{IP: net.ParseIP(localIPBare), Port: int(localPort)}
-							entryAddr = fmt.Sprintf("%s:%d", remoteAddr.IP, remoteAddr.Port)
+							entryAddr = net.JoinHostPort(remoteAddr.IP.String(), strconv.Itoa(remoteAddr.Port))
 						default:
 							Fail(fmt.Sprintf("unsupported forwardingType %q", forwardingType))
 						}
@@ -492,11 +491,10 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						go serveTag(originA, "TAG_A", doneA)
 						go serveTag(originB, "TAG_B", doneB)
 
-						clientArgs := getClientArgs(rsaPrivKeyPath,
+						clientArgs := append(getClientArgs(rsaPrivKeyPath,
 							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originAPort, serverPortA),
 							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originBPort, serverPortB),
-							"sleep", "10",
-						)
+						), "sleep", "10")
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
@@ -563,10 +561,9 @@ var _ = Describe("Testing the ssh3 cli", func() {
 							c.Write([]byte("VIA_ZERO"))
 						}()
 
-						clientArgs := getClientArgs(rsaPrivKeyPath,
+						clientArgs := append(getClientArgs(rsaPrivKeyPath,
 							"-forward-tcp", fmt.Sprintf("%d/0.0.0.0@%d/127.0.0.1", clientPort, originPort),
-							"sleep", "5",
-						)
+						), "sleep", "5")
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
@@ -599,10 +596,9 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						defer blocker.Close()
 						blockedPort := blocker.Addr().(*net.TCPAddr).Port
 
-						clientArgs := getClientArgs(rsaPrivKeyPath,
+						clientArgs := append(getClientArgs(rsaPrivKeyPath,
 							"-reverse-tcp", fmt.Sprintf("9999/127.0.0.1@%d/127.0.0.1", blockedPort),
-							"sleep", "5",
-						)
+						), "sleep", "5")
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
@@ -632,11 +628,10 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						defer blocker.Close()
 						blockedPort := blocker.Addr().(*net.TCPAddr).Port
 
-						clientArgs := getClientArgs(rsaPrivKeyPath,
+						clientArgs := append(getClientArgs(rsaPrivKeyPath,
 							"-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH),
 							"-reverse-tcp", fmt.Sprintf("9999/127.0.0.1@%d/127.0.0.1", blockedPort),
-							"sleep", "5",
-						)
+						), "sleep", "5")
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
@@ -663,11 +658,9 @@ var _ = Describe("Testing the ssh3 cli", func() {
  			// for both cases.
 			Context("UDP port forwarding", func() {
 				testUDPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.UDPAddr, messageFromClient, messageFromServer string, forwardingType string) {
-					localIP := "[::1]"
 					localIPBare := "::1"
 					if remoteAddr.IP.To4() != nil {
-						localIP = "127.0.0.1"
-						localIPBare = localIP
+						localIPBare = "127.0.0.1"
 					}
 					forwardSpec := fmt.Sprintf("%d/%s@%d/%s", localPort, localIPBare, remoteAddr.Port, remoteAddr.IP)
 
@@ -679,10 +672,10 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					switch forwardingType {
 					case "-forward-udp":
 						originAddr = remoteAddr
-						entryAddr = fmt.Sprintf("%s:%d", localIP, localPort)
+						entryAddr = net.JoinHostPort(localIPBare, strconv.Itoa(int(localPort)))
 					case "-reverse-udp":
 						originAddr = &net.UDPAddr{IP: net.ParseIP(localIPBare), Port: int(localPort)}
-						entryAddr = fmt.Sprintf("%s:%d", remoteAddr.IP, remoteAddr.Port)
+						entryAddr = net.JoinHostPort(remoteAddr.IP.String(), strconv.Itoa(remoteAddr.Port))
 					default:
 						Fail(fmt.Sprintf("unsupported forwardingType %q", forwardingType))
 					}
