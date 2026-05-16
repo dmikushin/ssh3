@@ -506,8 +506,8 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					n, err = rng.Read(messageFromServer)
 					Expect(n).To(Equal(len(messageFromServer)))
 					Expect(err).ToNot(HaveOccurred())
-					testUDPPortForwarding(8081, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, string(messageFromClient), string(messageFromServer), "-forward-tcp")
-					testUDPPortForwarding(8092, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, string(messageFromClient), string(messageFromServer), "-reverse-tcp")
+					testUDPPortForwarding(8081, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, string(messageFromClient), string(messageFromServer), "-forward-udp")
+					testUDPPortForwarding(8092, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, string(messageFromClient), string(messageFromServer), "-reverse-udp")
 				})
 
 				It("works with IPv6 addresses", func() {
@@ -517,8 +517,8 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					if !IPv6LoopbackAvailable(addrs) {
 						Skip("IPv6 not available on this host")
 					}
-					testUDPPortForwarding(8082, false, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server")
-					testUDPPortForwarding(8093, false, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server")
+					testUDPPortForwarding(8082, false, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server", "-forward-udp")
+					testUDPPortForwarding(8093, false, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 9090}, "hello from client", "hello from server", "-reverse-udp")
 				})
 
 			})
