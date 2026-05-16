@@ -456,7 +456,16 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						originAPort := originA.Addr().(*net.TCPAddr).Port
 						originBPort := originB.Addr().(*net.TCPAddr).Port
 
-						// Pick two free server-side ports for the reverse listeners.
+						// Pick two free server-side ports for the reverse
+						// listeners.  There is an unavoidable TOCTOU window
+						// here: between Close()-ing the probe and the ssh3
+						// server reaching ListenTCP another process on the
+						// host might grab the port.  In practice the window
+						// is microseconds and the ports are in the kernel's
+						// ephemeral range, so collisions are extremely
+						// unlikely; the test will surface them clearly as a
+						// "bind: address already in use" reverse-forward
+						// setup failure.
 						probeA, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 						Expect(err).ToNot(HaveOccurred())
 						serverPortA := probeA.Addr().(*net.TCPAddr).Port
@@ -476,7 +485,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 								return
 							}
 							defer c.Close()
-							c.Write([]byte(tag))
+							_, _ = c.Write([]byte(tag))
 						}
 						doneA := make(chan struct{})
 						doneB := make(chan struct{})
@@ -486,36 +495,45 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						clientArgs := getClientArgs(rsaPrivKeyPath,
 							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originAPort, serverPortA),
 							"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originBPort, serverPortB),
-							"sleep", "5",
+							"sleep", "10",
 						)
 						command := exec.Command(ssh3Path, clientArgs...)
 						session, err := Start(command, GinkgoWriter, GinkgoWriter)
 						Expect(err).ToNot(HaveOccurred())
 						defer session.Terminate()
 
-						// Both reverse listeners should be reachable on the server side.
+						// Both reverse listeners must come up on the server side.
 						var connA, connB net.Conn
 						Eventually(func() error {
 							connA, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", serverPortA))
 							return err
-						}).ShouldNot(HaveOccurred())
+						}, "5s").ShouldNot(HaveOccurred())
 						defer connA.Close()
 						Eventually(func() error {
 							connB, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", serverPortB))
 							return err
-						}).ShouldNot(HaveOccurred())
+						}, "5s").ShouldNot(HaveOccurred())
 						defer connB.Close()
 
-						readTag := func(c net.Conn) string {
+						// Read the tag from each tunnel.  Use a real
+						// assertion on the read error - the previous
+						// version dropped it on the floor, which would
+						// mask a closed-channel race as an empty string
+						// compared against "TAG_A".
+						readTag := func(c net.Conn) (string, error) {
 							buf := make([]byte, 16)
-							c.SetReadDeadline(time.Now().Add(2 * time.Second))
-							n, _ := c.Read(buf)
-							return string(buf[:n])
+							c.SetReadDeadline(time.Now().Add(3 * time.Second))
+							n, err := c.Read(buf)
+							return string(buf[:n]), err
 						}
-						Expect(readTag(connA)).To(Equal("TAG_A"))
-						Expect(readTag(connB)).To(Equal("TAG_B"))
-						<-doneA
-						<-doneB
+						tagA, err := readTag(connA)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(tagA).To(Equal("TAG_A"))
+						tagB, err := readTag(connB)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(tagB).To(Equal("TAG_B"))
+						Eventually(doneA, "3s").Should(BeClosed())
+						Eventually(doneB, "3s").Should(BeClosed())
 					})
 
 					// Regression test for -forward-tcp accepting a non-loopback
@@ -593,10 +611,21 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						Eventually(session, "10s").Should(Exit())
 						Expect(session.ExitCode()).ToNot(Equal(0),
 							"client should fail when the server cannot bind the reverse-tcp port")
+						// The reason string the server attaches to the
+						// ack-Fail message must surface in the client's
+						// stderr - otherwise we are passing the test for
+						// the wrong reason (e.g. a generic disconnect).
+						Expect(session.Err).To(Say("address already in use"))
 					})
 
 					// Same as above but with -proxy-jump in the mix, to make sure
-					// the ack handshake survives the proxy hop.
+					// the ack handshake survives the proxy hop.  Beyond the
+					// non-zero exit code we also assert that stderr carries
+					// the *target* server's bind error verbatim - that is
+					// only possible if the request and the ack actually
+					// crossed the proxy, since the target server's listener
+					// is the only thing that can fail with "address already
+					// in use" for the chosen port.
 					It("exits non-zero on reverse-tcp bind failure through proxy jump", func() {
 						blocker, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 						Expect(err).ToNot(HaveOccurred())
@@ -616,6 +645,11 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						Eventually(session, "15s").Should(Exit())
 						Expect(session.ExitCode()).ToNot(Equal(0),
 							"client should fail through proxy jump when the server cannot bind the reverse-tcp port")
+						// The reason string is forwarded from the target
+						// server through the proxy to the client - seeing
+						// the target's specific bind error here is the
+						// evidence that the ack survived the hop.
+						Expect(session.Err).To(Say("address already in use"))
 					})
 				})
 			})
@@ -688,28 +722,34 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					Expect(err).ToNot(HaveOccurred())
 					defer session.Terminate()
 
-					// Wait for some time to ensure that the client has established the forwarding
-					time.Sleep(2 * time.Second)
-
-					// Try to connect to the tunnel entry point (see role flip above).
+					// Wait until the tunnel entry point is actually reachable
+					// instead of sleeping for a hard-coded duration: the
+					// previous time.Sleep(2*time.Second) was both racy on a
+					// loaded CI box and wasteful on a fast one.
 					var conn net.Conn
 					Eventually(func() error {
 						var err error
 						conn, err = net.Dial("udp", entryAddr)
 						return err
-					}).ShouldNot(HaveOccurred())
+					}, "5s").ShouldNot(HaveOccurred())
 					defer conn.Close()
 
-					// Send message from client
-					n, err := conn.Write([]byte(messageFromClient))
-					Expect(err).ToNot(HaveOccurred())
-					Expect(n).To(Equal(len(messageFromClient)))
-
-					// Read message from server
+					// Send message from client.  We retry the send/read pair
+					// in Eventually because UDP packets sent before the
+					// server-side bind side of a -reverse-udp forward is
+					// fully wired up will be dropped silently; the deadline
+					// covers both the initial setup race and the round-trip.
 					buffer := make([]byte, 2*len(messageFromServer))
-					conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-					n, err = conn.Read(buffer)
-					Expect(err).ToNot(HaveOccurred())
+					var n int
+					Eventually(func() error {
+						if _, werr := conn.Write([]byte(messageFromClient)); werr != nil {
+							return werr
+						}
+						conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+						var rerr error
+						n, rerr = conn.Read(buffer)
+						return rerr
+					}, "5s").ShouldNot(HaveOccurred())
 					Expect(n).To(Equal(len(messageFromServer)))
 					Expect(string(buffer[:n])).To(Equal(messageFromServer))
 				}
