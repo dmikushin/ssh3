@@ -239,70 +239,26 @@ func buildForwardingChannelAdditionalBytes(remoteAddr net.IP, port uint16) []byt
 	buf = append(buf, portBuf[:]...)
 	return buf
 }
-func buildRequestTCPReverseChannelAdditionalBytes(localAddr net.IP, localPort uint16, remoteAddr net.IP, remotePort uint16) []byte {
-	var buf []byte
-	var portBuf [2]byte
-	//var portBuf2 [2]byte
 
-	var addressFamily util.SSHForwardingAddressFamily
-	if len(localAddr) == 4 {
-		addressFamily = util.SSHAFIpv4
-	} else {
-		addressFamily = util.SSHAFIpv6
-	}
-
-	buf = util.AppendVarInt(buf, addressFamily)
-	buf = append(buf, localAddr...)
-	binary.BigEndian.PutUint16(portBuf[:], uint16(localPort))
-	buf = append(buf, portBuf[:]...)
-
-	if len(remoteAddr) == 4 {
-		addressFamily = util.SSHAFIpv4
-	} else {
-		addressFamily = util.SSHAFIpv6
-	}
-
-	buf = util.AppendVarInt(buf, addressFamily)
-	buf = append(buf, remoteAddr...)
-	binary.BigEndian.PutUint16(portBuf[:], uint16(remotePort))
-	buf = append(buf, portBuf[:]...)
-	//TODO: If I do not duplicate this, the port does not arrive to destination
-	buf = append(buf, portBuf[:]...)
+// buildRequestReverseChannelAdditionalBytes serialises the two address
+// pairs carried by a request-reverse-{tcp,udp} channel header: the
+// server-side bind address first, then the client-side target address.
+// The encoding for each pair is the same one buildForwardingChannelAdditionalBytes
+// uses (varint address family, raw address bytes, big-endian uint16 port).
+//
+// This function replaces two near-identical helpers
+// (buildRequestTCPReverseChannelAdditionalBytes and the UDP one) and drops
+// the duplicate-port-trailer workaround they carried.  That trailer was
+// a workaround for parseRequestReverseHeader using bare io.Reader.Read on
+// the address bytes: Read is not required to return as many bytes as the
+// slice can hold, and on a short read the next 2 bytes of the port slot
+// were silently being consumed as part of the previous address.  The
+// parser now uses io.ReadFull, so the wire format is back to one port per
+// pair and the workaround can go.
+func buildRequestReverseChannelAdditionalBytes(localAddr net.IP, localPort uint16, remoteAddr net.IP, remotePort uint16) []byte {
+	buf := buildForwardingChannelAdditionalBytes(localAddr, localPort)
+	buf = append(buf, buildForwardingChannelAdditionalBytes(remoteAddr, remotePort)...)
 	return buf
-
-}
-// TODO: Functions buildRequestUDPReverseChannelAdditionalBytes and buildRequestTCPReverseChannelAdditionalBytes are identical!
-func buildRequestUDPReverseChannelAdditionalBytes(localAddr net.IP, localPort uint16, remoteAddr net.IP, remotePort uint16) []byte {
-	var buf []byte
-	var portBuf [2]byte
-	//var portBuf2 [2]byte
-
-	var addressFamily util.SSHForwardingAddressFamily
-	if len(localAddr) == 4 {
-		addressFamily = util.SSHAFIpv4
-	} else {
-		addressFamily = util.SSHAFIpv6
-	}
-
-	buf = util.AppendVarInt(buf, addressFamily)
-	buf = append(buf, localAddr...)
-	binary.BigEndian.PutUint16(portBuf[:], uint16(localPort))
-	buf = append(buf, portBuf[:]...)
-
-	if len(remoteAddr) == 4 {
-		addressFamily = util.SSHAFIpv4
-	} else {
-		addressFamily = util.SSHAFIpv6
-	}
-
-	buf = util.AppendVarInt(buf, addressFamily)
-	buf = append(buf, remoteAddr...)
-	binary.BigEndian.PutUint16(portBuf[:], uint16(remotePort))
-	buf = append(buf, portBuf[:]...)
-	//TODO: If I do not duplicate this, the port does not arrive to destination
-	buf = append(buf, portBuf[:]...)
-	return buf
-
 }
 
 func parseHeader(channelID uint64, r util.Reader) (conversationControlStreamID ControlStreamID, channelType string, maxPacketSize uint64, err error) {
@@ -336,14 +292,17 @@ func parseForwardingHeader(channelID uint64, buf util.Reader) (net.IP, uint16, e
 		return nil, 0, fmt.Errorf("invalid address family: %d", addressFamily)
 	}
 
-	_, err = buf.Read(address)
-	if err != nil {
+	// io.Reader.Read does not guarantee filling the whole slice in one
+	// call; use io.ReadFull so the next field does not silently consume
+	// the leftover bytes of this one.  (That bug is what previously
+	// required buildRequestReverseChannelAdditionalBytes to emit a
+	// duplicated port trailer to "make the port arrive".)
+	if _, err = io.ReadFull(buf, address); err != nil {
 		return nil, 0, err
 	}
 
 	var portBuf [2]byte
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
+	if _, err = io.ReadFull(buf, portBuf[:]); err != nil {
 		return nil, 0, err
 	}
 	port := binary.BigEndian.Uint16(portBuf[:])
@@ -352,64 +311,19 @@ func parseForwardingHeader(channelID uint64, buf util.Reader) (net.IP, uint16, e
 }
 
 func parseRequestReverseHeader(channelID uint64, buf util.Reader) (net.IP, uint16, net.IP, uint16, error) {
-
-	var localaddress net.IP
-	var remoteaddress net.IP
-	var portBuf [2]byte
-
-	//Parse local address and port where the reverse socket is proxied within the client machine
-	//------------------------------------------------------------------------------------------
-	addressFamily, err := util.ReadVarInt(buf)
+	// Two consecutive forwarding-header pairs: the server-bind address
+	// first, then the client-target address.  See parseForwardingHeader
+	// for the io.ReadFull rationale (and the previous "duplicate the
+	// port" workaround it makes obsolete).
+	localAddress, localPort, err := parseForwardingHeader(channelID, buf)
 	if err != nil {
-		return nil, 0, nil, 0, err
+		return nil, 0, nil, 0, fmt.Errorf("parse local address: %w", err)
 	}
-
-	if addressFamily == util.SSHAFIpv4 {
-		localaddress = make([]byte, 4)
-	} else if addressFamily == util.SSHAFIpv6 {
-		localaddress = make([]byte, 16)
-	} else {
-		return nil, 0, nil, 0, fmt.Errorf("invalid local address family: %d", addressFamily)
-	}
-
-	_, err = buf.Read(localaddress)
+	remoteAddress, remotePort, err := parseForwardingHeader(channelID, buf)
 	if err != nil {
-		return nil, 0, nil, 0, err
+		return nil, 0, nil, 0, fmt.Errorf("parse remote address: %w", err)
 	}
-
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-	localport := binary.BigEndian.Uint16(portBuf[:])
-
-	//Parse remote address and port of the remote service to be proxied within the client machine
-	//-------------------------------------------------------------------------------------------
-	addressFamily, err = util.ReadVarInt(buf)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	if addressFamily == util.SSHAFIpv4 {
-		remoteaddress = make([]byte, 4)
-	} else if addressFamily == util.SSHAFIpv6 {
-		remoteaddress = make([]byte, 16)
-	} else {
-		return nil, 0, nil, 0, fmt.Errorf("invalid remote address family: %d", addressFamily)
-	}
-
-	_, err = buf.Read(remoteaddress)
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
-		return nil, 0, nil, 0, err
-	}
-	remoteport := binary.BigEndian.Uint16(portBuf[:])
-
-	return localaddress, localport, remoteaddress, remoteport, nil
+	return localAddress, localPort, remoteAddress, remotePort, nil
 }
 
 func parseUDPForwardingHeader(channelID uint64, buf util.Reader) (*net.UDPAddr, error) {

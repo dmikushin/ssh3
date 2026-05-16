@@ -341,7 +341,7 @@ func (c *Conversation) RequestTCPReverseChannel(maxPacketSize uint64, datagramsQ
 		return nil, err
 	}
 
-	additionalBytes := buildRequestTCPReverseChannelAdditionalBytes(localAddr.IP, uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
+	additionalBytes := buildRequestReverseChannelAdditionalBytes(localAddr.IP, uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
 
 	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "request-reverse-tcp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.maybeSendHeader()
@@ -355,7 +355,7 @@ func (c *Conversation) RequestUDPReverseChannel(maxPacketSize uint64, datagramsQ
 		return nil, err
 	}
 
-	additionalBytes := buildRequestUDPReverseChannelAdditionalBytes(localAddr.IP, uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
+	additionalBytes := buildRequestReverseChannelAdditionalBytes(localAddr.IP, uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
 
 	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "request-reverse-udp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.maybeSendHeader()
