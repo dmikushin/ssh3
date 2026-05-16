@@ -804,52 +804,68 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 	return conn.Addr().(*net.TCPAddr), nil
 }
 
-func (c *Client) ReverseTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remoteTCPAddr *net.TCPAddr) (*net.TCPAddr, error) {
-	log.Debug().Msgf("start TCP forwarding from %s to %s", localTCPAddr, remoteTCPAddr)
+// ReverseTCP sets up an SSH-style reverse TCP port forward.
+//
+// The "client-local" half (clientTargetAddr) is the address on the client side
+// to which incoming forwarded connections will be relayed (analogous to the
+// HOST:HOSTPORT in OpenSSH's "-R bind:port:HOST:HOSTPORT").
+//
+// The "server-side" half (serverBindAddr) is the address on the server side
+// where the listening socket is opened (analogous to the bind:port half).
+//
+// Wire-protocol note: the underlying channel header carries the server-bind
+// address in the "local" slot and the client-target address in the "remote"
+// slot (see server.go: TCPReverseForwardingChannelImpl, where LocalAddr is the
+// socket on the server machine and RemoteAddr is the socket reached via the
+// client). RequestTCPReverseChannel forwards its (localAddr, remoteAddr)
+// arguments to that header in that order, so we pass serverBindAddr first.
+func (c *Client) ReverseTCP(ctx context.Context, clientTargetAddr *net.TCPAddr, serverBindAddr *net.TCPAddr) (*net.TCPAddr, error) {
+	log.Debug().Msgf("request reverse TCP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
-	forwardingChannel, err := c.RequestTCPReverseChannel(30000, 10, localTCPAddr, remoteTCPAddr)
+	forwardingChannel, err := c.RequestTCPReverseChannel(30000, 10, serverBindAddr, clientTargetAddr)
 	if err != nil {
-		log.Error().Msgf("could open new TCP reverse forwarding channel: %s", err)
-		return remoteTCPAddr, nil
+		log.Error().Msgf("could not open new TCP reverse forwarding channel: %s", err)
+		return serverBindAddr, err
 	}
 
 	go func() {
 		for {
 			channel, err := c.AcceptChannel(c.Context())
 			if err != nil {
-				log.Debug().Msgf("Error accepting channel")
+				log.Debug().Msgf("Error accepting channel: %s", err)
+				return
 			}
 
 			switch channel.ChannelType() {
 			case "open-request-reverse-tcp":
-				log.Debug().Msgf("start reverse TCP forwarding from %s to %s", localTCPAddr, remoteTCPAddr)
+				log.Debug().Msgf("accepted reverse TCP forwarding channel; dialing client target %s", clientTargetAddr)
 
-				conn, err := net.DialTCP("tcp", nil, remoteTCPAddr)
+				conn, err := net.DialTCP("tcp", nil, clientTargetAddr)
 				if err != nil {
-					return
+					log.Error().Msgf("could not dial client target %s: %s", clientTargetAddr, err)
+					channel.Close()
+					continue
 				}
 				forwardReverseTCPInBackground(ctx, channel, conn)
-				if err != nil {
-					channel.Close()
-					return
-				}
 			}
 		}
 	}()
 	forwardingChannel.Close()
-	return remoteTCPAddr, nil
+	return serverBindAddr, nil
 }
 
-func (c *Client) ReverseUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remoteUDPAddr *net.UDPAddr) (*net.UDPAddr, error) {
-	log.Debug().Msgf("start UDP reverse forwarding from %s to %s", localUDPAddr, remoteUDPAddr)
+// ReverseUDP sets up an SSH-style reverse UDP port forward.
+// See ReverseTCP for the meaning of clientTargetAddr and serverBindAddr.
+func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, serverBindAddr *net.UDPAddr) (*net.UDPAddr, error) {
+	log.Debug().Msgf("request reverse UDP forwarding: server bind %s -> client target %s", serverBindAddr, clientTargetAddr)
 
-	forwardingChannel, err := c.RequestUDPReverseChannel(30000, 10, localUDPAddr, remoteUDPAddr)
+	forwardingChannel, err := c.RequestUDPReverseChannel(30000, 10, serverBindAddr, clientTargetAddr)
 	if err != nil {
-		log.Error().Msgf("could open new UDP reverse forwarding channel: %s", err)
-		return remoteUDPAddr, nil
+		log.Error().Msgf("could not open new UDP reverse forwarding channel: %s", err)
+		return serverBindAddr, err
 	}
 	forwardingChannel.Close()
-	return remoteUDPAddr, nil
+	return serverBindAddr, nil
 }
 
 
