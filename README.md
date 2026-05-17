@@ -77,6 +77,24 @@ This SSH3 implementation already provides many of the popular features of OpenSS
 - Proxy jump (see the `-proxy-jump` parameter). If A is an SSH3 client and B and C are both SSH3 servers, you can connect from A to C using B as a gateway/proxy. The proxy uses UDP forwarding to forward the QUIC packets from A to C, so B cannot decrypt the traffic A<->C SSH3 traffic.
 - Parses `~/.ssh/config` on the client and handles the `Hostname`, `User`, `Port` and `IdentityFile` config options (the other options are currently ignored). Also parses a new `UDPProxyJump` that behaves similarly to OpenSSH's `ProxyJump`.
 
+### 🛰️ Connection migration (`-enable-migration`, Linux client)
+
+QUIC supports moving a live connection from one network path to another without dropping the session.  When the SSH3 client is started with `-enable-migration`, it subscribes to the OS routing/address state via a Linux netlink socket; every time the kernel reports a change (address added/removed, default route changed, link up/down), the client:
+
+1. opens a fresh UDP socket on the new path,
+2. wraps it in a new `quic.Transport` and registers it as a candidate path on the same QUIC connection,
+3. probes the new path with `PATH_CHALLENGE` / `PATH_RESPONSE`,
+4. atomically switches the connection's active path on success.
+
+Every reverse and forward tunnel set up on the conversation survives the switch — the QUIC connection ID and TLS state stay attached to the same Go object, only the underlying packet path moves.  On the server side no configuration is needed: ssh3-server already keys its conversation table by the QUIC connection, leaves migration enabled in its transport parameters, and (for observability) logs `peer migrated for user <X>: <old-addr> -> <new-addr>` whenever it accepts a new path.
+
+Limitations and gotchas:
+
+- Linux client only for now (`netchange.ErrUnsupported` on other platforms; the flag becomes a no-op).
+- The flag is opt-in: tunnels that don't need migration don't pay for a netlink subscriber.
+- Migration recovers from path / IP changes, not from server reboots or long blackholes that exceed the QUIC idle timeout.  For those, wrap the client in a shell-level reconnect loop (the same pattern autossh uses).
+- The migration coordinator keeps exactly one generation of "old" transport alive past each successful switch, so quic-go can drain in-flight packets queued on the previous socket before it disappears.
+
 ## 🙏 Community support
 Help us progress SSH3 responsibly! We welcome capable security researchers to review our codebase and provide feedback. Please also connect us with relevant standards bodies to potentially advance SSH3 through the formal IETF/IRTF processes over time.
 
