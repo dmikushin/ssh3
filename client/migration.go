@@ -94,8 +94,10 @@ type migrationCoordinator struct {
 
 func (mc *migrationCoordinator) run(ctx context.Context) {
 	defer func() {
-		if err := mc.watcher.Close(); err != nil {
-			log.Debug().Msgf("migration: closing netchange watcher: %s", err)
+		if mc.watcher != nil {
+			if err := mc.watcher.Close(); err != nil {
+				log.Debug().Msgf("migration: closing netchange watcher: %s", err)
+			}
 		}
 		if mc.previousTransport != nil {
 			_ = mc.previousTransport.Close()
@@ -104,6 +106,62 @@ func (mc *migrationCoordinator) run(ctx context.Context) {
 
 	connDone := mc.client.qconn.Context().Done()
 
+	// Auto-restart loop for the netchange watcher.  A transient
+	// kernel error (ENOBUFS under netlink pressure, a momentary
+	// read failure) closes the events channel and exits the inner
+	// for-loop; we then back off, reopen the watcher and resume.
+	// Without this loop one such hiccup permanently disabled
+	// migration for the rest of the connection's lifetime - a
+	// silent-degradation mode flagged by the audit.
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	for {
+		mc.consumeEvents(ctx, connDone)
+
+		// consumeEvents returns either because the events channel
+		// closed (watcher died) or because ctx / qconn ended.  In
+		// the latter case we exit; in the former we try to reopen.
+		select {
+		case <-ctx.Done():
+			return
+		case <-connDone:
+			return
+		default:
+		}
+
+		log.Warn().Msgf("migration: netchange watcher died, reopening in %s", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		case <-connDone:
+			return
+		}
+		newWatcher, err := netchange.New()
+		if err != nil {
+			log.Warn().Msgf("migration: could not reopen netchange watcher: %s", err)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		// Close the old (already-broken) watcher just in case it
+		// still holds an fd, and swap in the new one.
+		if mc.watcher != nil {
+			_ = mc.watcher.Close()
+		}
+		mc.watcher = newWatcher
+		backoff = 500 * time.Millisecond
+		log.Info().Msg("migration: netchange watcher reopened")
+	}
+}
+
+// consumeEvents reads from the current watcher's Events channel until
+// either the channel closes (watcher error) or one of the cancellation
+// channels fires.  It does not own the watcher's lifetime - the outer
+// run() decides whether to reopen or shut down.
+func (mc *migrationCoordinator) consumeEvents(ctx context.Context, connDone <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -112,7 +170,7 @@ func (mc *migrationCoordinator) run(ctx context.Context) {
 			return
 		case ev, ok := <-mc.watcher.Events():
 			if !ok {
-				log.Debug().Msg("migration: netchange events channel closed; stopping")
+				log.Debug().Msg("migration: netchange events channel closed")
 				return
 			}
 			mc.handleEvent(ctx, ev)
