@@ -1039,7 +1039,15 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 		case ssh3.ReverseSetupAckOK:
 			return true, false, nil
 		case ssh3.ReverseSetupAckFail:
-			reason := strings.TrimSpace(dm.Data[1:])
+			// Cap the reason to keep a malicious or buggy server from
+			// shipping a 256 KB UTF-8 blob straight into our log/
+			// error path.
+			const maxReason = 512
+			reasonRaw := dm.Data[1:]
+			if len(reasonRaw) > maxReason {
+				reasonRaw = reasonRaw[:maxReason]
+			}
+			reason := strings.TrimSpace(reasonRaw)
 			if reason == "" {
 				reason = "server reported failure with no reason"
 			}
