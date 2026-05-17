@@ -268,10 +268,23 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 			// the server already supports migration end-to-end.  All
 			// this goroutine does is log the transition for
 			// observability.
-			go func(initialPeer string) {
+			//
+			// We compare only the IP portion of RemoteAddr, not the
+			// full IP:port.  NAT rebinds (common on cellular and
+			// some enterprise firewalls) shift the source port every
+			// ~30 s without any actual path change; logging those as
+			// "peer migrated" would spam the log with false alarms
+			// that look like real migrations to an operator.
+			go func() {
 				ticker := time.NewTicker(2 * time.Second)
 				defer ticker.Stop()
-				prev := initialPeer
+				peerIP := func() string {
+					if addr, ok := qconn.RemoteAddr().(*net.UDPAddr); ok && addr != nil {
+						return addr.IP.String()
+					}
+					return qconn.RemoteAddr().String()
+				}
+				prev := peerIP()
 				for {
 					select {
 					case <-ctx.Done():
@@ -279,13 +292,13 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 					case <-qconn.Context().Done():
 						return
 					case <-ticker.C:
-						if curr := qconn.RemoteAddr().String(); curr != prev {
+						if curr := peerIP(); curr != prev {
 							log.Info().Msgf("peer migrated for user %s: %s -> %s", authenticatedUsername, prev, curr)
 							prev = curr
 						}
 					}
 				}
-			}(qconn.RemoteAddr().String())
+			}()
 
 			go func() {
 				// TODO: this hijacks the datagrams for the whole quic connection, so the server
