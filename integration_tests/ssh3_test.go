@@ -1099,23 +1099,43 @@ while True:
 					runMigrationSpec(false)
 				})
 
-				// PIt: pending - the production-side code change
-				// (cmd/ssh3.go's `if startProxyMigration != nil`)
-				// drives proxy-only migration when -enable-migration
-				// is combined with -proxy-jump, and is the correct
-				// architecture (see README's Connection-migration
-				// section).  The reverse-forward listener on the
-				// target server does not come up at all in this
-				// harness's netns/DNAT topology even before the
-				// route swap fires, which suggests the failure is
-				// in how target-leg packets traverse the proxy's
-				// UDP-forward inside the netns rather than in the
-				// migration coordinator itself.  Marked pending so
-				// the rest of the suite can run cleanly; the proxy-
-				// jump migration path needs a follow-up debug
-				// session with quic-go datagram traces to figure
-				// out why the target CONNECT never reaches the
-				// target server through the in-netns proxy.
+				// PIt: pending.  The proxy-only-coordinator
+				// architecture (cmd/ssh3.go) is correct on its face
+				// and the direct-migration spec just above passes,
+				// but proxy-jump migration is NOT yet demonstrated
+				// end-to-end.  Last debug run on this harness:
+				//
+				//   - primary QUIC leg (client@netns ->
+				//     192.168.250.1:4444 -DNAT-> host:4444) is fine:
+				//     server logs CONNECT 200 OK for the proxy.
+				//   - proxyClient.ForwardUDP starts cleanly:
+				//     "started proxy jump at 127.0.0.1:58411".
+				//   - target QUIC dial (client@netns ->
+				//     127.0.0.1:58411 via netns loopback) errors
+				//     with "timeout: no recent network activity"
+				//     before the handshake completes.
+				//
+				// In other words target-conversation datagrams reach
+				// the in-netns ForwardUDP listener but the response
+				// path target -> proxy -> client never closes the
+				// loop in time.  Likely culprits (not yet confirmed):
+				//   - quic-go datagram routing back through the
+				//     QUIC tunnel + netns loopback has different
+				//     timing characteristics than the same flow on
+				//     a single namespace,
+				//   - or the DNAT + route_localnet + conntrack
+				//     interaction on the host's veth changes UDP
+				//     reply pinning so proxy's reverse datagrams
+				//     don't arrive at the client's source port.
+				//
+				// The agreed-upon plan is to rebuild this test on a
+				// 3-namespace topology (client_ns, proxy_ns,
+				// target_ns with real veth pairs, NO DNAT and NO
+				// loopback overloading) so the data plane mirrors a
+				// real proxy-jump deployment.  Until then the spec
+				// remains PIt and the README carries an explicit
+				// caveat that proxy-jump migration is best-effort
+				// and not covered by an automated test.
 				PIt("survives a default-route swap inside a netns with proxy-jump", func() {
 					runMigrationSpec(true)
 				})
