@@ -521,6 +521,7 @@ func ClientMain() int {
 	displayVersion := flag.Bool("version", false, "if set, displays the software version on standard output and exit")
 	noPKCE := flag.Bool("no-pkce", false, "if set perform PKCE challenge-response with oidc")
 	forwardSSHAgent := flag.Bool("forward-agent", false, "if set, forwards ssh agent to be used with sshv2 connections on the remote host")
+	enableMigration := flag.Bool("enable-migration", false, "if set, automatically migrate the QUIC connection onto a new network path when the OS reports the routing/address state has changed (Linux only). Useful for long-lived tunnels that need to survive a Wi-Fi/4G/Ethernet switch without dropping forwards.")
 	var forwardUDPSpecs stringList
 	flag.Var(&forwardUDPSpecs, "forward-udp", "if set, forward a UDP socket. Syntax: <local_bind_port>/<local_bind_ip>@<remote_port>/<remote_ip>. The client opens a UDP socket on local_bind_ip:local_bind_port and relays datagrams over the QUIC tunnel to the server, which sends them to remote_ip:remote_port. May be specified multiple times; a single value may also carry several comma-separated specs (used for UDP multicast groups).")
 	var forwardTCPSpecs stringList
@@ -820,6 +821,14 @@ func ClientMain() int {
 	if err != nil {
 		log.Error().Msgf("could not dial %s: %s", options.CanonicalHostFormat(), err)
 		return -1
+	}
+	if *enableMigration {
+		// Kick off the network-change watcher + path-migration loop
+		// in the background.  It stops on its own when the QUIC
+		// conversation context (which is derived from qconn) is
+		// cancelled, so we do not need to plumb a separate stop
+		// signal through here.
+		c.StartMigration(ctx)
 	}
 	for _, pair := range forwardTCPPairs {
 		if _, err := c.ForwardTCP(ctx, pair.clientLocal, pair.serverRemote); err != nil {

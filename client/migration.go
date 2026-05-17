@@ -1,0 +1,193 @@
+package client
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/francoismichel/ssh3/client/netchange"
+	"github.com/quic-go/quic-go"
+	"github.com/rs/zerolog/log"
+)
+
+// StartMigration wires the netlink-based network-change watcher into
+// a QUIC connection-migration coordinator running for the lifetime of
+// the connection.
+//
+// The coordinator does, for every detected network change:
+//
+//  1. Open a fresh UDP socket and wrap it in a *quic.Transport.
+//  2. Ask quic-go to add this transport as a candidate path on the
+//     connection (Conn.AddPath).
+//  3. Probe the path (PATH_CHALLENGE / PATH_RESPONSE) with a 5 s
+//     timeout.
+//  4. If the probe succeeds, switch the active path to the new one
+//     and remember the new transport on the Client.  The previous
+//     candidate transport (if any) is closed at this point - we keep
+//     exactly one "old" transport alive past a switch so that any
+//     in-flight packets still being sent over it can drain before we
+//     yank the socket out from under quic-go.
+//  5. If the probe fails, abandon: close the new path, the new
+//     transport, and the new UDP socket; log a warning; continue.
+//
+// While a migration is in-flight, subsequent network-change events
+// are coalesced: the coordinator simply notes that "another change
+// happened" and re-evaluates as soon as the current migration ends.
+// We never run two migrations concurrently.
+//
+// startMigrationLoop returns immediately; the goroutine it spawns
+// stops when ctx is cancelled or when the netchange watcher errors
+// out.  Errors are logged, not returned, because the goroutine
+// outlives the call.
+func (c *Client) StartMigration(ctx context.Context) {
+	if c.qtransport == nil {
+		// No transport handle - we cannot migrate.  This is the
+		// proxy-jump path; not an error.
+		return
+	}
+
+	watcher, err := netchange.New()
+	if err != nil {
+		if errors.Is(err, netchange.ErrUnsupported) {
+			log.Info().Msg("connection migration disabled: netchange watcher not supported on this platform")
+		} else {
+			log.Warn().Msgf("connection migration disabled: %s", err)
+		}
+		return
+	}
+
+	mc := &migrationCoordinator{
+		client:  c,
+		watcher: watcher,
+	}
+	go mc.run(ctx)
+}
+
+// migrationCoordinator owns the goroutine that reacts to
+// netchange.Watcher events and drives quic-go's path migration API.
+type migrationCoordinator struct {
+	client  *Client
+	watcher netchange.Watcher
+
+	// mu serialises migration attempts: at most one runs at a time.
+	mu      sync.Mutex
+	// previousTransport is the transport that owned the path active
+	// before the most recent successful Switch.  It is kept alive
+	// across one migration so that quic-go can drain any in-flight
+	// packets, and closed at the next successful Switch.  nil before
+	// the first migration.
+	previousTransport *quic.Transport
+}
+
+func (mc *migrationCoordinator) run(ctx context.Context) {
+	defer func() {
+		if err := mc.watcher.Close(); err != nil {
+			log.Debug().Msgf("migration: closing netchange watcher: %s", err)
+		}
+		if mc.previousTransport != nil {
+			_ = mc.previousTransport.Close()
+		}
+	}()
+
+	connDone := mc.client.qconn.Context().Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-connDone:
+			return
+		case ev, ok := <-mc.watcher.Events():
+			if !ok {
+				log.Debug().Msg("migration: netchange events channel closed; stopping")
+				return
+			}
+			mc.handleEvent(ctx, ev)
+		}
+	}
+}
+
+func (mc *migrationCoordinator) handleEvent(ctx context.Context, ev netchange.Event) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	log.Info().Msgf("migration: network change observed (%s), attempting path migration", ev.Reason)
+
+	if err := mc.migrate(ctx); err != nil {
+		log.Warn().Msgf("migration: %s", err)
+		return
+	}
+	log.Info().Msg("migration: switched to new network path successfully")
+}
+
+// migrate runs one full probe-and-switch cycle.  Returns nil on
+// success or a descriptive error on failure (in which case the new
+// transport/socket are already cleaned up).
+func (mc *migrationCoordinator) migrate(ctx context.Context) error {
+	// Open a fresh UDP socket.  Letting the kernel pick the local
+	// address means we automatically use the new default route.
+	udpConn, err := net.ListenUDP(udpNetworkFor(mc.client.qconn), nil)
+	if err != nil {
+		return fmt.Errorf("open new UDP socket: %w", err)
+	}
+
+	newTransport := &quic.Transport{Conn: udpConn}
+
+	// AddPath registers the new transport with quic-go and gives us
+	// back a *quic.Path we can probe and switch onto.
+	path, err := mc.client.qconn.AddPath(newTransport)
+	if err != nil {
+		_ = newTransport.Close()
+		_ = udpConn.Close()
+		return fmt.Errorf("add path: %w", err)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := path.Probe(probeCtx); err != nil {
+		_ = path.Close()
+		_ = newTransport.Close()
+		_ = udpConn.Close()
+		return fmt.Errorf("probe new path: %w", err)
+	}
+
+	if err := path.Switch(); err != nil {
+		_ = path.Close()
+		_ = newTransport.Close()
+		_ = udpConn.Close()
+		return fmt.Errorf("switch to new path: %w", err)
+	}
+
+	// Migration succeeded.  Retire the previous candidate transport
+	// (the one we promoted last time round) and keep the just-
+	// retired transport in its slot.  We keep one generation of
+	// "old" transport alive so quic-go has time to drain in-flight
+	// packets on it before the socket disappears.
+	oldTransport := mc.client.qtransport
+	if mc.previousTransport != nil {
+		if err := mc.previousTransport.Close(); err != nil {
+			log.Debug().Msgf("migration: closing retired previous transport: %s", err)
+		}
+	}
+	mc.previousTransport = oldTransport
+	mc.client.qtransport = newTransport
+	return nil
+}
+
+// udpNetworkFor picks "udp4" / "udp6" matching the address family of
+// the connection's current remote endpoint, so the new socket lands
+// in the right family.
+func udpNetworkFor(conn *quic.Conn) string {
+	// RemoteAddr is a *net.UDPAddr on quic-go's *quic.Conn for the
+	// dialed (client) case.
+	if addr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && addr != nil {
+		if addr.IP.To4() != nil {
+			return "udp4"
+		}
+		return "udp6"
+	}
+	return "udp"
+}
