@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/francoismichel/ssh3/util"
 	"golang.org/x/exp/slices"
@@ -298,9 +299,38 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 		// with H3_FRAME_UNEXPECTED by the StreamHijacker.  The ack is
 		// also a soft proof that the server actually accepted the
 		// conversation (not just the CONNECT headers).
+		//
+		// Distinguishing legacy from broken server: a PR148-baseline
+		// server never advertises Ssh3-Setup-Ack and never writes the
+		// ack, so the read stalls forever - we fall back to "no ack
+		// expected" without surfacing an error.  A new server that
+		// crashes or whose ack write fails between addConversation
+		// and the byte being on the wire closes the request stream,
+		// which produces EOF here.  When the server advertised the
+		// feature, that EOF is a real protocol error and we refuse
+		// to proceed (the conversation registration is presumed
+		// broken on the server side).
+		serverAcks := rsp.Header.Get("Ssh3-Setup-Ack") == "1"
 		var ack [1]byte
-		if _, err := io.ReadFull(lastReqStream, ack[:]); err != nil {
-			log.Warn().Msgf("could not read conversation-ready ack from server: %s (continuing anyway)", err)
+		readDone := make(chan error, 1)
+		go func() {
+			_, err := io.ReadFull(lastReqStream, ack[:])
+			readDone <- err
+		}()
+		const ackReadTimeout = 5 * time.Second
+		select {
+		case err := <-readDone:
+			if err != nil {
+				if serverAcks {
+					return fmt.Errorf("server advertised Ssh3-Setup-Ack but did not deliver it: %w", err)
+				}
+				log.Debug().Msgf("legacy server: no conversation-ready ack (%s); continuing", err)
+			}
+		case <-time.After(ackReadTimeout):
+			if serverAcks {
+				return fmt.Errorf("server advertised Ssh3-Setup-Ack but no ack arrived within %s", ackReadTimeout)
+			}
+			log.Debug().Msgf("legacy server: no Ssh3-Setup-Ack header and no ack within %s; continuing", ackReadTimeout)
 		}
 		return nil
 	} else if rsp.StatusCode == http.StatusUnauthorized {

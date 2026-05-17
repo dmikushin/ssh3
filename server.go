@@ -223,6 +223,19 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 			conversationsManager := s.getOrCreateConversationsManager(qconn)
 			conversationsManager.addConversation(newConv)
 
+			// Advertise that we will emit a one-byte conversation-ready
+			// ack on the CONNECT stream after WriteHeader.  A client
+			// that sees this header MUST io.ReadFull the ack before
+			// opening any channel - and on EOF/error MUST treat it as
+			// a fatal protocol error rather than the legacy "old
+			// server doesn't ack" fallback.  Without this advertised
+			// commitment, the client cannot distinguish an old PR148-
+			// baseline server (no ack, channel stays open) from a new
+			// server whose ack write failed (channel closes before
+			// the ack arrives) - the latter would silently degrade
+			// into "tunnel is up but forward is broken".
+			w.Header().Set("Ssh3-Setup-Ack", "1")
+
 			w.WriteHeader(200)
 
 			// Synchronisation handshake against the quic-go v0.57+
