@@ -105,6 +105,13 @@ type migrationCoordinator struct {
 const minMigrationInterval = 10 * time.Second
 
 func (mc *migrationCoordinator) run(ctx context.Context) {
+	// Remember the transport the conversation was originally dialed
+	// on.  Its lifetime is owned by ClientMain (it predates the
+	// coordinator), so we must NOT close it on teardown - we'd be
+	// pulling a socket out from under code we don't own.  Anything
+	// else in c.qtransport at teardown was created by us in
+	// migrate() and must be closed.
+	initialTransport := mc.client.qtransport
 	defer func() {
 		if mc.watcher != nil {
 			if err := mc.watcher.Close(); err != nil {
@@ -113,6 +120,13 @@ func (mc *migrationCoordinator) run(ctx context.Context) {
 		}
 		if mc.previousTransport != nil {
 			_ = mc.previousTransport.Close()
+		}
+		// Close the active transport iff we created it ourselves
+		// (i.e. at least one migration succeeded).  Without this the
+		// underlying UDP socket leaks on every clean session exit
+		// after a migration.
+		if mc.client.qtransport != nil && mc.client.qtransport != initialTransport {
+			_ = mc.client.qtransport.Close()
 		}
 	}()
 
