@@ -72,8 +72,18 @@ type migrationCoordinator struct {
 	client  *Client
 	watcher netchange.Watcher
 
-	// mu serialises migration attempts: at most one runs at a time.
-	mu      sync.Mutex
+	// mu protects busy / pending and serialises mutation of the
+	// transport pointers below.
+	mu sync.Mutex
+	// busy is true while a migrate() call is in progress.  While
+	// busy, additional events do NOT trigger a parallel migration:
+	// they just set pending = true so the in-flight migration knows
+	// to do one more cycle when it finishes.  This is the coalescing
+	// the package comment promises - implemented inside the
+	// coordinator rather than relying on the netchange watcher's
+	// debounce alone.
+	busy    bool
+	pending bool
 	// previousTransport is the transport that owned the path active
 	// before the most recent successful Switch.  It is kept alive
 	// across one migration so that quic-go can drain any in-flight
@@ -110,17 +120,46 @@ func (mc *migrationCoordinator) run(ctx context.Context) {
 	}
 }
 
+// handleEvent either starts a fresh migration cycle or records that
+// "another change happened" if a cycle is already running.  In the
+// latter case the in-flight cycle will run one additional migration
+// after it finishes, coalescing all the bursty events that arrived
+// while it was busy into a single follow-up.
 func (mc *migrationCoordinator) handleEvent(ctx context.Context, ev netchange.Event) {
 	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	log.Info().Msgf("migration: network change observed (%s), attempting path migration", ev.Reason)
-
-	if err := mc.migrate(ctx); err != nil {
-		log.Warn().Msgf("migration: %s", err)
+	if mc.busy {
+		mc.pending = true
+		mc.mu.Unlock()
+		log.Debug().Msgf("migration: queued network change (%s); migrate in progress", ev.Reason)
 		return
 	}
-	log.Info().Msg("migration: switched to new network path successfully")
+	mc.busy = true
+	mc.mu.Unlock()
+
+	for {
+		log.Info().Msgf("migration: network change observed (%s), attempting path migration", ev.Reason)
+		if err := mc.migrate(ctx); err != nil {
+			log.Warn().Msgf("migration: %s", err)
+		} else {
+			log.Info().Msg("migration: switched to new network path successfully")
+		}
+
+		// Check whether more events arrived while we were busy.
+		// If so, do one more cycle - but only one, regardless of
+		// how many events piled up.  All of them collapse to a
+		// single follow-up migration because by the time we get
+		// here, the latest network state is what matters; the
+		// individual reasons are no longer interesting.
+		mc.mu.Lock()
+		if !mc.pending {
+			mc.busy = false
+			mc.mu.Unlock()
+			return
+		}
+		mc.pending = false
+		mc.mu.Unlock()
+		ev = netchange.Event{When: time.Now(), Reason: "coalesced-follow-up"}
+	}
 }
 
 // migrate runs one full probe-and-switch cycle.  Returns nil on
