@@ -1,1 +1,14 @@
 /bin/
+# build outputs from local smoke tests
+/ssh3-bin
+/ssh3-server-bin
+/ssh3-fix-*
+/ssh3-fix2-*
+/ssh3-fix3-*
+/ssh3-fix4-*
+/ssh3-fix5-*
+/ssh3-pr148-*
+/ssh3-v057-*
+/bin/
+/cert.pem
+/priv.key
