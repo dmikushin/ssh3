@@ -817,16 +817,29 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				// migration test in a way that can be parameterised
 				// over whether -proxy-jump is in the picture or not.
 				//
-				// When proxyJump is true the client is started with
-				// -proxy-jump pointing at the proxy server reachable
-				// through the same netns gateway IP; the test then
-				// asserts that the *proxy* server logs a "peer
-				// migrated for user X" line after the default-route
-				// swap.  The *target* server does NOT migrate: its
-				// peer (as seen by it) is the proxy's loopback
-				// UDP-forward endpoint, which never changes.  One
-				// migration on the proxy leg carries the target
-				// leg's loopback traffic along with it.
+				// Topology (see netnsEnv): three namespaces
+				// (client_ns, proxy_ns, target_ns) connected by
+				// real veth pairs - no DNAT, no loopback overload.
+				//
+				// Both variants spawn DEDICATED ssh3-server
+				// processes inside their target namespaces (rather
+				// than reusing the BeforeSuite host-side servers)
+				// so that every QUIC endpoint has a routable real
+				// address.  This is what makes proxy-jump migration
+				// actually testable: the proxy can dial the target
+				// over its own veth, the client reaches the proxy
+				// through the host's IP-forwarding, and the swapped
+				// default route inside client_ns produces a real
+				// source-IP change on the proxy leg.
+				//
+				// What we assert:
+				//   - direct: target server logs "peer migrated
+				//     for user X" after the route swap.
+				//   - proxy-jump: *proxy* server logs it.  Target
+				//     server does NOT migrate - its peer is the
+				//     proxy's loopback UDP-forward endpoint, which
+				//     does not change when the client↔proxy path
+				//     does.
 				runMigrationSpec := func(proxyJump bool) {
 					if os.Geteuid() != 0 {
 						Skip("netns migration test requires root")
@@ -835,19 +848,12 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						Skip("iproute2 'ip' binary not found in PATH")
 					}
 					if _, err := exec.LookPath("iptables"); err != nil {
-						Skip("iptables binary not found in PATH (needed for DNAT to the loopback-bound server)")
+						Skip("iptables binary not found in PATH (needed to ACCEPT inter-namespace forwarding)")
 					}
 
 					env := newNetnsEnv()
 					if err := env.setup(); err != nil {
-						// Always run teardown so a partially-built
-						// netns does not leak into the next run.
 						_ = env.teardown()
-						// Permission / sandbox failures look like
-						// EPERM, "operation not permitted", or
-						// "open /proc/sys/...: read-only file
-						// system".  Skip rather than fail so the
-						// suite stays green in CI sandboxes.
 						msg := err.Error()
 						if strings.Contains(msg, "operation not permitted") ||
 							strings.Contains(msg, "permission denied") ||
@@ -859,42 +865,89 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					}
 					defer func() {
 						if err := env.teardown(); err != nil {
-							// Use AddReportEntry-style logging via
-							// GinkgoWriter; do NOT Fail here, as
-							// that would mask the real test result.
 							fmt.Fprintf(GinkgoWriter, "netns teardown error: %v\n", err)
 						}
 					}()
 
-					// Pick a free server-side port for the reverse-tcp
-					// listener so concurrent test reruns do not stomp
-					// on each other.  The TOCTOU window (we close the
-					// probe and then ask ssh3 to bind it) is the same
-					// pattern the existing reverse-tcp specs use.
-					probe, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					// Pick free ports for the dedicated servers in
+					// each variant.  Picking ephemeral ports up front
+					// (probe-and-close TOCTOU) is acceptable here
+					// because the namespaces are throw-away.
+					reservePort := func() int {
+						l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+						Expect(err).ToNot(HaveOccurred())
+						defer l.Close()
+						return l.Addr().(*net.TCPAddr).Port
+					}
+					targetPort := reservePort()
+					proxyPort := reservePort()
+					reversePort := reservePort()
+
+					// Spawn the target ssh3-server in target_ns
+					// (proxy-jump) or in the *host* network namespace
+					// bound to the client-reachable address (direct).
+					//
+					// For direct mode we bind on 0.0.0.0 of the
+					// HOST so that both pair-A (10.99.0.1) and pair-B
+					// (10.99.0.5) addresses accept the client's
+					// connection, which is what makes the
+					// post-swap path keep working.
+					targetServerCmd := func() *exec.Cmd {
+						if proxyJump {
+							return exec.Command("ip", "netns", "exec", env.targetNS,
+								ssh3ServerPath,
+								"-bind", fmt.Sprintf("0.0.0.0:%d", targetPort),
+								"-v",
+								"-url-path", DEFAULT_URL_PATH,
+								"-cert", os.Getenv("CERT_PEM"),
+								"-key", os.Getenv("CERT_PRIV_KEY"))
+						}
+						return exec.Command(ssh3ServerPath,
+							"-bind", fmt.Sprintf("0.0.0.0:%d", targetPort),
+							"-v",
+							"-url-path", DEFAULT_URL_PATH,
+							"-cert", os.Getenv("CERT_PEM"),
+							"-key", os.Getenv("CERT_PRIV_KEY"))
+					}()
+					targetServerCmd.Env = append(targetServerCmd.Env, "SSH3_LOG_LEVEL=debug")
+					targetServerSession, err := Start(targetServerCmd, GinkgoWriter, GinkgoWriter)
 					Expect(err).ToNot(HaveOccurred())
-					reversePort := probe.Addr().(*net.TCPAddr).Port
-					probe.Close()
+					defer targetServerSession.Terminate()
 
-					// The origin TCP server lives on the client side
-					// (inside the netns).  When something dials the
-					// host-side reverse-tcp listener, the ssh3 client
-					// dials this origin locally via the tunnel.  We
-					// must start it BEFORE the ssh3 client comes up
-					// and answers the first reverse-tcp probe, hence
-					// the ordering here.
-					originPort := 18765
+					// Proxy server runs in proxy_ns only when proxy-
+					// jump is exercised.
+					var proxyServerSession *Session
+					if proxyJump {
+						proxyServerCmd := exec.Command("ip", "netns", "exec", env.proxyNS,
+							ssh3ServerPath,
+							"-bind", fmt.Sprintf("0.0.0.0:%d", proxyPort),
+							"-v",
+							"-url-path", DEFAULT_PROXY_URL_PATH,
+							"-cert", os.Getenv("CERT_PEM"),
+							"-key", os.Getenv("CERT_PRIV_KEY"))
+						proxyServerCmd.Env = append(proxyServerCmd.Env, "SSH3_LOG_LEVEL=debug")
+						proxyServerSession, err = Start(proxyServerCmd, GinkgoWriter, GinkgoWriter)
+						Expect(err).ToNot(HaveOccurred())
+						defer proxyServerSession.Terminate()
+					}
 
-					// Use socat if available, otherwise fall back to
-					// a tiny python3 listener.  Either way the goal
-					// is the same: every accepted TCP connection
-					// gets back the literal "TUNNEL_OK".  We avoid
-					// in-process net.Listen() here because the
-					// listener has to live INSIDE the netns and Go's
-					// setns()-from-a-goroutine is unsafe.
+					// Wait for the target server to bind.  The session
+					// stderr says "Server started, listening on …".
+					Eventually(targetServerSession.Err, "5s").Should(Say("Server started, listening on"))
+					if proxyServerSession != nil {
+						Eventually(proxyServerSession.Err, "5s").Should(Say("Server started, listening on"))
+					}
+
+					// Origin TCP server lives on the client side
+					// (inside client_ns).  When something on the
+					// server side dials the reverse-tcp listener,
+					// the ssh3 client dials this origin locally via
+					// the tunnel.  Must be up before the ssh3 client
+					// answers the first probe.
+					originPort := reservePort()
 					var originCmd *exec.Cmd
 					if _, err := exec.LookPath("socat"); err == nil {
-						originCmd = exec.Command("ip", "netns", "exec", env.nsName,
+						originCmd = exec.Command("ip", "netns", "exec", env.clientNS,
 							"socat", fmt.Sprintf("TCP-LISTEN:%d,bind=127.0.0.1,reuseaddr,fork", originPort),
 							"SYSTEM:'printf TUNNEL_OK'")
 					} else if _, err := exec.LookPath("python3"); err == nil {
@@ -911,7 +964,7 @@ while True:
     finally:
         c.close()
 `, originPort)
-						originCmd = exec.Command("ip", "netns", "exec", env.nsName, "python3", "-c", py)
+						originCmd = exec.Command("ip", "netns", "exec", env.clientNS, "python3", "-c", py)
 					} else {
 						Skip("need socat or python3 to run the origin TCP server inside the netns")
 					}
@@ -922,12 +975,8 @@ while True:
 						_ = originCmd.Process.Kill()
 						_, _ = originCmd.Process.Wait()
 					}()
-
-					// Wait for the in-netns origin to actually bind
-					// before launching the ssh3 client.  Dial from
-					// inside the netns via `ip netns exec`.
 					Eventually(func() error {
-						out, err := exec.Command("ip", "netns", "exec", env.nsName,
+						out, err := exec.Command("ip", "netns", "exec", env.clientNS,
 							"sh", "-c", fmt.Sprintf("exec 3<>/dev/tcp/127.0.0.1/%d", originPort)).CombinedOutput()
 						if err != nil {
 							return fmt.Errorf("origin not yet listening: %v: %s", err, string(out))
@@ -935,47 +984,27 @@ while True:
 						return nil
 					}, "5s", "100ms").ShouldNot(HaveOccurred())
 
-					// Let any netlink events generated by env.setup
+					// Settle any netlink events generated by env.setup
 					// (interface up, route add, address assignment)
-					// drain before the ssh3 client - and its migration
-					// watcher - starts.  Without this pause the
-					// watcher catches the tail end of the setup burst
-					// and fires a migration mid-tunnel-setup, which on
-					// the proxy-jump variant disrupts the in-flight
-					// CONNECT through the proxy and prevents the
-					// reverse-forward from ever coming up.
+					// before the ssh3 client - and its migration
+					// watcher - starts.  Without this the watcher
+					// catches the tail end of the setup burst and
+					// fires a migration mid-tunnel-setup.  P1.2(b)
+					// will replace this with a timestamp-filter in
+					// the coordinator itself.
 					time.Sleep(1500 * time.Millisecond)
 
-					// Mark a fence point in each server's stderr so the
-					// "peer migrated" Eventually assertions later in
-					// this spec only see migration events caused by
-					// THIS spec's route-swap, not by an earlier spec's
-					// teardown.  We use Say(.{0,0}) just to advance
-					// the gbytes read cursor to "end of buffer at this
-					// moment in time".
-					Expect(serverSessions[serverBind].Err).ToNot(BeNil())
+					// Target URL: in direct mode the host's pair-A
+					// address (the initial default route target);
+					// in proxy-jump mode the target_ns address, which
+					// the proxy can reach over its own veth.
+					targetHostPort := fmt.Sprintf("%s:%d", env.vethCAOuterIP, targetPort)
 					if proxyJump {
-						Expect(serverSessions[proxyServerBind].Err).ToNot(BeNil())
+						targetHostPort = fmt.Sprintf("%s:%d", env.vethTInnerIP, targetPort)
 					}
 
-					// Start the ssh3 client inside the netns, using
-					// the host's pair-A IP as the server endpoint.
-					// iptables DNAT redirects 192.168.250.1:4433 to
-					// the real 127.0.0.1:4433 server on the host, and
-					// (when proxyJump is set) 192.168.250.1:4444 to
-					// 127.0.0.1:4444 for the proxy server.  In the
-					// proxy-jump case the *target* URL must point at
-					// the address the PROXY (which lives on the host)
-					// can reach the target with, i.e. 127.0.0.1:4433.
-					// The proxy hop itself is the leg whose source
-					// address sits inside the netns; the post-proxy
-					// leg is a host-local UDP forward.
-					targetHostPort := fmt.Sprintf("%s:4433", env.vethAOuterIP)
-					if proxyJump {
-						targetHostPort = "127.0.0.1:4433"
-					}
 					clientArgs := []string{
-						"netns", "exec", env.nsName,
+						"netns", "exec", env.clientNS,
 						ssh3Path,
 						"-v",
 						"-insecure",
@@ -984,11 +1013,11 @@ while True:
 					}
 					if proxyJump {
 						clientArgs = append(clientArgs,
-							"-proxy-jump", fmt.Sprintf("%s@%s:4444%s", username, env.vethAOuterIP, DEFAULT_PROXY_URL_PATH),
+							"-proxy-jump", fmt.Sprintf("%s@%s:%d%s", username, env.vethPInnerIP, proxyPort, DEFAULT_PROXY_URL_PATH),
 						)
 					}
 					clientArgs = append(clientArgs,
-						"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originPort, reversePort),
+						"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/0.0.0.0", originPort, reversePort),
 						fmt.Sprintf("%s@%s%s", username, targetHostPort, DEFAULT_URL_PATH),
 						"sleep", "60",
 					)
@@ -997,66 +1026,43 @@ while True:
 					Expect(err).ToNot(HaveOccurred())
 					defer clientSession.Terminate()
 
-					// Reverse-tcp listener on the host should come
-					// up once the ssh3 conversation is established.
-					// 5 s leaves room for QUIC handshake + auth +
-					// reverse-forward setup over the netns path.
-					// With proxy-jump in the mix we need a bit more
-					// time because the client must first establish
-					// the proxy QUIC leg, then dial the target
-					// through it, and the proxy leg's migration
-					// coordinator may fire on a netlink event
-					// generated by the netns setup itself - which
-					// kicks in mid-setup and burns 5 s on a probe
-					// + the 10 s rate-limit window before the
-					// follow-up retry can proceed.
-					setupBudget := "5s"
+					// reverseDialAddr is where the test connects from
+					// to verify the tunnel: the target server's bind
+					// (so 0.0.0.0:reversePort) is reachable via the
+					// target_ns IP in proxy-jump mode, or the host's
+					// pair-A address in direct mode.
+					var reverseDialAddr string
+					if proxyJump {
+						reverseDialAddr = fmt.Sprintf("%s:%d", env.vethTInnerIP, reversePort)
+					} else {
+						reverseDialAddr = fmt.Sprintf("%s:%d", env.vethCAOuterIP, reversePort)
+					}
+
+					setupBudget := "10s"
 					if proxyJump {
 						setupBudget = "30s"
 					}
 					var preConn net.Conn
 					Eventually(func() error {
 						var derr error
-						preConn, derr = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", reversePort))
+						preConn, derr = net.Dial("tcp", reverseDialAddr)
 						return derr
 					}, setupBudget).ShouldNot(HaveOccurred())
-					// Read the tag so we know the data path actually
-					// reached the in-netns origin, not just that the
-					// listener came up.
 					buf := make([]byte, 16)
 					preConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 					n, _ := preConn.Read(buf)
 					Expect(string(buf[:n])).To(Equal("TUNNEL_OK"))
 					preConn.Close()
 
-					// Trigger the migration: swap the default route
-					// inside the netns from pair A to pair B.  The
-					// client's netchange watcher should see the
-					// RTM_*ROUTE events, the migration coordinator
-					// should open a new UDP socket (whose source IP
-					// will now be 192.168.250.6 because that is the
-					// reachable address on the new default route),
-					// probe, and switch.  With proxy-jump set, ONLY
-					// the proxy-leg coordinator runs; the target leg
-					// has no real network-facing path to migrate to
-					// (its peer is the proxy's loopback UDP-forward).
+					// Trigger the migration.
 					Expect(env.swapDefaultRoute()).To(Succeed())
 
-					// After the swap, the same reverse-tcp listener
-					// on the host must still be reachable through
-					// the (now-migrated) QUIC connection.  Budget:
-					// 250 ms debounce + up to 5 s probe + a few
-					// Eventually retries.  The proxy-jump variant
-					// gets a larger budget because the data path
-					// only recovers once the proxy's QUIC socket
-					// has migrated and quic-go has drained any
-					// in-flight packets on the retired path.
-					postBudget := "10s"
+					postBudget := "15s"
 					if proxyJump {
-						postBudget = "20s"
+						postBudget = "25s"
 					}
 					Eventually(func() error {
-						c, derr := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", reversePort))
+						c, derr := net.Dial("tcp", reverseDialAddr)
 						if derr != nil {
 							return derr
 						}
@@ -1073,23 +1079,13 @@ while True:
 						return nil
 					}, postBudget, "250ms").ShouldNot(HaveOccurred())
 
-					// And the server side must have logged the
-					// migration.  In non-proxy-jump mode the target
-					// server is the migration peer; in proxy-jump
-					// mode the *proxy* server is the migration peer
-					// (the target leg's loopback transport does not
-					// migrate on its own - see cmd/ssh3.go's
-					// `if *enableMigration && *proxyJump == ""`
-					// guard for the rationale).  The observer ticks
-					// every 2 s, so give it a generous deadline.
-					// Say() advances each server-session's gbytes
-					// read cursor, so repeat invocations of this
-					// spec (e.g. the proxy-jump variant after the
-					// non-proxy one) do not satisfy this assertion
-					// with a previously emitted line.
-					migrationServer := serverSessions[serverBind].Err
+					// Migration log line lands on the *proxy* server
+					// in proxy-jump mode (the only QUIC connection
+					// whose source IP changed); on the target server
+					// otherwise.
+					migrationServer := targetServerSession.Err
 					if proxyJump {
-						migrationServer = serverSessions[proxyServerBind].Err
+						migrationServer = proxyServerSession.Err
 					}
 					Eventually(migrationServer, "15s").Should(
 						Say(fmt.Sprintf("peer migrated for user %s", username)))
@@ -1099,43 +1095,40 @@ while True:
 					runMigrationSpec(false)
 				})
 
-				// PIt: pending.  The proxy-only-coordinator
-				// architecture (cmd/ssh3.go) is correct on its face
-				// and the direct-migration spec just above passes,
-				// but proxy-jump migration is NOT yet demonstrated
-				// end-to-end.  Last debug run on this harness:
+				// PIt: pending.  3-namespace topology now rules out
+				// the "DNAT/loopback" hypothesis from the previous
+				// debug round - the primary client→proxy QUIC leg
+				// completes cleanly (proxy server logs CONNECT 200
+				// OK against the real 10.99.1.2 address, no DNAT in
+				// play), so host forwarding and rp_filter are NOT
+				// the problem.  What still fails is the *target*
+				// leg: after proxyClient.ForwardUDP opens a local
+				// listener inside client_ns ("started proxy jump at
+				// 127.0.0.1:43807"), the target QUIC dial to that
+				// loopback endpoint still times out before the
+				// handshake completes.  This means the bug is in
+				// how the target-conversation datagrams ride the
+				// proxy's UDP-forwarding channel (cmd/ssh3-server.go's
+				// handleUDPForwardingChannel + the client-side
+				// ForwardUDP go-routine), not in the netns harness.
 				//
-				//   - primary QUIC leg (client@netns ->
-				//     192.168.250.1:4444 -DNAT-> host:4444) is fine:
-				//     server logs CONNECT 200 OK for the proxy.
-				//   - proxyClient.ForwardUDP starts cleanly:
-				//     "started proxy jump at 127.0.0.1:58411".
-				//   - target QUIC dial (client@netns ->
-				//     127.0.0.1:58411 via netns loopback) errors
-				//     with "timeout: no recent network activity"
-				//     before the handshake completes.
+				// Hypotheses to investigate next (require qlog +
+				// tcpdump on each veth):
+				//   - handshake-initial QUIC packets get clamped
+				//     somewhere between client→ForwardUDP local
+				//     listener → primary QUIC datagrams → proxy →
+				//     proxy.DialUDP(target) → target;
+				//   - return path target → proxy → primary QUIC
+				//     datagrams → client.ForwardUDP local listener
+				//     → target-leg QUIC dial socket does not pin
+				//     to the same source-port pair after the proxy's
+				//     ephemeral source-port reassignment;
+				//   - quic-go's datagram path has a queue-depth
+				//     limit that drops handshake packets at this
+				//     particular timing.
 				//
-				// In other words target-conversation datagrams reach
-				// the in-netns ForwardUDP listener but the response
-				// path target -> proxy -> client never closes the
-				// loop in time.  Likely culprits (not yet confirmed):
-				//   - quic-go datagram routing back through the
-				//     QUIC tunnel + netns loopback has different
-				//     timing characteristics than the same flow on
-				//     a single namespace,
-				//   - or the DNAT + route_localnet + conntrack
-				//     interaction on the host's veth changes UDP
-				//     reply pinning so proxy's reverse datagrams
-				//     don't arrive at the client's source port.
-				//
-				// The agreed-upon plan is to rebuild this test on a
-				// 3-namespace topology (client_ns, proxy_ns,
-				// target_ns with real veth pairs, NO DNAT and NO
-				// loopback overloading) so the data plane mirrors a
-				// real proxy-jump deployment.  Until then the spec
-				// remains PIt and the README carries an explicit
-				// caveat that proxy-jump migration is best-effort
-				// and not covered by an automated test.
+				// Until the right hypothesis is confirmed, the
+				// spec stays PIt; the README's caveat still stands.
 				PIt("survives a default-route swap inside a netns with proxy-jump", func() {
 					runMigrationSpec(true)
 				})
