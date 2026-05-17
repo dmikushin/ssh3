@@ -262,12 +262,14 @@ func (mc *migrationCoordinator) migrate(ctx context.Context) error {
 	// (the one we promoted last time round) and keep the just-
 	// retired transport in its slot.  We keep one generation of
 	// "old" transport alive so quic-go has time to drain in-flight
-	// packets on it before the socket disappears.
+	// packets on it before the socket disappears.  The actual
+	// Close() is delayed by drainDelay so that even back-to-back
+	// migrations (Wi-Fi flapping → coalesced follow-up cycles)
+	// don't pull the socket out from under quic-go while it is
+	// still retransmitting on it.
 	oldTransport := mc.client.qtransport
 	if mc.previousTransport != nil {
-		if err := mc.previousTransport.Close(); err != nil {
-			log.Debug().Msgf("migration: closing retired previous transport: %s", err)
-		}
+		closeTransportAfterDrain(mc.previousTransport)
 	}
 	mc.previousTransport = oldTransport
 	mc.client.qtransport = newTransport
@@ -287,4 +289,24 @@ func udpNetworkFor(conn *quic.Conn) string {
 		return "udp6"
 	}
 	return "udp"
+}
+
+// transportDrainDelay is how long we let a demoted *quic.Transport
+// linger before closing its underlying UDP socket.  quic-go keeps a
+// just-switched-away path alive for up to ~3 PTO (typically ≤1.5 s)
+// for in-flight retransmissions; closing the socket inside that
+// window causes those retransmissions to fail with ENOBUFS/EINVAL.
+// 2 s comfortably covers the typical 3-PTO window without hanging on
+// session teardown.
+const transportDrainDelay = 2 * time.Second
+
+// closeTransportAfterDrain releases a *quic.Transport's socket after
+// transportDrainDelay has elapsed.  Returns immediately; the timer
+// goroutine logs at debug level on error.
+func closeTransportAfterDrain(tr *quic.Transport) {
+	time.AfterFunc(transportDrainDelay, func() {
+		if err := tr.Close(); err != nil {
+			log.Debug().Msgf("migration: closing retired previous transport (after drain): %s", err)
+		}
+	})
 }
