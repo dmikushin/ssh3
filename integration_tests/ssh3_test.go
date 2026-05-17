@@ -820,11 +820,13 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				// When proxyJump is true the client is started with
 				// -proxy-jump pointing at the proxy server reachable
 				// through the same netns gateway IP; the test then
-				// asserts that BOTH the proxy server and the target
-				// server log a "peer migrated for user X" line after
-				// the default-route swap, proving that each leg's
-				// migration coordinator independently moved its own
-				// QUIC socket onto the new path.
+				// asserts that the *proxy* server logs a "peer
+				// migrated for user X" line after the default-route
+				// swap.  The *target* server does NOT migrate: its
+				// peer (as seen by it) is the proxy's loopback
+				// UDP-forward endpoint, which never changes.  One
+				// migration on the proxy leg carries the target
+				// leg's loopback traffic along with it.
 				runMigrationSpec := func(proxyJump bool) {
 					if os.Geteuid() != 0 {
 						Skip("netns migration test requires root")
@@ -1034,19 +1036,21 @@ while True:
 					// should open a new UDP socket (whose source IP
 					// will now be 192.168.250.6 because that is the
 					// reachable address on the new default route),
-					// probe, and switch.  With proxy-jump set, BOTH
-					// coordinators (proxy leg + target leg) must do
-					// this independently.
+					// probe, and switch.  With proxy-jump set, ONLY
+					// the proxy-leg coordinator runs; the target leg
+					// has no real network-facing path to migrate to
+					// (its peer is the proxy's loopback UDP-forward).
 					Expect(env.swapDefaultRoute()).To(Succeed())
 
 					// After the swap, the same reverse-tcp listener
 					// on the host must still be reachable through
 					// the (now-migrated) QUIC connection.  Budget:
 					// 250 ms debounce + up to 5 s probe + a few
-					// Eventually retries.  Give the proxy-jump
-					// variant a larger budget because two legs
-					// migrate independently and the data path only
-					// recovers once both have switched.
+					// Eventually retries.  The proxy-jump variant
+					// gets a larger budget because the data path
+					// only recovers once the proxy's QUIC socket
+					// has migrated and quic-go has drained any
+					// in-flight packets on the retired path.
 					postBudget := "10s"
 					if proxyJump {
 						postBudget = "20s"

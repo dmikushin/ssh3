@@ -44,8 +44,13 @@ import (
 // outlives the call.
 func (c *Client) StartMigration(ctx context.Context) {
 	if c.qtransport == nil {
-		// No transport handle - we cannot migrate.  This is the
-		// proxy-jump path; not an error.
+		// Defensive: every Client constructed by client.Dial holds
+		// a *quic.Transport (we plumb it explicitly from
+		// setupQUICConnection, including for the proxy-jump leg
+		// since the proxy-hop migration work landed).  If a future
+		// caller ever rewires Client without a transport - or
+		// passes nil intentionally to disable migration - just
+		// return rather than panic.
 		return
 	}
 

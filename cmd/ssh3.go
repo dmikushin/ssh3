@@ -920,16 +920,24 @@ func ClientMain() int {
 	// reverse-forward listener from ever coming up.
 	if *enableMigration {
 		if startProxyMigration != nil {
-			// proxy-jump in the picture: migrate the proxy leg.
-			// The target leg's transport is the loopback end of
-			// the proxy's UDP-forward, not a real network-facing
-			// socket, so its packets automatically follow the proxy
-			// leg's path once the proxy migrates.  Trying to call
-			// c.StartMigration here in addition would AddPath on
-			// the target's loopback transport, send the new path's
-			// packets straight to 127.0.0.1:<forward-port> bypassing
-			// the proxy entirely, and trip the server's
-			// PROTOCOL_VIOLATION on the retired DCID.
+			// proxy-jump in the picture: migrate the proxy leg only.
+			//
+			// The target leg's UDP transport binds to a wildcard
+			// local address but always sends to the loopback
+			// listener of the proxy's UDP-forward.  That loopback
+			// "path" never goes down, so a second coordinator on
+			// the target leg has nothing useful to migrate to.
+			// Worse, it would open a fresh kernel UDP socket and
+			// ask quic-go to AddPath on the target conversation;
+			// the resulting PATH_CHALLENGE would just take the
+			// same loopback round-trip through the (already-
+			// migrating) proxy and create a second, duplicate
+			// UDP-forward flow on the proxy for no benefit.
+			//
+			// When the proxy leg switches paths the target leg's
+			// loopback traffic continues to ride that switched
+			// path transparently, so one coordinator is enough
+			// to recover both legs from a network change.
 			startProxyMigration()
 		} else {
 			c.StartMigration(ctx)
