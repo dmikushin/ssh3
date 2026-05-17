@@ -269,22 +269,28 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 			// this goroutine does is log the transition for
 			// observability.
 			//
-			// We compare only the IP portion of RemoteAddr, not the
-			// full IP:port.  NAT rebinds (common on cellular and
-			// some enterprise firewalls) shift the source port every
-			// ~30 s without any actual path change; logging those as
-			// "peer migrated" would spam the log with false alarms
-			// that look like real migrations to an operator.
-			go func() {
+			// We log every address change at INF.  When only the
+			// source port changes but the IP is the same (NAT
+			// keepalive rebind is the common cause but kernel-chosen
+			// outbound source ports also do this after migrate()
+			// even when the route really did move - we have observed
+			// it on Linux dual-stack sockets) we tag the message as
+			// "(port-only)" so an operator can spot the rebind-vs-
+			// real-migration distinction in the log.  Filtering pure
+			// port shifts out of the log was tried and dropped: real
+			// QUIC migrations do reach the server with an unchanged
+			// source IP often enough that the filter was hiding the
+			// actual signal it was supposed to surface.
+			go func(initial *net.UDPAddr) {
 				ticker := time.NewTicker(2 * time.Second)
 				defer ticker.Stop()
-				peerIP := func() string {
+				peerAddr := func() *net.UDPAddr {
 					if addr, ok := qconn.RemoteAddr().(*net.UDPAddr); ok && addr != nil {
-						return addr.IP.String()
+						return addr
 					}
-					return qconn.RemoteAddr().String()
+					return nil
 				}
-				prev := peerIP()
+				prev := initial
 				for {
 					select {
 					case <-ctx.Done():
@@ -292,13 +298,24 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 					case <-qconn.Context().Done():
 						return
 					case <-ticker.C:
-						if curr := peerIP(); curr != prev {
-							log.Info().Msgf("peer migrated for user %s: %s -> %s", authenticatedUsername, prev, curr)
-							prev = curr
+						curr := peerAddr()
+						if curr == nil || prev == nil || curr.String() == prev.String() {
+							continue
 						}
+						suffix := ""
+						if curr.IP.Equal(prev.IP) {
+							suffix = " (port-only)"
+						}
+						log.Info().Msgf("peer migrated for user %s: %s -> %s%s", authenticatedUsername, prev, curr, suffix)
+						prev = curr
 					}
 				}
-			}()
+			}(func() *net.UDPAddr {
+				if addr, ok := qconn.RemoteAddr().(*net.UDPAddr); ok {
+					return addr
+				}
+				return nil
+			}())
 
 			go func() {
 				// TODO: this hijacks the datagrams for the whole quic connection, so the server

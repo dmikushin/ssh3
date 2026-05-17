@@ -195,23 +195,28 @@ func (e *netnsEnv) setup() error {
 	//    real loopback-bound server.  This is what lets the client
 	//    inside the netns talk to 127.0.0.1:4433 on the host without
 	//    us having to restart the server on a different bind address.
+	//    We add a second rule for port 4444 (the proxy server) so the
+	//    proxy-jump migration spec can reach both legs through the
+	//    same gateway IPs.
 	for _, dstIP := range []string{e.vethAOuterIP, e.vethBOuterIP} {
-		args := []string{"-t", "nat", "-A", "PREROUTING",
-			"-p", "udp",
-			"-d", dstIP,
-			"--dport", "4433",
-			"-j", "DNAT", "--to-destination", "127.0.0.1:4433",
+		for _, port := range []string{"4433", "4444"} {
+			args := []string{"-t", "nat", "-A", "PREROUTING",
+				"-p", "udp",
+				"-d", dstIP,
+				"--dport", port,
+				"-j", "DNAT", "--to-destination", "127.0.0.1:" + port,
+			}
+			if _, err := run("iptables", args...); err != nil {
+				return err
+			}
+			delArgs := append([]string{"-t", "nat", "-D", "PREROUTING"}, args[4:]...)
+			// The cleanup deletes by spec, which iptables matches against
+			// the rule we just inserted.
+			e.addCleanup(func() error {
+				_, err := run("iptables", delArgs...)
+				return err
+			})
 		}
-		if _, err := run("iptables", args...); err != nil {
-			return err
-		}
-		delArgs := append([]string{"-t", "nat", "-D", "PREROUTING"}, args[4:]...)
-		// The cleanup deletes by spec, which iptables matches against
-		// the rule we just inserted.
-		e.addCleanup(func() error {
-			_, err := run("iptables", delArgs...)
-			return err
-		})
 	}
 
 	return nil

@@ -748,6 +748,12 @@ func ClientMain() int {
 	}
 
 	var proxyAddress *net.UDPAddr
+	// startProxyMigration is non-nil iff -proxy-jump was set; it lets
+	// the post-setup StartMigration block below kick off the proxy
+	// leg's coordinator without lifting proxyClient out of the
+	// if-block scope.
+	var startProxyMigration func()
+
 	if *proxyJump != "" {
 		if !strings.HasPrefix(*proxyJump, "https://") {
 			*proxyJump = fmt.Sprintf("https://%s", *proxyJump)
@@ -762,7 +768,7 @@ func ClientMain() int {
 			log.Error().Msgf("Could not get connection material for proxy %s: %s", proxyParsedUrl, err)
 			return -1
 		}
-		qconn, _, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
+		qconn, proxyTransport, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
 
 		if qconn == nil {
 			if status != 0 {
@@ -775,14 +781,27 @@ func ClientMain() int {
 			EnableDatagrams: true,
 		}
 
-		// Proxy-jump client: pass nil for the Transport - migration
-		// is wired only on the *target* conversation for now, the
-		// proxy hop reuses the dialed connection but is not itself a
-		// migration peer.
-		proxyClient, err := client.Dial(ctx, proxyOptions, qconn, nil, roundTripper, proxyAgentClient)
+		// Proxy-jump client: pass the proxy's *quic.Transport through
+		// so that the proxy leg can also run its own migration
+		// coordinator when -enable-migration is set.  Both legs are
+		// independent QUIC connections terminating with their own
+		// *quic.Conn / *quic.Transport, so each needs its own watcher
+		// to survive a host-side network change.
+		proxyClient, err := client.Dial(ctx, proxyOptions, qconn, proxyTransport, roundTripper, proxyAgentClient)
 		if err != nil {
 			log.Error().Msgf("could not establish SSH3 proxy conversation: %s", err)
 			return -1
+		}
+		// Note: proxyClient.StartMigration is deferred to AFTER all
+		// forwards are set up on the target conversation - starting
+		// the network-change watcher here would race the target's
+		// CONNECT dial through proxyClient.ForwardUDP and a netlink
+		// event arriving mid-handshake would tear down the partially-
+		// constructed target leg.  See the StartMigration block right
+		// before c.RunSession below.
+		if *enableMigration {
+			pc := proxyClient
+			startProxyMigration = func() { pc.StartMigration(ctx) }
 		}
 
 		baseAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -822,14 +841,9 @@ func ClientMain() int {
 		log.Error().Msgf("could not dial %s: %s", options.CanonicalHostFormat(), err)
 		return -1
 	}
-	if *enableMigration {
-		// Kick off the network-change watcher + path-migration loop
-		// in the background.  It stops on its own when the QUIC
-		// conversation context (which is derived from qconn) is
-		// cancelled, so we do not need to plumb a separate stop
-		// signal through here.
-		c.StartMigration(ctx)
-	}
+	// Migration coordinators (both proxy and target legs) are kicked
+	// off AFTER all forwards have been set up - see the dedicated
+	// StartMigration block right before c.RunSession further down.
 	for _, pair := range forwardTCPPairs {
 		if _, err := c.ForwardTCP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
 			log.Error().Msgf("could not forward TCP %s: %s", pair.source, err)
@@ -893,6 +907,34 @@ func ClientMain() int {
 		}
 	}
 
+
+	// Now that every forward (TCP, UDP, reverse-TCP, reverse-UDP)
+	// has been established, kick off the migration coordinator(s).
+	// Doing this earlier - immediately after client.Dial - races
+	// the in-flight reverse-forward setup against any netlink event
+	// the kernel emits while we are still building the conversation;
+	// on a host whose routing/address state churns at startup (fresh
+	// netns, freshly-up Wi-Fi interface, NetworkManager rolling out
+	// the connection) that race can interrupt the target leg's
+	// CONNECT through proxyClient.ForwardUDP and prevent the
+	// reverse-forward listener from ever coming up.
+	if *enableMigration {
+		if startProxyMigration != nil {
+			// proxy-jump in the picture: migrate the proxy leg.
+			// The target leg's transport is the loopback end of
+			// the proxy's UDP-forward, not a real network-facing
+			// socket, so its packets automatically follow the proxy
+			// leg's path once the proxy migrates.  Trying to call
+			// c.StartMigration here in addition would AddPath on
+			// the target's loopback transport, send the new path's
+			// packets straight to 127.0.0.1:<forward-port> bypassing
+			// the proxy entirely, and trip the server's
+			// PROTOCOL_VIOLATION on the retired DCID.
+			startProxyMigration()
+		} else {
+			c.StartMigration(ctx)
+		}
+	}
 
 	err = c.RunSession(tty, *forwardSSHAgent, command...)
 	switch sessionError := err.(type) {

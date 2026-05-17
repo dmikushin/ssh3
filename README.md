@@ -95,6 +95,8 @@ Limitations and gotchas:
 - Migration recovers from path / IP changes, not from server reboots or long blackholes that exceed the QUIC idle timeout.  For those, wrap the client in a shell-level reconnect loop (the same pattern autossh uses).
 - The migration coordinator keeps exactly one generation of "old" transport alive past each successful switch, so quic-go can drain in-flight packets queued on the previous socket before it disappears.
 
+When `-enable-migration` is combined with `-proxy-jump`, the migration coordinator runs on the client↔proxy leg only.  The target leg's transport is the loopback end of the proxy's UDP-forward, not a real network-facing socket, so its packets transparently follow the proxy leg's path once the proxy has migrated; trying to AddPath on the target leg would open a fresh kernel UDP socket on the client and bypass the proxy entirely (the server would tear the connection down with a PROTOCOL_VIOLATION on the retired connection ID).  Net effect: a network change moves both legs onto the new path because the proxy leg's migration carries the target leg along with it.
+
 ## 🙏 Community support
 Help us progress SSH3 responsibly! We welcome capable security researchers to review our codebase and provide feedback. Please also connect us with relevant standards bodies to potentially advance SSH3 through the formal IETF/IRTF processes over time.
 
