@@ -224,9 +224,15 @@ func (mc *migrationCoordinator) handleEvent(ctx context.Context, ev netchange.Ev
 // success or a descriptive error on failure (in which case the new
 // transport/socket are already cleaned up).
 func (mc *migrationCoordinator) migrate(ctx context.Context) error {
-	// Open a fresh UDP socket.  Letting the kernel pick the local
-	// address means we automatically use the new default route.
-	udpConn, err := net.ListenUDP(udpNetworkFor(mc.client.qconn), nil)
+	// Open a fresh dual-stack UDP socket.  Using "udp" (rather than
+	// hard-coding udp4/udp6 from the current remote family) lets the
+	// kernel pick whichever source family it can actually reach the
+	// peer through.  This is essential for the v4↔v6 transition case
+	// flagged by the audit: a dual-stack device joining an IPv6-only
+	// network must be able to migrate from a v4 source address to a
+	// v6 one without re-resolving the server hostname.  On Linux a
+	// dual-stack socket accepts both families via IPv4-mapped IPv6.
+	udpConn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return fmt.Errorf("open new UDP socket: %w", err)
 	}
@@ -274,21 +280,6 @@ func (mc *migrationCoordinator) migrate(ctx context.Context) error {
 	mc.previousTransport = oldTransport
 	mc.client.qtransport = newTransport
 	return nil
-}
-
-// udpNetworkFor picks "udp4" / "udp6" matching the address family of
-// the connection's current remote endpoint, so the new socket lands
-// in the right family.
-func udpNetworkFor(conn *quic.Conn) string {
-	// RemoteAddr is a *net.UDPAddr on quic-go's *quic.Conn for the
-	// dialed (client) case.
-	if addr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && addr != nil {
-		if addr.IP.To4() != nil {
-			return "udp4"
-		}
-		return "udp6"
-	}
-	return "udp"
 }
 
 // transportDrainDelay is how long we let a demoted *quic.Transport
