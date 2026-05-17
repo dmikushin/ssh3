@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -796,6 +797,207 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					Eventually(session).Should(Exit())
 					Eventually(session).ShouldNot(Exit(0))
 					Eventually(string(session.Wait().Err.Contents())).Should(ContainSubstring("unauthorized"))
+				})
+			})
+
+			// Exercises the QUIC connection-migration coordinator
+			// end-to-end: build a throw-away netns with two veth
+			// pairs into the host, run an ssh3 client inside it with
+			// -enable-migration, flip the default route, and assert
+			// that (a) a long-lived reverse-tcp forward stays
+			// reachable across the route swap and (b) the server
+			// logs the expected "peer migrated" line.
+			//
+			// This spec must Skip() - not fail - when prerequisites
+			// are unmet (non-root, no `ip`, no netns support).  The
+			// existing run_integration_tests.sh runs the suite under
+			// sudo so the privilege check should normally pass.
+			Context("Connection migration", func() {
+				It("survives a default-route swap inside a netns", func() {
+					if os.Geteuid() != 0 {
+						Skip("netns migration test requires root")
+					}
+					if _, err := exec.LookPath("ip"); err != nil {
+						Skip("iproute2 'ip' binary not found in PATH")
+					}
+					if _, err := exec.LookPath("iptables"); err != nil {
+						Skip("iptables binary not found in PATH (needed for DNAT to the loopback-bound server)")
+					}
+
+					env := newNetnsEnv()
+					if err := env.setup(); err != nil {
+						// Always run teardown so a partially-built
+						// netns does not leak into the next run.
+						_ = env.teardown()
+						// Permission / sandbox failures look like
+						// EPERM, "operation not permitted", or
+						// "open /proc/sys/...: read-only file
+						// system".  Skip rather than fail so the
+						// suite stays green in CI sandboxes.
+						msg := err.Error()
+						if strings.Contains(msg, "operation not permitted") ||
+							strings.Contains(msg, "permission denied") ||
+							strings.Contains(msg, "read-only file system") ||
+							strings.Contains(msg, "kernel may lack netns") {
+							Skip("cannot build netns topology in this sandbox: " + msg)
+						}
+						Fail("netns setup failed: " + msg)
+					}
+					defer func() {
+						if err := env.teardown(); err != nil {
+							// Use AddReportEntry-style logging via
+							// GinkgoWriter; do NOT Fail here, as
+							// that would mask the real test result.
+							fmt.Fprintf(GinkgoWriter, "netns teardown error: %v\n", err)
+						}
+					}()
+
+					// Pick a free server-side port for the reverse-tcp
+					// listener so concurrent test reruns do not stomp
+					// on each other.  The TOCTOU window (we close the
+					// probe and then ask ssh3 to bind it) is the same
+					// pattern the existing reverse-tcp specs use.
+					probe, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					Expect(err).ToNot(HaveOccurred())
+					reversePort := probe.Addr().(*net.TCPAddr).Port
+					probe.Close()
+
+					// The origin TCP server lives on the client side
+					// (inside the netns).  When something dials the
+					// host-side reverse-tcp listener, the ssh3 client
+					// dials this origin locally via the tunnel.  We
+					// must start it BEFORE the ssh3 client comes up
+					// and answers the first reverse-tcp probe, hence
+					// the ordering here.
+					originPort := 18765
+
+					// Use socat if available, otherwise fall back to
+					// a tiny python3 listener.  Either way the goal
+					// is the same: every accepted TCP connection
+					// gets back the literal "TUNNEL_OK".  We avoid
+					// in-process net.Listen() here because the
+					// listener has to live INSIDE the netns and Go's
+					// setns()-from-a-goroutine is unsafe.
+					var originCmd *exec.Cmd
+					if _, err := exec.LookPath("socat"); err == nil {
+						originCmd = exec.Command("ip", "netns", "exec", env.nsName,
+							"socat", fmt.Sprintf("TCP-LISTEN:%d,bind=127.0.0.1,reuseaddr,fork", originPort),
+							"SYSTEM:'printf TUNNEL_OK'")
+					} else if _, err := exec.LookPath("python3"); err == nil {
+						py := fmt.Sprintf(`
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", %d))
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    try:
+        c.sendall(b"TUNNEL_OK")
+    finally:
+        c.close()
+`, originPort)
+						originCmd = exec.Command("ip", "netns", "exec", env.nsName, "python3", "-c", py)
+					} else {
+						Skip("need socat or python3 to run the origin TCP server inside the netns")
+					}
+					originCmd.Stdout = GinkgoWriter
+					originCmd.Stderr = GinkgoWriter
+					Expect(originCmd.Start()).To(Succeed())
+					defer func() {
+						_ = originCmd.Process.Kill()
+						_, _ = originCmd.Process.Wait()
+					}()
+
+					// Wait for the in-netns origin to actually bind
+					// before launching the ssh3 client.  Dial from
+					// inside the netns via `ip netns exec`.
+					Eventually(func() error {
+						out, err := exec.Command("ip", "netns", "exec", env.nsName,
+							"sh", "-c", fmt.Sprintf("exec 3<>/dev/tcp/127.0.0.1/%d", originPort)).CombinedOutput()
+						if err != nil {
+							return fmt.Errorf("origin not yet listening: %v: %s", err, string(out))
+						}
+						return nil
+					}, "5s", "100ms").ShouldNot(HaveOccurred())
+
+					// Start the ssh3 client inside the netns, using
+					// the host's pair-A IP as the server endpoint.
+					// iptables DNAT redirects 192.168.250.1:4433 to
+					// the real 127.0.0.1:4433 server on the host.
+					clientArgs := []string{
+						"netns", "exec", env.nsName,
+						ssh3Path,
+						"-v",
+						"-insecure",
+						"-privkey", rsaPrivKeyPath,
+						"-enable-migration",
+						"-reverse-tcp", fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", originPort, reversePort),
+						fmt.Sprintf("%s@%s:4433%s", username, env.vethAOuterIP, DEFAULT_URL_PATH),
+						"sleep", "60",
+					}
+					clientCmd := exec.Command("ip", clientArgs...)
+					clientSession, err := Start(clientCmd, GinkgoWriter, GinkgoWriter)
+					Expect(err).ToNot(HaveOccurred())
+					defer clientSession.Terminate()
+
+					// Reverse-tcp listener on the host should come
+					// up once the ssh3 conversation is established.
+					// 5 s leaves room for QUIC handshake + auth +
+					// reverse-forward setup over the netns path.
+					var preConn net.Conn
+					Eventually(func() error {
+						var derr error
+						preConn, derr = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", reversePort))
+						return derr
+					}, "5s").ShouldNot(HaveOccurred())
+					// Read the tag so we know the data path actually
+					// reached the in-netns origin, not just that the
+					// listener came up.
+					buf := make([]byte, 16)
+					preConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+					n, _ := preConn.Read(buf)
+					Expect(string(buf[:n])).To(Equal("TUNNEL_OK"))
+					preConn.Close()
+
+					// Trigger the migration: swap the default route
+					// inside the netns from pair A to pair B.  The
+					// client's netchange watcher should see the
+					// RTM_*ROUTE events, the migration coordinator
+					// should open a new UDP socket (whose source IP
+					// will now be 192.168.250.6 because that is the
+					// reachable address on the new default route),
+					// probe, and switch.
+					Expect(env.swapDefaultRoute()).To(Succeed())
+
+					// After the swap, the same reverse-tcp listener
+					// on the host must still be reachable through
+					// the (now-migrated) QUIC connection.  Budget:
+					// 250 ms debounce + up to 5 s probe + a few
+					// Eventually retries.
+					Eventually(func() error {
+						c, derr := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", reversePort))
+						if derr != nil {
+							return derr
+						}
+						defer c.Close()
+						c.SetReadDeadline(time.Now().Add(2 * time.Second))
+						b := make([]byte, 16)
+						k, rerr := c.Read(b)
+						if rerr != nil {
+							return rerr
+						}
+						if string(b[:k]) != "TUNNEL_OK" {
+							return fmt.Errorf("unexpected tag %q", string(b[:k]))
+						}
+						return nil
+					}, "10s", "250ms").ShouldNot(HaveOccurred())
+
+					// And the server side must have logged the
+					// migration.  The observer ticks every 2 s, so
+					// give it a generous deadline.
+					Eventually(serverSessions[serverBind].Err, "10s").Should(
+						Say(fmt.Sprintf("peer migrated for user %s", username)))
 				})
 			})
 		})
