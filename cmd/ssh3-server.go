@@ -680,11 +680,30 @@ func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 		return ackErr
 	}
 
+	// Tie the listener's lifetime to the conversation context.  Without
+	// this, a torn-down conversation leaves the listening socket bound
+	// for the lifetime of the server process - the accept loop below
+	// only exits on AcceptTCP error, which never fires until the
+	// listener is explicitly closed.  Closing the listener unblocks the
+	// pending Accept with ErrClosed, the accept goroutine exits, and
+	// the bind is released.
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
 	go func() {
 		for {
 			conn, err := conn.AcceptTCP()
 			if err != nil {
-				log.Error().Msgf("could not accept on TCP listener %s: %s", channel.LocalAddr, err)
+				// On graceful shutdown (ctx cancelled) the watcher
+				// goroutine above closes the listener and this loop
+				// exits with ErrClosed - logged at debug level only.
+				if errors.Is(err, net.ErrClosed) {
+					log.Debug().Msgf("reverse-tcp listener on %s closed (conversation shutdown)", channel.LocalAddr)
+				} else {
+					log.Error().Msgf("could not accept on TCP listener %s: %s", channel.LocalAddr, err)
+				}
 				return
 			}
 
@@ -908,13 +927,24 @@ func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 		ch.Close()
 		return ackErr
 	}
+	// Tie the UDP socket's lifetime to the conversation context.
+	// See the TCP variant for the rationale.  Closing the socket
+	// unblocks the pending ReadFromUDP below with ErrClosed.
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
 	forwardings := make(map[string]ssh3.Channel)
 	go func() {
 		buf := make([]byte, 1500)
 		for {
 			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
-				log.Error().Msgf("could not read on UDP socket: %s", err)
+				if errors.Is(err, net.ErrClosed) {
+					log.Debug().Msgf("reverse-udp listener on %s closed (conversation shutdown)", ch.LocalAddr)
+				} else {
+					log.Error().Msgf("could not read on UDP socket: %s", err)
+				}
 				return
 			}
 			channel, ok := forwardings[addr.String()]
