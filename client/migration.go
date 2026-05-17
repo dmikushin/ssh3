@@ -84,6 +84,10 @@ type migrationCoordinator struct {
 	// debounce alone.
 	busy    bool
 	pending bool
+	// lastMigrationAt is the wall-clock time at which the previous
+	// migrate() *started* (not finished).  Used by the rate-limiter
+	// below to enforce minMigrationInterval between attempts.
+	lastMigrationAt time.Time
 	// previousTransport is the transport that owned the path active
 	// before the most recent successful Switch.  It is kept alive
 	// across one migration so that quic-go can drain any in-flight
@@ -91,6 +95,14 @@ type migrationCoordinator struct {
 	// the first migration.
 	previousTransport *quic.Transport
 }
+
+// minMigrationInterval caps how often the coordinator will attempt a
+// migration.  A pathological network with constant address churn
+// (broken Wi-Fi, flapping interface) would otherwise burn an UDP
+// socket and a 5 s PATH_CHALLENGE cycle per netchange event.  10 s
+// is short enough that real roams still feel snappy, long enough
+// that thrashing interfaces don't fan out into a hot loop.
+const minMigrationInterval = 10 * time.Second
 
 func (mc *migrationCoordinator) run(ctx context.Context) {
 	defer func() {
@@ -194,7 +206,34 @@ func (mc *migrationCoordinator) handleEvent(ctx context.Context, ev netchange.Ev
 	mc.busy = true
 	mc.mu.Unlock()
 
+	connDone := mc.client.qconn.Context().Done()
+
 	for {
+		// Rate-limit: a thrashing interface should not churn UDP
+		// sockets and PATH_CHALLENGE bursts.  If less than
+		// minMigrationInterval has elapsed since the previous attempt,
+		// sleep for the remainder before starting the next migrate.
+		if !mc.lastMigrationAt.IsZero() {
+			wait := minMigrationInterval - time.Since(mc.lastMigrationAt)
+			if wait > 0 {
+				log.Debug().Msgf("migration: rate-limited, sleeping %s before next attempt", wait)
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					mc.mu.Lock()
+					mc.busy = false
+					mc.mu.Unlock()
+					return
+				case <-connDone:
+					mc.mu.Lock()
+					mc.busy = false
+					mc.mu.Unlock()
+					return
+				}
+			}
+		}
+		mc.lastMigrationAt = time.Now()
+
 		log.Info().Msgf("migration: network change observed (%s), attempting path migration", ev.Reason)
 		if err := mc.migrate(ctx); err != nil {
 			log.Warn().Msgf("migration: %s", err)
