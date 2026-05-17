@@ -341,7 +341,7 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 }
 
 type Client struct {
-	qconn quic.EarlyConnection
+	qconn *quic.Conn
 	*ssh3.Conversation
 
 	// reverseDispatcher centralises the handling of all server-initiated
@@ -514,8 +514,8 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 	}
 }
 
-func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyConnection,
-	roundTripper *http3.RoundTripper,
+func Dial(ctx context.Context, config *client_config.Config, qconn *quic.Conn,
+	roundTripper *http3.Transport,
 	sshAgent agent.ExtendedAgent) (*Client, error) {
 
 	hostUrl := url.URL{}
@@ -547,8 +547,15 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 		}
 	}
 
-	// dirty hack: ensure only one QUIC connection is used
-	roundTripper.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+	// dirty hack: ensure only one QUIC connection is used.
+	// Note: after the quic-go v0.57.1 upgrade, EstablishClientConversation
+	// drives its CONNECT request through http3.Transport.NewClientConn(qconn)
+	// + OpenRequestStream, so it no longer relies on this Dial override to
+	// reuse our existing qconn. The hook is kept because any other code
+	// path that still goes through roundTripper.RoundTrip(...) (now or in
+	// the future) would otherwise dial a fresh QUIC connection instead of
+	// reusing qconn.
+	roundTripper.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 		return qconn, nil
 	}
 
@@ -688,7 +695,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	log.Debug().Msgf("establish conversation with the server")
-	err = conv.EstablishClientConversation(req, roundTripper, ssh3.AVAILABLE_CLIENT_VERSIONS)
+	err = conv.EstablishClientConversation(req, roundTripper, qconn, ssh3.AVAILABLE_CLIENT_VERSIONS)
 	if errors.Is(err, util.Unauthorized{}) {
 		log.Error().Msgf("Access denied from the server: unauthorized")
 		return nil, err

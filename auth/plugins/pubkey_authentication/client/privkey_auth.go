@@ -117,7 +117,7 @@ func (m *PrivkeyFileAuthMethod) getCryptoMaterial() (crypto.Signer, jwt.SigningM
 }
 
 // PrepareRequestForAuth implements auth.ClientAuthMethod.
-func (m *PrivkeyFileAuthMethod) PrepareRequestForAuth(request *http.Request, sshAgent agent.ExtendedAgent, roundTripper *http3.RoundTripper, username string, conversation *ssh3.Conversation) error {
+func (m *PrivkeyFileAuthMethod) PrepareRequestForAuth(request *http.Request, sshAgent agent.ExtendedAgent, roundTripper *http3.Transport, username string, conversation *ssh3.Conversation) error {
 	log.Debug().Msgf("try file-based privkey auth using file %s", m.Filename())
 	var jwtBearerKey any
 	jwtBearerKey, signingMethod, err := m.getCryptoMaterial()
@@ -188,7 +188,7 @@ func (m *PrivkeyFileAuthMethod) PrepareRequestForAuth(request *http.Request, ssh
 
 var _ auth.ClientAuthMethod = &PrivkeyFileAuthMethod{}
 
-var privkeyPluginFunc auth.GetClientAuthMethodsFunc = func(request *http.Request, sshAgent agent.ExtendedAgent, clientConfig *config.Config, roundTripper *http3.RoundTripper) ([]auth.ClientAuthMethod, error) {
+var privkeyPluginFunc auth.GetClientAuthMethodsFunc = func(request *http.Request, sshAgent agent.ExtendedAgent, clientConfig *config.Config, roundTripper *http3.Transport) ([]auth.ClientAuthMethod, error) {
 	for _, opt := range clientConfig.Options() {
 		if o, ok := opt.(*PrivkeyAuthOption); ok {
 			var methods []auth.ClientAuthMethod

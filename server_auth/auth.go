@@ -11,7 +11,6 @@ import (
 	"github.com/francoismichel/ssh3"
 	"github.com/francoismichel/ssh3/util/unix_util"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/rs/zerolog/log"
 )
@@ -37,22 +36,35 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 		// Only call Flush() here, as calling flush prevents from adding the Content-Length header to the response
 		// The Content-Length can be useful upon receiving an error response
 		defer w.(http.Flusher).Flush()
-		hijacker, ok := w.(http3.Hijacker)
+		_, ok := w.(http3.Hijacker)
 		if !ok { // should never happen, unless quic-go change their API
 			log.Error().Msgf("failed to hijack")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		streamCreator := hijacker.StreamCreator()
-		qconn := streamCreator.(quic.Connection)
+		qconn := ssh3.QUICConnFromContext(r.Context())
+		if qconn == nil {
+			log.Error().Msgf("no *quic.Conn in request context; misconfigured ssh3.Server?")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if !qconn.ConnectionState().TLS.HandshakeComplete {
 			// do not process early data (0-RTT) when performing authorization
 			// to avoid replay attacks
 			w.WriteHeader(http.StatusTooEarly)
 			return
 		}
-		str := r.Body.(http3.HTTPStreamer).HTTPStream()
+		// In quic-go v0.57+, HTTPStreamer is implemented by the
+		// response writer (server-side hijack), not by the request
+		// body.  Cast w, not r.Body.
+		streamer, ok := w.(http3.HTTPStreamer)
+		if !ok {
+			log.Error().Msgf("response writer does not implement http3.HTTPStreamer; cannot hijack stream")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		str := streamer.HTTPStream()
 		conv, err := ssh3.NewServerConversation(ctx, str, qconn, qconn, defaultMaxPacketSize, peerVersion)
 		if err != nil {
 			log.Error().Msgf("could not create new server conversation")

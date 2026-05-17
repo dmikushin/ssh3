@@ -4,18 +4,18 @@ import (
 	"sync"
 
 	"github.com/francoismichel/ssh3/util"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go"
 )
 
 type ControlStreamID = uint64
 
 type conversationsManager struct {
-	connection    http3.StreamCreator
+	connection    *quic.Conn
 	conversations map[ControlStreamID]*Conversation
 	lock          sync.Mutex
 }
 
-func newConversationManager(connection http3.StreamCreator) *conversationsManager {
+func newConversationManager(connection *quic.Conn) *conversationsManager {
 	return &conversationsManager{connection: connection, conversations: make(map[ControlStreamID]*Conversation)}
 }
 

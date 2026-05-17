@@ -122,7 +122,7 @@ func NewPubkeyAuthMethod(pubkey *agent.Key) *PubkeyAuthMethod {
 }
 
 // PrepareRequestForAuth implements auth.ClientAuthMethod.
-func (m *PubkeyAuthMethod) PrepareRequestForAuth(request *http.Request, sshAgent agent.ExtendedAgent, roundTripper *http3.RoundTripper, username string, conversation *ssh3.Conversation) error {
+func (m *PubkeyAuthMethod) PrepareRequestForAuth(request *http.Request, sshAgent agent.ExtendedAgent, roundTripper *http3.Transport, username string, conversation *ssh3.Conversation) error {
 	log.Debug().Msgf("try agent-based pubkey auth using pubkey %s", m.Key.String())
 
 	signingMethod, err := NewAgentSigningMethod(sshAgent, m.Key)
@@ -138,7 +138,7 @@ func (m *PubkeyAuthMethod) PrepareRequestForAuth(request *http.Request, sshAgent
 	return nil
 }
 
-var pubkeyPluginFunc auth.GetClientAuthMethodsFunc = func(request *http.Request, sshAgent agent.ExtendedAgent, clientConfig *config.Config, roundTripper *http3.RoundTripper) ([]auth.ClientAuthMethod, error) {
+var pubkeyPluginFunc auth.GetClientAuthMethodsFunc = func(request *http.Request, sshAgent agent.ExtendedAgent, clientConfig *config.Config, roundTripper *http3.Transport) ([]auth.ClientAuthMethod, error) {
 	var agentKeys []*agent.Key
 	var err error
 	if sshAgent != nil {

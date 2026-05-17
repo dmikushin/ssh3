@@ -1244,7 +1244,7 @@ func ServerMain() int {
 	server := http3.Server{
 		Handler:         nil,
 		Addr:            *bindAddr,
-		QuicConfig:      quicConf,
+		QUICConfig:      quicConf,
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
 	}

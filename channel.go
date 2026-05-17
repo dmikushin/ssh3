@@ -91,6 +91,15 @@ type Channel interface {
 	setDgramQueue(*util.DatagramsQueue)
 }
 
+// channelReceiver is the subset of *quic.Stream / *quic.ReceiveStream
+// the channelImpl needs on the read side. We type it as an interface so
+// that we can pass in lightweight wrappers like *StreamByteReader as
+// well as the bare quic stream.
+type channelReceiver interface {
+	io.Reader
+	CancelRead(quic.StreamErrorCode)
+}
+
 type channelImpl struct {
 	ChannelInfo
 	confirmSent     bool
@@ -101,7 +110,7 @@ type channelImpl struct {
 
 	channelCloseListener
 
-	recv           quic.ReceiveStream
+	recv           channelReceiver
 	send           io.WriteCloser
 	datagramsQueue *util.DatagramsQueue
 	PtyReqHandler
@@ -376,7 +385,7 @@ func parseUDPRequestReverseHeader(channelID uint64, buf util.Reader) (*net.UDPAd
 		}, nil
 }
 
-func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv quic.ReceiveStream,
+func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv channelReceiver,
 	send io.WriteCloser, datagramSender util.SSH3DatagramSenderFunc, channelCloseListener channelCloseListener, sendHeader bool, confirmSent bool,
 	confirmReceived bool, datagramsQueueSize uint64, additonalHeaderBytes []byte) Channel {
 	var header []byte = nil
@@ -537,7 +546,7 @@ func (c *channelImpl) SendRequest(r *ssh3.ChannelRequestMessage) error {
 }
 
 func (c *channelImpl) CancelRead() {
-	c.recv.CancelRead(42)
+	c.recv.CancelRead(quic.StreamErrorCode(42))
 }
 
 func (c *channelImpl) Close() {

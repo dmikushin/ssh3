@@ -50,7 +50,7 @@ func homedir() string {
 // If non-nil, use udpConn as transport (can be used for proxy jump)
 // Otherwise, create a UDPConn from udp://host:port
 func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog io.Writer, ssh3Dir string, certPool *x509.CertPool, knownHostsPath string, knownHosts ssh3.KnownHosts,
-	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (quic.EarlyConnection, int) {
+	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (*quic.Conn, int) {
 
 	var err error
 	remoteAddr := proxyRemoteAddr
@@ -766,7 +766,7 @@ func ClientMain() int {
 			return status
 		}
 
-		roundTripper := &http3.RoundTripper{
+		roundTripper := &http3.Transport{
 			EnableDatagrams: true,
 		}
 
@@ -804,7 +804,7 @@ func ClientMain() int {
 		return status
 	}
 
-	roundTripper := &http3.RoundTripper{
+	roundTripper := &http3.Transport{
 		EnableDatagrams: true,
 	}
 

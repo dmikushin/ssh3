@@ -18,13 +18,33 @@ import (
 
 type ServerConversationHandler func(authenticatedUsername string, conversation *Conversation) error
 
+// ssh3ConnContextKey is the context key under which the ssh3 Server stores
+// the *quic.Conn for each HTTP/3 connection it serves. server_auth uses it
+// to recover the underlying QUIC connection from r.Context() in order to
+// open SSH3 streams and datagrams.
+type ssh3ConnContextKeyType struct{}
+
+var ssh3ConnContextKey = ssh3ConnContextKeyType{}
+
+// QUICConnFromContext returns the *quic.Conn associated with ctx, if any.
+// Returns nil when the context was not created by an ssh3 Server.
+func QUICConnFromContext(ctx context.Context) *quic.Conn {
+	v, _ := ctx.Value(ssh3ConnContextKey).(*quic.Conn)
+	return v
+}
+
 type Server struct {
 	maxPacketSize       uint64
 	h3Server            *http3.Server
-	conversations       map[http3.StreamCreator]*conversationsManager
+	conversations       map[*quic.Conn]*conversationsManager
 	conversationHandler ServerConversationHandler
 	lock                sync.Mutex
-	// conversations map[]
+	// connByID lets the StreamHijacker callback recover the *quic.Conn
+	// for a given QUIC connection from the ConnectionTracingID we are
+	// handed by quic-go v0.57.1+ (the old callback signature passed
+	// the connection object directly).
+	connByID    map[quic.ConnectionTracingID]*quic.Conn
+	connByIDMtx sync.RWMutex
 }
 
 // Creates a new server handling http requests for SSH conversations
@@ -33,16 +53,53 @@ func NewServer(maxPacketSize uint64, defaultDatagramQueueSize uint64, h3Server *
 	ssh3Server := &Server{
 		maxPacketSize:       maxPacketSize,
 		h3Server:            h3Server,
-		conversations:       make(map[http3.StreamCreator]*conversationsManager),
+		conversations:       make(map[*quic.Conn]*conversationsManager),
 		conversationHandler: conversationHandler,
+		connByID:            make(map[quic.ConnectionTracingID]*quic.Conn),
 	}
 
-	h3Server.StreamHijacker = func(frameType http3.FrameType, qconn quic.Connection, stream quic.Stream, err error) (bool, error) {
+	// Wire up ConnContext so that:
+	//   1. The StreamHijacker can recover the *quic.Conn from the
+	//      ConnectionTracingID it now receives (the callback no
+	//      longer gets the connection object directly).
+	//   2. server_auth.HandleAuths can pull the *quic.Conn out of
+	//      r.Context() to hand it to ssh3.NewServerConversation.
+	prevConnContext := h3Server.ConnContext
+	h3Server.ConnContext = func(ctx context.Context, conn *quic.Conn) context.Context {
+		if prevConnContext != nil {
+			ctx = prevConnContext(ctx, conn)
+		}
+		id, ok := conn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
+		if ok {
+			ssh3Server.connByIDMtx.Lock()
+			ssh3Server.connByID[id] = conn
+			ssh3Server.connByIDMtx.Unlock()
+			// Clean up when the connection closes; the goroutine
+			// blocks until the per-connection context is cancelled.
+			go func() {
+				<-conn.Context().Done()
+				ssh3Server.connByIDMtx.Lock()
+				delete(ssh3Server.connByID, id)
+				ssh3Server.connByIDMtx.Unlock()
+			}()
+		}
+		return context.WithValue(ctx, ssh3ConnContextKey, conn)
+	}
+
+	h3Server.StreamHijacker = func(frameType http3.FrameType, connID quic.ConnectionTracingID, stream *quic.Stream, err error) (bool, error) {
 		if err != nil {
 			return false, err
 		}
 		if frameType != SSH_FRAME_TYPE {
 			log.Error().Msgf("bad HTTP frame type: %d", frameType)
+			return false, nil
+		}
+
+		ssh3Server.connByIDMtx.RLock()
+		qconn, ok := ssh3Server.connByID[connID]
+		ssh3Server.connByIDMtx.RUnlock()
+		if !ok {
+			log.Error().Msgf("StreamHijacker: no *quic.Conn registered for ConnectionTracingID; dropping stream %d", stream.StreamID())
 			return false, nil
 		}
 
@@ -119,28 +176,28 @@ func NewServer(maxPacketSize uint64, defaultDatagramQueueSize uint64, h3Server *
 	return ssh3Server
 }
 
-func (s *Server) getConversationsManager(streamCreator http3.StreamCreator) (*conversationsManager, bool) {
+func (s *Server) getConversationsManager(qconn *quic.Conn) (*conversationsManager, bool) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	conversations, ok := s.conversations[streamCreator]
+	conversations, ok := s.conversations[qconn]
 	return conversations, ok
 }
 
-func (s *Server) getOrCreateConversationsManager(streamCreator http3.StreamCreator) *conversationsManager {
+func (s *Server) getOrCreateConversationsManager(qconn *quic.Conn) *conversationsManager {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	conversationsManager, ok := s.conversations[streamCreator]
+	conversationsManager, ok := s.conversations[qconn]
 	if !ok {
-		s.conversations[streamCreator] = newConversationManager(streamCreator)
-		conversationsManager = s.conversations[streamCreator]
+		s.conversations[qconn] = newConversationManager(qconn)
+		conversationsManager = s.conversations[qconn]
 	}
 	return conversationsManager
 }
 
-func (s *Server) removeConnection(streamCreator http3.StreamCreator) {
+func (s *Server) removeConnection(qconn *quic.Conn) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	delete(s.conversations, streamCreator)
+	delete(s.conversations, qconn)
 }
 
 type AuthenticatedHandlerFunc func(authenticatedUserName string, newConv *Conversation, w http.ResponseWriter, r *http.Request)
@@ -152,17 +209,42 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 	return func(authenticatedUsername string, newConv *Conversation, w http.ResponseWriter, r *http.Request) {
 		log.Info().Msgf("got request: method: %s, URL: %s", r.Method, r.URL.String())
 		if r.Method == http.MethodConnect && r.Proto == "ssh3" {
-			hijacker, ok := w.(http3.Hijacker)
+			_, ok := w.(http3.Hijacker)
 			if !ok { // should never happen, unless quic-go change their API
 				log.Error().Msg("failed to hijack HTTP conversation: is it an HTTP/3 conversation ?")
 				return
 			}
-			streamCreator := hijacker.StreamCreator()
-			qconn := streamCreator.(quic.Connection)
-			conversationsManager := s.getOrCreateConversationsManager(streamCreator)
+			qconn := QUICConnFromContext(r.Context())
+			if qconn == nil {
+				log.Error().Msg("could not retrieve *quic.Conn from request context; misconfigured ssh3.Server?")
+				return
+			}
+			conversationsManager := s.getOrCreateConversationsManager(qconn)
 			conversationsManager.addConversation(newConv)
 
 			w.WriteHeader(200)
+
+			// Synchronisation handshake against the quic-go v0.57+
+			// race where the http3 server may schedule this handler
+			// in a different goroutine from the one that handles the
+			// next stream the client opens (which is StreamHijacker
+			// territory).  Without this, the client can open the
+			// first reverse-forward channel before addConversation
+			// returns, and the StreamHijacker will reject it with
+			// H3_FRAME_UNEXPECTED because the conversation is not
+			// yet in conversationsManager.
+			//
+			// We write a single 0x00 byte on the hijacked CONNECT
+			// stream and the client blocks on reading it before
+			// opening any channels.  Cheap, deterministic, and
+			// invisible to clients that never read - they would
+			// just observe a 1-byte readable buffer on the control
+			// stream, harmless.
+			if hjs, ok := w.(http3.HTTPStreamer); ok {
+				if _, err := hjs.HTTPStream().Write([]byte{0x00}); err != nil {
+					log.Warn().Msgf("could not write conversation-ready byte on CONNECT stream: %s", err)
+				}
+			}
 
 			go func() {
 				// TODO: this hijacks the datagrams for the whole quic connection, so the server
@@ -200,7 +282,7 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 			go func() {
 				defer newConv.Close()
 				defer conversationsManager.removeConversation(newConv)
-				defer s.removeConnection(streamCreator)
+				defer s.removeConnection(qconn)
 				if err := s.conversationHandler(authenticatedUsername, newConv); err != nil {
 					if errors.Is(err, context.Canceled) {
 						log.Info().Msgf("conversation canceled for conversation id %s, user %s", newConv.ConversationID(), authenticatedUsername)

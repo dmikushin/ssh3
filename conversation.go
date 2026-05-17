@@ -26,11 +26,22 @@ func (cid ConversationID) String() string {
 	return base64.StdEncoding.EncodeToString(cid[:])
 }
 
+// controlStreamLike is the small subset of methods we use on the
+// HTTP/3 control stream of a conversation. It is satisfied by both
+// *http3.Stream (server side, where the stream is delivered to us by
+// the HTTP/3 handler) and *http3.RequestStream (client side, where we
+// open it ourselves via http3.ClientConn.OpenRequestStream because
+// the v0.57.1 transport no longer exposes DontCloseRequestStream).
+type controlStreamLike interface {
+	StreamID() quic.StreamID
+	Close() error
+}
+
 type Conversation struct {
-	controlStream             http3.Stream
+	controlStream             controlStreamLike
 	maxPacketSize             uint64
 	defaultDatagramsQueueSize uint64
-	streamCreator             http3.StreamCreator
+	streamCreator             *quic.Conn
 	messageSender             util.DatagramSender
 	channelsManager           *channelsManager
 	context                   context.Context
@@ -76,9 +87,9 @@ func NewClientConversation(maxPacketsize uint64, defaultDatagramsQueueSize uint6
 	return conv, nil
 }
 
-func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripper *http3.RoundTripper, supportedVersions []Version) error {
+func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripper *http3.Transport, qconn *quic.Conn, supportedVersions []Version) error {
 
-	roundTripper.StreamHijacker = func(frameType http3.FrameType, qconn quic.Connection, stream quic.Stream, err error) (bool, error) {
+	roundTripper.StreamHijacker = func(frameType http3.FrameType, _ quic.ConnectionTracingID, stream *quic.Stream, err error) (bool, error) {
 		if err != nil {
 			return false, err
 		}
@@ -140,13 +151,51 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 		return true, nil
 	}
 
+	// Build a single *http3.ClientConn on top of our already-handshaken
+	// QUIC connection. The old code relied on http3.Transport.RoundTripOpt
+	// with DontCloseRequestStream so the underlying request stream stayed
+	// open after ReadResponse, which is what ssh3 needs for its long-lived
+	// CONNECT-style control stream. DontCloseRequestStream was removed in
+	// quic-go v0.57.1; the supported replacement is to drive the request
+	// manually through *http3.ClientConn.OpenRequestStream, which by
+	// design does NOT close the stream when ReadResponse returns. That
+	// restores the long-lived CONNECT semantics.
+	//
+	// roundTripper.StreamHijacker is set above; NewClientConn snapshots it,
+	// so this call must come after the hijacker is installed. qconn is
+	// already past HandshakeComplete by the time we get here (see
+	// client/client.go just before NewClientConversation), so there is no
+	// chicken-and-egg ordering problem with OpenRequestStream.
+	clientConn := roundTripper.NewClientConn(qconn)
+
+	// doReq keeps its (response, server-version, error) signature; the
+	// underlying *http3.RequestStream that backs the long-lived control
+	// stream is stashed via the closure into the returned response by
+	// way of c.controlStream below — there is exactly one successful
+	// doReq call per conversation (after at most one version-fallback
+	// retry), so we don't need to thread the RequestStream through the
+	// return values.
+	var lastReqStream *http3.RequestStream
 	doReq := func(version Version, req *http.Request) (*http.Response, Version, error) {
 		req.Header.Set("User-Agent", version.GetVersionString())
 		log.Debug().Msgf("send %s request on URL %s, User-Agent=\"%s\"", req.Method, req.URL, req.Header.Get("User-Agent"))
-		rsp, err := roundTripper.RoundTripOpt(req, http3.RoundTripOpt{DontCloseRequestStream: true})
+		str, err := clientConn.OpenRequestStream(req.Context())
 		if err != nil {
-			return rsp, Version{}, err
+			return nil, Version{}, err
 		}
+		if err := str.SendRequestHeader(req); err != nil {
+			str.CancelRead(0)
+			str.CancelWrite(0)
+			return nil, Version{}, err
+		}
+		rsp, err := str.ReadResponse()
+		if err != nil {
+			return nil, Version{}, err
+		}
+		// Hold on to the stream so EstablishClientConversation can adopt
+		// it as the control stream once it has decided this response is
+		// the final one (i.e. not a version-negotiation 403).
+		lastReqStream = str
 
 		log.Debug().Msgf("got response with %s status code", rsp.Status)
 
@@ -206,9 +255,8 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 			log.Warn().Msgf("The server runs an unsupported SSH version (%s), you may want to consider to update the client (currently %s)",
 				serverVersion.GetProtocolVersion(), ThisVersion().GetProtocolVersion())
 		}
-		c.controlStream = rsp.Body.(http3.HTTPStreamer).HTTPStream()
-		c.streamCreator = rsp.Body.(http3.Hijacker).StreamCreator()
-		qconn := c.streamCreator.(quic.Connection)
+		c.controlStream = lastReqStream
+		c.streamCreator = qconn
 		c.messageSender = qconn
 		c.context, c.cancelContext = context.WithCancelCause(qconn.Context())
 		go func() {
@@ -241,6 +289,19 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 			}
 		}()
 		c.peerVersion = serverVersion
+		// Synchronisation: read the one-byte conversation-ready ack the
+		// server writes on the CONNECT stream after addConversation.
+		// In quic-go v0.57+ the http3 handler invocation is not
+		// strictly ordered against the next stream the client opens,
+		// so without this read the very first reverse-forward channel
+		// can lose the race against addConversation and get rejected
+		// with H3_FRAME_UNEXPECTED by the StreamHijacker.  The ack is
+		// also a soft proof that the server actually accepted the
+		// conversation (not just the CONNECT headers).
+		var ack [1]byte
+		if _, err := io.ReadFull(lastReqStream, ack[:]); err != nil {
+			log.Warn().Msgf("could not read conversation-ready ack from server: %s (continuing anyway)", err)
+		}
 		return nil
 	} else if rsp.StatusCode == http.StatusUnauthorized {
 		return util.Unauthorized{}
@@ -259,7 +320,7 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 	}
 }
 
-func NewServerConversation(ctx context.Context, controlStream http3.Stream, qconn quic.Connection, messageSender util.DatagramSender, maxPacketsize uint64, peerVersion Version) (*Conversation, error) {
+func NewServerConversation(ctx context.Context, controlStream *http3.Stream, qconn *quic.Conn, messageSender util.DatagramSender, maxPacketsize uint64, peerVersion Version) (*Conversation, error) {
 	backgroundContext, backgroundCancelFunc := context.WithCancelCause(ctx)
 
 	tls := qconn.ConnectionState().TLS
@@ -284,13 +345,31 @@ func NewServerConversation(ctx context.Context, controlStream http3.Stream, qcon
 	return conv, nil
 }
 
+// StreamByteReader wraps a *quic.Stream (or anything that implements
+// the bidirectional-stream subset we need) so that it satisfies the
+// channelReceiver interface and exposes ReadByte for parsers that use
+// util.NewReader.
 type StreamByteReader struct {
-	http3.Stream
+	stream streamLike
+}
+
+// streamLike is the read-side subset of *quic.Stream and *quic.ReceiveStream.
+type streamLike interface {
+	io.Reader
+	CancelRead(quic.StreamErrorCode)
+}
+
+func (r *StreamByteReader) Read(p []byte) (int, error) {
+	return r.stream.Read(p)
+}
+
+func (r *StreamByteReader) CancelRead(code quic.StreamErrorCode) {
+	r.stream.CancelRead(code)
 }
 
 func (r *StreamByteReader) ReadByte() (byte, error) {
 	buf := [1]byte{0}
-	_, err := r.Stream.Read(buf[:])
+	_, err := r.stream.Read(buf[:])
 	if err != nil {
 		return 0, err
 	}
