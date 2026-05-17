@@ -342,6 +342,11 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 
 type Client struct {
 	qconn *quic.Conn
+	// qtransport is the quic.Transport that owns qconn's first
+	// network path.  Keeping it on the Client lets the connection-
+	// migration coordinator spin up additional transports and call
+	// qconn.AddPath(newTransport) when the underlying network changes.
+	qtransport *quic.Transport
 	*ssh3.Conversation
 
 	// reverseDispatcher centralises the handling of all server-initiated
@@ -515,6 +520,7 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 }
 
 func Dial(ctx context.Context, config *client_config.Config, qconn *quic.Conn,
+	qtransport *quic.Transport,
 	roundTripper *http3.Transport,
 	sshAgent agent.ExtendedAgent) (*Client, error) {
 
@@ -706,6 +712,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn *quic.Conn,
 
 	return &Client{
 		qconn:             qconn,
+		qtransport:        qtransport,
 		Conversation:      conv,
 		reverseDispatcher: newReverseDispatcher(),
 	}, nil

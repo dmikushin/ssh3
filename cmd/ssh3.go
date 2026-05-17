@@ -50,7 +50,7 @@ func homedir() string {
 // If non-nil, use udpConn as transport (can be used for proxy jump)
 // Otherwise, create a UDPConn from udp://host:port
 func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog io.Writer, ssh3Dir string, certPool *x509.CertPool, knownHostsPath string, knownHosts ssh3.KnownHosts,
-	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (*quic.Conn, int) {
+	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (*quic.Conn, *quic.Transport, int) {
 
 	var err error
 	remoteAddr := proxyRemoteAddr
@@ -58,7 +58,7 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 		remoteAddr, err = net.ResolveUDPAddr("udp", options.URLHostnamePort())
 		if err != nil {
 			log.Error().Msgf("could not resolve UDP address: %s", err)
-			return nil, -1
+			return nil, nil, -1
 		}
 	}
 
@@ -83,7 +83,7 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 	udpConn, err := net.ListenUDP(netString, nil)
 	if err != nil {
 		log.Error().Msgf("could not create UDP connection: %s", err)
-		return nil, -1
+		return nil, nil, -1
 	}
 
 	tlsConf := &tls.Config{
@@ -122,8 +122,13 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 	}
 
 	log.Debug().Msgf("dialing QUIC host at %s", remoteAddr)
-	qClient, err := quic.DialEarly(ctx,
-		udpConn,
+	// Wrap the UDPConn in a quic.Transport: this is the entry point
+	// for the connection-migration API (Conn.AddPath needs a
+	// *quic.Transport).  We hold onto the transport and return it to
+	// the caller so the migration coordinator can spawn additional
+	// transports for new paths and link them to this connection.
+	tr := &quic.Transport{Conn: udpConn}
+	qClient, err := tr.DialEarly(ctx,
 		remoteAddr,
 		tlsConf,
 		&qconf)
@@ -133,14 +138,14 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 				log.Debug().Msgf("received QUIC crypto error on first connection attempt: %s", err)
 				if tty == nil {
 					log.Error().Msgf("insecure server cert in non-terminal session, aborting")
-					return nil, -1
+					return nil, nil, -1
 				}
 				if _, ok := knownHosts[options.CanonicalHostFormat()]; ok {
 					log.Error().Msgf("The server certificate cannot be verified using the one installed in %s. "+
 						"If you did not change the server certificate, it could be a machine-in-the-middle attack. "+
 						"TLS error: %s", knownHostsPath, err)
 					log.Error().Msgf("Aborting.")
-					return nil, -1
+					return nil, nil, -1
 				}
 				// bad certificates, let's mimic the OpenSSH's behaviour similar to host keys
 				tlsConf.InsecureSkipVerify = true
@@ -151,19 +156,18 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 					return certError
 				}
 
-				_, err := quic.DialEarly(ctx,
-					udpConn,
+				_, err := tr.DialEarly(ctx,
 					remoteAddr,
 					tlsConf,
 					&qconf)
 				if !errors.Is(err, certError) {
 					log.Error().Msgf("could not create client QUIC connection: %s", err)
-					return nil, -1
+					return nil, nil, -1
 				}
 				// let's first check that the certificate is self-signed
 				if err := peerCertificate.CheckSignatureFrom(peerCertificate); err != nil {
 					log.Error().Msgf("the peer provided an unknown, insecure certificate, that is not self-signed: %s", err)
-					return nil, -1
+					return nil, nil, -1
 				}
 				// first, carriage return
 				_, _ = tty.WriteString("\r")
@@ -175,7 +179,7 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 					"Do you want to add this certificate to ~/.ssh3/known_hosts (yes/no)? ")
 				if err != nil {
 					log.Error().Msgf("cound not write on /dev/tty: %s", err)
-					return nil, -1
+					return nil, nil, -1
 				}
 
 				answer := ""
@@ -191,21 +195,21 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 				}
 				if answer == "no" {
 					log.Info().Msg("Connection aborted")
-					return nil, 0
+					return nil, nil, 0
 				}
 				if err := ssh3.AppendKnownHost(knownHostsPath, options.CanonicalHostFormat(), peerCertificate); err != nil {
 					log.Error().Msgf("could not append known host to %s: %s", knownHostsPath, err)
-					return nil, -1
+					return nil, nil, -1
 				}
 				tty.WriteString(fmt.Sprintf("Successfully added the certificate to %s, please rerun the command\n\r", knownHostsPath))
-				return nil, 0
+				return nil, nil, 0
 			}
 		}
 		log.Error().Msgf("could not establish client QUIC connection: %s", err)
-		return nil, -1
+		return nil, nil, -1
 	}
 
-	return qClient, 0
+	return qClient, tr, 0
 }
 
 func parseAddrPort(addrPort string) (localIP net.IP, localPort int, remoteIP net.IP, remotePort int, err error) {
@@ -757,7 +761,7 @@ func ClientMain() int {
 			log.Error().Msgf("Could not get connection material for proxy %s: %s", proxyParsedUrl, err)
 			return -1
 		}
-		qconn, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
+		qconn, _, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
 
 		if qconn == nil {
 			if status != 0 {
@@ -770,7 +774,11 @@ func ClientMain() int {
 			EnableDatagrams: true,
 		}
 
-		proxyClient, err := client.Dial(ctx, proxyOptions, qconn, roundTripper, proxyAgentClient)
+		// Proxy-jump client: pass nil for the Transport - migration
+		// is wired only on the *target* conversation for now, the
+		// proxy hop reuses the dialed connection but is not itself a
+		// migration peer.
+		proxyClient, err := client.Dial(ctx, proxyOptions, qconn, nil, roundTripper, proxyAgentClient)
 		if err != nil {
 			log.Error().Msgf("could not establish SSH3 proxy conversation: %s", err)
 			return -1
@@ -795,7 +803,7 @@ func ClientMain() int {
 		log.Debug().Msgf("started proxy jump at %s", proxyAddress)
 	}
 
-	qconn, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, options, proxyAddress, tty)
+	qconn, qtransport, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, options, proxyAddress, tty)
 
 	if qconn == nil {
 		if status != 0 {
@@ -808,7 +816,7 @@ func ClientMain() int {
 		EnableDatagrams: true,
 	}
 
-	c, err := client.Dial(ctx, options, qconn, roundTripper, agentClient)
+	c, err := client.Dial(ctx, options, qconn, qtransport, roundTripper, agentClient)
 	if err != nil {
 		log.Error().Msgf("could not dial %s: %s", options.CanonicalHostFormat(), err)
 		return -1
