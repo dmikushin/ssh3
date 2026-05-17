@@ -1013,6 +1013,8 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 		msg, e := channel.NextMessage()
 		resultCh <- readResult{msg, e}
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case r := <-resultCh:
 		if r.err != nil {
@@ -1045,8 +1047,20 @@ func readReverseSetupAck(channel ssh3.Channel, timeout time.Duration) (ok bool, 
 		default:
 			return false, false, fmt.Errorf("unknown reverse-forward setup opcode 0x%02x", dm.Data[0])
 		}
-	case <-time.After(timeout):
+	case <-timer.C:
+		// Cancel the in-flight read on the QUIC stream.  In quic-go
+		// CancelRead is asynchronous: it sends STOP_SENDING and
+		// causes the next Read to error out, which is what unblocks
+		// the goroutine spawned above.  Drain the resultCh with a
+		// short bounded wait so the goroutine doesn't leak past
+		// this function (in the worst case it sits there forever
+		// waiting for stream activity that will never come).
 		channel.CancelRead()
+		select {
+		case <-resultCh:
+		case <-time.After(time.Second):
+			log.Warn().Msg("readReverseSetupAck: background read goroutine did not exit after CancelRead within 1s; leaked")
+		}
 		return false, true, nil
 	}
 }
