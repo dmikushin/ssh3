@@ -43,6 +43,16 @@ import (
 // out.  Errors are logged, not returned, because the goroutine
 // outlives the call.
 func (c *Client) StartMigration(ctx context.Context) {
+	if !c.migrationStarted.CompareAndSwap(false, true) {
+		// StartMigration already ran on this Client; spawning a
+		// second coordinator on the same *quic.Conn would race
+		// the existing one on AddPath/Switch and on the
+		// qtransport assignment.  Bail loudly so the misuse
+		// shows up in the log rather than as obscure path
+		// corruption.
+		log.Warn().Msg("StartMigration called more than once on the same Client; ignoring the second call")
+		return
+	}
 	if c.qtransport == nil {
 		// Defensive: every Client constructed by client.Dial holds
 		// a *quic.Transport (we plumb it explicitly from
@@ -331,12 +341,22 @@ func (mc *migrationCoordinator) migrate(ctx context.Context) error {
 	// migrations (Wi-Fi flapping → coalesced follow-up cycles)
 	// don't pull the socket out from under quic-go while it is
 	// still retransmitting on it.
+	//
+	// We hold mc.mu over the field swap purely to document the
+	// memory-model contract (writes to mc.previousTransport and
+	// mc.client.qtransport happen under mc.mu).  busy=true already
+	// guarantees there is at most one writer, so this lock is
+	// uncontended in practice; it exists so a future reader from
+	// a different goroutine can grab the same mutex and observe a
+	// consistent pair of pointers.
+	mc.mu.Lock()
 	oldTransport := mc.client.qtransport
 	if mc.previousTransport != nil {
 		closeTransportAfterDrain(mc.previousTransport)
 	}
 	mc.previousTransport = oldTransport
 	mc.client.qtransport = newTransport
+	mc.mu.Unlock()
 	return nil
 }
 

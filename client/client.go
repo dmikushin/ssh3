@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -346,7 +347,17 @@ type Client struct {
 	// network path.  Keeping it on the Client lets the connection-
 	// migration coordinator spin up additional transports and call
 	// qconn.AddPath(newTransport) when the underlying network changes.
+	//
+	// After StartMigration runs, qtransport is mutated only by
+	// migrationCoordinator.migrate() while holding
+	// migrationCoordinator.mu.  Outside the coordinator code, treat
+	// it as read-mostly; if you need to read it concurrently with a
+	// possible migration, grab the same mutex.
 	qtransport *quic.Transport
+	// migrationStarted guards StartMigration against being called
+	// twice on the same Client (which would spawn duplicate
+	// coordinators racing on the same *quic.Conn).
+	migrationStarted atomic.Bool
 	*ssh3.Conversation
 
 	// reverseDispatcher centralises the handling of all server-initiated

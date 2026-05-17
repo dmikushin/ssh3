@@ -800,8 +800,7 @@ func ClientMain() int {
 		// constructed target leg.  See the StartMigration block right
 		// before c.RunSession below.
 		if *enableMigration {
-			pc := proxyClient
-			startProxyMigration = func() { pc.StartMigration(ctx) }
+			startProxyMigration = func() { proxyClient.StartMigration(ctx) }
 		}
 
 		baseAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
