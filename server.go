@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -245,6 +246,33 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 					log.Warn().Msgf("could not write conversation-ready byte on CONNECT stream: %s", err)
 				}
 			}
+
+			// Migration observer: passively notice when the peer's
+			// network endpoint changes (quic-go updates RemoteAddr()
+			// when it accepts a new path).  ssh3 conversations are
+			// keyed by *quic.Conn (which survives migration), and
+			// quic.Config does not set DisableActiveMigration, so
+			// the server already supports migration end-to-end.  All
+			// this goroutine does is log the transition for
+			// observability.
+			go func(initialPeer string) {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				prev := initialPeer
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-qconn.Context().Done():
+						return
+					case <-ticker.C:
+						if curr := qconn.RemoteAddr().String(); curr != prev {
+							log.Info().Msgf("peer migrated for user %s: %s -> %s", authenticatedUsername, prev, curr)
+							prev = curr
+						}
+					}
+				}
+			}(qconn.RemoteAddr().String())
 
 			go func() {
 				// TODO: this hijacks the datagrams for the whole quic connection, so the server
