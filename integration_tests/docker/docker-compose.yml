@@ -1,0 +1,147 @@
+# In-tree docker smoke-test stack: ssh3 client + ssh3 server on a
+# fully isolated docker bridge network with NO host networking, NO
+# published ports, NO access to the host's internet (network is
+# `internal: true`).
+#
+# The two containers talk to each other over the `ssh3net` bridge.
+# Nothing else - including the host itself - can reach them.
+#
+# Usage (from this directory):
+#   1. `./bootstrap.sh`                         (one-time: generate cert + ssh key)
+#   2. `docker compose up --build`              (foreground; ctrl-c to stop)
+#   3. `docker compose down --rmi local -v`     (full teardown)
+#
+# Run the smoke-test suite (echo + reverse-tcp connectivity through
+# the tunnel) - the `tests` profile is opt-in so a plain `up` does
+# not start it:
+#   docker compose --profile tests run --build --rm tests
+#
+# Or from the repo root:
+#   make docker-smoke-tests
+#
+# `additional_contexts.ssh3-src` defaults to `../..`, i.e. the ssh3
+# repo root relative to this compose file.  Point at a different
+# checkout (e.g. a fork) by overriding SSH3_SRC:
+#   SSH3_SRC=/path/to/other/ssh3 docker compose up --build
+#
+# This file intentionally pins every container's network to ssh3net
+# with `internal: true`.  If you want to publish a port to the host
+# for debugging, do it on a SEPARATE compose override file
+# (compose.override.yml) so the smoke-test stack stays isolated.
+
+services:
+  server:
+    build:
+      context: ./server
+      additional_contexts:
+        ssh3-src: ${SSH3_SRC:-../..}
+    image: ssh3-docker-smoke-server:dev
+    hostname: ssh3-server
+    environment:
+      SSH3_BIND: "0.0.0.0:4443"
+      SSH3_URL_PATH: "/ssh3"
+      SSH3_USER: "tunneluser"
+      SSH3_USER_UID: "1000"
+    secrets:
+      - source: cert_pem
+        target: cert.pem
+      - source: cert_key
+        target: cert.key
+      - source: client_pub
+        target: authorized_id.pub
+    networks:
+      ssh3net:
+        ipv4_address: 10.20.0.10
+    # Container needs CAP_SETUID/CAP_SETGID so ssh3-server can
+    # setuid into tunneluser when handling a session.  We do NOT
+    # use --privileged or host networking.
+    cap_add:
+      - SETUID
+      - SETGID
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ./client
+      additional_contexts:
+        ssh3-src: ${SSH3_SRC:-../..}
+    image: ssh3-docker-smoke-client:dev
+    hostname: ssh3-client
+    depends_on:
+      - server
+    environment:
+      SSH3_REMOTE_USER: "tunneluser"
+      # We address the server by its docker service name; docker's
+      # embedded DNS resolves it inside ssh3net.
+      SSH3_REMOTE_HOST: "server:4443"
+      SSH3_REMOTE_PATH: "/ssh3"
+      # Self-signed cert => -insecure on the client.  In a real
+      # deployment you'd use a Let's-Encrypt cert and drop this.
+      SSH3_INSECURE: "1"
+      # Migration is meaningful here only if you also flip the
+      # client container's network between two compose networks
+      # at runtime; left on so the logs show the coordinator
+      # starting up.
+      SSH3_ENABLE_MIGRATION: "1"
+      # No forwards by default - override in compose.override.yml or
+      # via `SSH3_OPTIONS='...' docker compose up`.  Example for the
+      # autossh use case:
+      #   SSH3_OPTIONS: "-reverse-tcp 0.0.0.0:2222@22/127.0.0.1"
+      SSH3_OPTIONS: ""
+      SSH3_RECONNECT_DELAY: "5"
+      SSH3_REMOTE_COMMAND: "sleep infinity"
+    secrets:
+      - source: client_priv
+        target: id_ed25519
+    networks:
+      ssh3net:
+        ipv4_address: 10.20.0.20
+    restart: unless-stopped
+
+  # Smoke test runner.  Opt-in via the `tests` profile so a normal
+  # `docker compose up` doesn't spawn it.  Run with:
+  #   docker compose --profile tests run --build --rm tests
+  # The runner exits with code 0 on PASS, non-zero on FAIL.
+  tests:
+    profiles: [tests]
+    build:
+      context: ./tests
+      additional_contexts:
+        ssh3-src: ${SSH3_SRC:-../..}
+    image: ssh3-docker-smoke-tests:dev
+    hostname: ssh3-tests
+    depends_on:
+      - server
+    environment:
+      SSH3_REMOTE_USER: "tunneluser"
+      SSH3_REMOTE_HOST: "server:4443"
+      SSH3_REMOTE_PATH: "/ssh3"
+    secrets:
+      - source: client_priv
+        target: id_ed25519
+    networks:
+      ssh3net:
+        ipv4_address: 10.20.0.30
+
+networks:
+  ssh3net:
+    driver: bridge
+    # `internal: true` is the key isolation switch: the bridge has
+    # no default route, so containers attached to ssh3net cannot
+    # reach the host's external network and the host's other
+    # networks cannot reach them.  Container-to-container traffic
+    # inside this bridge works as normal.
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+
+secrets:
+  cert_pem:
+    file: ./secrets/cert.pem
+  cert_key:
+    file: ./secrets/cert.key
+  client_priv:
+    file: ./secrets/client_id_ed25519
+  client_pub:
+    file: ./secrets/client_id_ed25519.pub

@@ -38,6 +38,28 @@ integration-tests:
 local-integration-tests:
 	bash scripts/run_integration_tests.sh
 
+# docker-smoke-tests runs a low-risk end-to-end smoke check (echo +
+# reverse-tcp through a real ssh3 client<->ssh3 server pair) inside
+# a docker-compose stack on an `internal: true` bridge.  Does NOT
+# touch host networking, does NOT useradd, does NOT need sudo.  Build
+# happens inside the containers, so the first run takes a few minutes
+# while the go modules are fetched and the binaries compiled; the
+# `tests` service exits non-zero on failure.  Teardown runs even when
+# the tests fail so the local docker state stays clean.
+#
+# Override SSH3_SRC if you want the containers to build against a
+# different ssh3 checkout (default: the repo root, i.e. ../.. from
+# the compose file):
+#   SSH3_SRC=/path/to/fork make docker-smoke-tests
+docker-smoke-tests:
+	cd integration_tests/docker && \
+		./bootstrap.sh && \
+		docker compose up -d --build server && \
+		( docker compose --profile tests run --build --rm tests; \
+		  rc=$$?; \
+		  docker compose down --rmi local -v; \
+		  exit $$rc )
+
 install:
 	$(GO_OPTS) go install $(BUILDFLAGS) ./cmd/ssh3
 	$(GO_OPTS) go install $(BUILDFLAGS) ./cmd/ssh3-server

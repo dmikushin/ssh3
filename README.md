@@ -47,6 +47,9 @@ Given the current prototype state, we advise *testing SSH3 in sandboxed environm
 
 While [hiding](#-your-ssh3-public-server-can-be-hidden) servers behind secret paths has potential benefits, it does not negate the need for rigorous vulnerability analysis before entering production. We are excited by SSH3's future possibilities but encourage additional scrutiny first.
 
+### 🐳 Validating a build with the docker smoke-test stack
+If you just want a quick "did my change break the end-to-end flow?" sanity check, run `make docker-smoke-tests`. It brings up a two-container ssh3-client + ssh3-server pair on an `internal: true` docker bridge, runs an echo test and a reverse-tcp tunnel test through the live connection, and tears everything down. It doesn't touch host networking, doesn't `useradd`, and doesn't need sudo — the heavy `local-integration-tests` target is still there when you want the full Ginkgo suite under Linux netns. See [`integration_tests/docker/README.md`](integration_tests/docker/README.md) for the details and how to point the build at a different ssh3 checkout.
+
 ## 🥷 Your SSH3 public server can be hidden
 Using SSH3, you can avoid the usual stress of scanning and dictionary attacks against your SSH server. Similarly to your secret Google Drive documents, your SSH3 server can be hidden behind a secret link and only answer to authentication attempts that made an HTTP request to this specific link, like the following:
 
