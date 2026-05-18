@@ -43,3 +43,21 @@ jobs:
       - name: Test
         run: |
           make test
+
+  docker-smoke-tests:
+    # End-to-end ssh3 client ↔ ssh3 server smoke test inside an
+    # isolated docker bridge.  Mirrors `make docker-smoke-tests`
+    # locally - same Dockerfiles, same run-tests.sh, same teardown.
+    # Doesn't need sudo / iptables / netns; runs entirely inside the
+    # GitHub-provided Docker daemon.
+    name: Docker smoke tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make sure docker + compose v2 are available
+        run: |
+          docker --version
+          docker compose version
+      - name: Run docker smoke tests
+        run: |
+          make docker-smoke-tests
