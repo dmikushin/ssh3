@@ -81,6 +81,10 @@ struct Raw {
     ctl_in: mpsc::UnboundedReceiver<Message>,
     lane: quinn::SendStream,
     lane_in: quinn::RecvStream,
+    /// The event lane (we write raw event frames within the server's 1 MiB
+    /// grant) and the server's events.
+    ev: quinn::SendStream,
+    ev_in: mpsc::UnboundedReceiver<Message>,
     /// The server's latest grant on channel 2 lane 0 (when we send).
     server_limit: u64,
 }
@@ -112,10 +116,15 @@ async fn raw_session(env: &Env, target: SocketAddr, our_limit: u64) -> Raw {
             }
         }
     });
-    // Keep the event lane read so the server's event credit is not an issue.
-    tokio::spawn(async move { while let Ok(Some(_)) = frame::read_frame(&mut ev_r, 65536).await {} });
-    std::mem::forget(ev);
-    Raw { conn, ctl, ctl_in, lane, lane_in, server_limit }
+    let (etx, ev_in) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(Some(m)) = frame::read_message(&mut ev_r, 65536).await {
+            if etx.send(m).is_err() {
+                return;
+            }
+        }
+    });
+    Raw { conn, ctl, ctl_in, lane, lane_in, ev, ev_in, server_limit }
 }
 
 impl Raw {
@@ -317,4 +326,63 @@ async fn idle_lanes_return_to_floor() {
         st.credit_outstanding <= (n + 1) * floor && st.recv_budget_used == 0
     }, || format!("{:?}", env.server.stats())).await;
     assert!(env.server.stats().credit_retractions >= n, "{:?}", env.server.stats());
+}
+
+/// Writes `n` bytes, then closes.
+async fn finite_source(n: usize) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(&vec![3u8; n]).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    a
+}
+
+/// Reviewer's forced order: the peer completes the channel (ChannelDone on
+/// the event log) while its final LaneAck is held back; the held-back ack,
+/// now stale (accepted below what ChannelDone released), arrives while the
+/// channel still exists. No close; the channel then completes and every
+/// ring byte and chunk is reclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_done_before_stale_lane_ack() {
+    let env = env_with(fast_limits());
+    let n = 100_000usize;
+    let src = finite_source(n).await;
+    let mut r = raw_session(&env, src, 1 << 20).await;
+    // The raw peer never acks the event lane, so the server keeps its few
+    // event bytes for replay; channel 2's bytes are the ones under test.
+    let events_only = 1024u64;
+    let mut got = 0;
+    let mut buf = vec![0u8; 65536];
+    while got < n {
+        got += tokio::time::timeout(LIMIT, r.lane_in.read(&mut buf)).await.unwrap().unwrap().unwrap();
+    }
+    // The server's LaneFin for its direction (the source closed).
+    loop {
+        if let Message::LaneFin { chan_id: 2, lane: 0, final_offset } = tokio::time::timeout(LIMIT, r.ev_in.recv()).await.unwrap().unwrap() {
+            assert_eq!(final_offset as usize, n);
+            break;
+        }
+    }
+    // No LaneAck yet: the server still holds all n bytes for replay.
+    assert!(env.server.stats().send_ring_bytes >= n as u64);
+    // 1. ChannelDone first (event log).
+    r.ev.write_all(&frame::encode(&Message::ChannelDone { chan_id: 2 })).await.unwrap();
+    wait_until("ChannelDone applied (ring released)", LIMIT, || env.server.stats().send_ring_bytes < events_only, || format!("{:?}", env.server.stats())).await;
+    assert_eq!(env.server.stats().channels, 1, "channel must still exist (our LaneFin is withheld)");
+    // 2. The held-back, now stale ack.
+    frame::write_message(&mut r.ctl, &Message::LaneAck { chan_id: 2, lane: 0, accepted: (n / 2) as u64, limit: 1 << 20, seq: 0 }).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(r.conn.close_reason().is_none(), "stale ack closed the carrier: {:?}", r.conn.close_reason());
+    // 3. Our direction ends: the channel completes and is reclaimed.
+    r.ev.write_all(&frame::encode(&Message::LaneFin { chan_id: 2, lane: 0, final_offset: 0 })).await.unwrap();
+    wait_until("channel reclaimed", LIMIT, || env.server.stats().channels == 0, || format!("{:?}", env.server.stats())).await;
+    let st = env.server.stats();
+    assert!(st.send_ring_bytes < events_only && st.recv_ring_bytes == 0, "{st:?}");
+    assert!(r.conn.close_reason().is_none());
 }
