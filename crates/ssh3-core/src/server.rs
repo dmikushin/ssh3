@@ -22,6 +22,8 @@ pub struct ServerOptions {
     pub authenticator: Arc<dyn Authenticator>,
     pub limits: Limits,
     pub keys: EndpointKeys,
+    /// Session channels (shell/exec/subsystem); None refuses them.
+    pub session: Option<crate::sesschan::ServerSessionEnv>,
 }
 
 #[derive(Default)]
@@ -40,6 +42,7 @@ struct ServerShared {
     unauth: Arc<Semaphore>,
     budgets: Arc<Budgets>,
     counters: Counters,
+    session_env: Option<Arc<crate::sesschan::ServerSessionEnv>>,
 }
 
 pub struct Server {
@@ -89,6 +92,11 @@ impl Server {
         opts.limits.validate().map_err(Error::Config)?;
         let sc = transport::server_config(opts.tls, &opts.limits)?;
         let endpoint = Endpoint::new(transport::endpoint_config(&opts.keys), Some(sc), socket, Arc::new(TokioRuntime))?;
+        let local_port = endpoint.local_addr()?.port();
+        let session_env = opts.session.map(|mut e| {
+            e.local_port = local_port;
+            Arc::new(e)
+        });
         let shared = Arc::new(ServerShared {
             authenticator: opts.authenticator,
             unauth: Arc::new(Semaphore::new(opts.limits.max_unauthenticated)),
@@ -96,6 +104,7 @@ impl Server {
             limits: opts.limits,
             registry: Arc::new(Mutex::new(HashMap::new())),
             counters: Counters::default(),
+            session_env,
         });
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self { endpoint, shared, accept_task })
@@ -211,7 +220,17 @@ async fn handle(incoming: Incoming, shared: Arc<ServerShared>, permit: OwnedSema
         Authed::New { user, key, authz } => {
             let mut id = [0u8; 16];
             rand::thread_rng().fill_bytes(&mut id);
-            let session = SessionShared::new(id, Role::Server, user, key, authz, shared.limits.clone(), shared.budgets.clone(), Some(Arc::downgrade(&shared.registry)));
+            let session = SessionShared::new(
+                id,
+                Role::Server,
+                user,
+                key,
+                authz,
+                shared.limits.clone(),
+                shared.budgets.clone(),
+                Some(Arc::downgrade(&shared.registry)),
+                shared.session_env.clone(),
+            );
             {
                 let mut reg = shared.registry.lock().unwrap();
                 if reg.len() >= shared.limits.max_sessions {

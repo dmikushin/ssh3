@@ -10,6 +10,7 @@ pub mod limits;
 pub mod msg;
 pub mod ring;
 pub mod server;
+pub mod sesschan;
 pub mod session;
 pub mod transport;
 
@@ -18,3 +19,5 @@ pub use error::{Error, Result};
 pub use limits::Limits;
 pub use server::{Server, ServerOptions, ServerStats};
 pub use session::Budgets;
+pub use sesschan::{Command, ExitInfo, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec};
+pub use lane::{BlockingOverflow, PtyOverflow};

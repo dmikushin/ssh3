@@ -175,6 +175,7 @@ impl ClientSession {
             opts.limits.clone(),
             Budgets::new(&opts.limits),
             None,
+            None,
         );
         {
             let _g = shared.attach_lock.lock().await;
@@ -218,6 +219,11 @@ impl ClientSession {
 
     pub fn budgets(&self) -> &Budgets {
         &self.shared.budgets
+    }
+
+    /// Open a session channel (shell / exec / subsystem, optional pty).
+    pub async fn open_session(&self, spec: crate::sesschan::SessionSpec) -> Result<crate::sesschan::SessionChannel> {
+        self.shared.open_session(spec).await
     }
 
     pub async fn open_direct_tcp(&self, tcp: tokio::net::TcpStream, host: &str, port: u16) -> Result<u64> {

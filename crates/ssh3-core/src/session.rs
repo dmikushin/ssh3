@@ -62,6 +62,9 @@ impl Budgets {
 
 pub(crate) type Registry = Mutex<HashMap<SessionId, Arc<SessionShared>>>;
 
+/// Where a SessionReply is delivered (error text on failure).
+type ReplySlot = oneshot::Sender<std::result::Result<(), String>>;
+
 /// A -R request in flight: bind host, local target, reply slot.
 type PendingListen = (String, (String, u16), oneshot::Sender<std::result::Result<u16, FailReason>>);
 
@@ -82,13 +85,24 @@ pub(crate) struct Channel {
     pub lanes: Vec<Arc<Lane>>,
     /// Client side: ChannelOpen sent, ChannelOk not yet received. No lane
     /// streams exist yet, so they are not reopened on resume.
-    opening: AtomicBool,
+    pub(crate) opening: AtomicBool,
     tasks: Mutex<JoinSet<()>>,
     stats: Arc<Stats>,
+    /// Kind-specific state (session channels).
+    pub(crate) ext: Mutex<Option<crate::sesschan::ChanExt>>,
+}
+
+/// When a channel is finished and dropped.
+pub(crate) enum Completion {
+    /// Every lane finished in both directions (forwards).
+    AllLanes,
+    /// Server session: the process exited and every output lane was
+    /// delivered; stdin is abandoned (as sshd).
+    AfterExit(Arc<crate::sesschan::ExitFlag>),
 }
 
 impl Channel {
-    fn spawn(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub(crate) fn spawn(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
         self.tasks.lock().unwrap().spawn(f);
     }
 }
@@ -137,6 +151,11 @@ pub struct SessionShared {
     remote_forwards: Mutex<HashMap<(String, u16), (String, u16)>>,
     next_req: AtomicU64,
     pub refused_detached: AtomicU64,
+    has_pty: AtomicBool,
+    /// Server: how session channels run processes.
+    pub(crate) server_env: Option<Arc<crate::sesschan::ServerSessionEnv>>,
+    /// Client: session requests awaiting SessionReply, by (chan, req).
+    pub(crate) session_replies: Mutex<HashMap<(u64, u64), ReplySlot>>,
     events: mpsc::Sender<Message>,
     carrier: Mutex<Option<Carrier>>,
     epoch: AtomicU64,
@@ -160,6 +179,7 @@ impl SessionShared {
         limits: Limits,
         budgets: Arc<Budgets>,
         registry: Option<Weak<Registry>>,
+        server_env: Option<Arc<crate::sesschan::ServerSessionEnv>>,
     ) -> Arc<Self> {
         let (events_tx, events_rx) = mpsc::channel(limits.event_queue);
         let s = Arc::new(Self {
@@ -179,6 +199,9 @@ impl SessionShared {
             remote_forwards: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
             refused_detached: AtomicU64::new(0),
+            has_pty: AtomicBool::new(false),
+            server_env,
+            session_replies: Mutex::new(HashMap::new()),
             events: events_tx,
             carrier: Mutex::new(None),
             epoch: AtomicU64::new(0),
@@ -297,6 +320,21 @@ impl SessionShared {
         self.carrier.lock().unwrap().as_ref().map(|c| c.conn.rtt())
     }
 
+    /// Peer address and our local IP of the current carrier.
+    pub(crate) fn conn_addrs(&self) -> Option<(std::net::SocketAddr, Option<std::net::IpAddr>)> {
+        self.carrier.lock().unwrap().as_ref().map(|c| (c.conn.remote_address(), c.conn.local_ip()))
+    }
+
+    /// The session's forwarded-agent socket, if agent forwarding is on.
+    pub(crate) fn agent_socket_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// A pty channel exists: the session lingers per `pty_linger`.
+    pub(crate) fn note_pty(&self) {
+        self.has_pty.store(true, Ordering::Relaxed);
+    }
+
     fn conn(&self) -> Option<(Connection, u64)> {
         self.carrier.lock().unwrap().as_ref().map(|c| (c.conn.clone(), c.epoch))
     }
@@ -309,6 +347,10 @@ impl SessionShared {
     /// Reply from inside the event dispatcher: never waits (two dispatchers
     /// waiting on each other's event credit would deadlock). A peer that
     /// lets our replies pile up beyond the queue is violating the protocol.
+    pub(crate) fn reply_ev(&self, m: Message) -> Result<()> {
+        self.reply_event(m)
+    }
+
     fn reply_event(&self, m: Message) -> Result<()> {
         self.events.try_send(m).map_err(|_| Error::Protocol(format!("peer left {} session events unconsumed", self.limits.event_queue)))
     }
@@ -324,6 +366,7 @@ impl SessionShared {
             opening: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
             stats: self.stats.clone(),
+            ext: Mutex::new(None),
         });
         self.stats.channels.fetch_add(1, Ordering::Relaxed);
         for l in &ch.lanes {
@@ -332,7 +375,7 @@ impl SessionShared {
         ch
     }
 
-    fn new_channel(self: &Arc<Self>, chan_id: u64, nlanes: u8) -> std::result::Result<Arc<Channel>, FailReason> {
+    pub(crate) fn new_channel(self: &Arc<Self>, chan_id: u64, nlanes: u8, completion: Completion) -> std::result::Result<Arc<Channel>, FailReason> {
         let mut map = self.channels.lock().unwrap();
         if map.len() > self.limits.max_channels {
             return Err(FailReason::ResourceLimit);
@@ -341,16 +384,23 @@ impl SessionShared {
             return Err(FailReason::Protocol(format!("channel {chan_id} already exists")));
         }
         let ch = self.make_channel(chan_id, nlanes);
-        // Supervisor: drop the channel once every lane is complete.
+        // Supervisor: drop the channel once it is complete.
         let me = Arc::downgrade(self);
         let lanes = ch.lanes.clone();
         ch.spawn(async move {
+            if let Completion::AfterExit(flag) = &completion {
+                flag.wait().await;
+            }
             for l in &lanes {
                 loop {
                     let fut = l.done.notified();
                     tokio::pin!(fut);
                     fut.as_mut().enable();
-                    if l.is_complete() {
+                    let done = match &completion {
+                        Completion::AllLanes => l.is_complete(),
+                        Completion::AfterExit(_) => l.send_complete(),
+                    };
+                    if done {
                         break;
                     }
                     fut.await;
@@ -365,7 +415,11 @@ impl SessionShared {
         Ok(ch)
     }
 
-    fn drop_channel(&self, chan_id: u64) -> Option<Arc<Channel>> {
+    pub(crate) fn channel_by_id(&self, id: u64) -> Option<Arc<Channel>> {
+        self.channel(id)
+    }
+
+    pub(crate) fn drop_channel(&self, chan_id: u64) -> Option<Arc<Channel>> {
         if chan_id == EVENT_CHANNEL {
             return None;
         }
@@ -389,7 +443,17 @@ impl SessionShared {
         let _ = sock.set_send_buffer_size(self.limits.tcp_socket_buffer);
         let _ = tcp.set_nodelay(true);
         let (r, w) = tcp.into_split();
-        let lane = ch.lanes[0].clone();
+        self.start_io(ch, 0, r, w);
+    }
+
+    /// Bridge a local source and sink to lane `idx` of `ch`. A local I/O
+    /// error aborts the channel (ChannelClose to the peer).
+    pub(crate) fn start_io<R, W>(self: &Arc<Self>, ch: &Arc<Channel>, idx: usize, r: R, w: W)
+    where
+        R: tokio::io::AsyncRead + crate::lane::Readable + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let lane = ch.lanes[idx].clone();
         let chan_id = ch.chan_id;
         let me = Arc::downgrade(self);
         let l2 = lane.clone();
@@ -411,7 +475,7 @@ impl SessionShared {
     }
 
     /// Open a QUIC stream for `lane` on the current carrier.
-    async fn open_lane(self: &Arc<Self>, lane: &Arc<Lane>) -> Result<()> {
+    pub(crate) async fn open_lane(self: &Arc<Self>, lane: &Arc<Lane>) -> Result<()> {
         let (conn, _) = self.conn().ok_or(Error::CarrierLost)?;
         let (mut s, mut r) = conn.open_bi().await?;
         let epoch = lane.epoch();
@@ -446,8 +510,25 @@ impl SessionShared {
     /// Open a channel for a local TCP connection and bridge it once the peer
     /// accepts. Lane streams are always opened by the client.
     async fn open_tcp_channel(self: &Arc<Self>, tcp: TcpStream, kind: ChannelKind) -> Result<u64> {
+        let ch = self.open_channel(kind, 1, Completion::AllLanes, None).await?;
+        let chan_id = ch.chan_id;
+        self.start_tcp(&ch, tcp);
+        if self.role == Role::Client
+            && let Err(e) = self.open_lane(&ch.lanes[0]).await
+        {
+            // Detached now: the next resume opens it.
+            tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
+        }
+        Ok(chan_id)
+    }
+
+    /// Open a channel of `kind` with `nlanes` lanes and wait for the peer's
+    /// ChannelOk; the lanes carry the peer's initial limit afterwards. The
+    /// caller starts I/O and (client) opens the lane streams.
+    pub(crate) async fn open_channel(self: &Arc<Self>, kind: ChannelKind, nlanes: u8, completion: Completion, ext: Option<crate::sesschan::ChanExt>) -> Result<Arc<Channel>> {
         let chan_id = self.next_chan.fetch_add(2, Ordering::Relaxed);
-        let ch = self.new_channel(chan_id, 1).map_err(Error::Refused)?;
+        let ch = self.new_channel(chan_id, nlanes, completion).map_err(Error::Refused)?;
+        *ch.ext.lock().unwrap() = ext;
         ch.opening.store(true, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(chan_id, tx);
@@ -466,16 +547,11 @@ impl SessionShared {
                 return Err(Error::CarrierLost);
             }
         };
-        ch.lanes[0].set_peer_limit(peer_limit);
-        ch.opening.store(false, Ordering::Relaxed);
-        self.start_tcp(&ch, tcp);
-        if self.role == Role::Client
-            && let Err(e) = self.open_lane(&ch.lanes[0]).await
-        {
-            // Detached now: the next resume opens it.
-            tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
+        for l in &ch.lanes {
+            l.set_peer_limit(peer_limit);
         }
-        Ok(chan_id)
+        ch.opening.store(false, Ordering::Relaxed);
+        Ok(ch)
     }
 
     /// Peer's ChannelOpen (from the event log).
@@ -491,6 +567,7 @@ impl SessionShared {
                 }
                 (host, port)
             }
+            (Role::Server, ChannelKind::Session) => return self.accept_session(chan_id, peer_limit),
             (Role::Client, ChannelKind::ForwardedTcp { bind_host, bind_port, .. }) => {
                 match self.remote_forwards.lock().unwrap().get(&(bind_host, bind_port)).cloned() {
                     Some(target) => target,
@@ -504,7 +581,7 @@ impl SessionShared {
 
     /// Accept a peer's channel by dialing `host:port`; answer Ok/Fail.
     fn accept_tcp_channel(self: &Arc<Self>, chan_id: u64, host: String, port: u16, peer_limit: u64) -> Result<()> {
-        let ch = match self.new_channel(chan_id, 1) {
+        let ch = match self.new_channel(chan_id, 1, Completion::AllLanes) {
             Ok(ch) => ch,
             Err(FailReason::Protocol(m)) => return Err(Error::Protocol(m)),
             Err(reason) => return self.reply_event(Message::ChannelFail { chan_id, reason }),
@@ -642,6 +719,19 @@ impl SessionShared {
                 Ok(())
             }
             Message::ListenRequest { req_id, host, port } => self.on_listen_request(req_id, host, port).await,
+            Message::SessionRequest { chan_id, req_id, req } => self.on_session_request(chan_id, req_id, req).await,
+            Message::SessionReply { chan_id, req_id, error } => {
+                self.on_session_reply(chan_id, req_id, error);
+                Ok(())
+            }
+            Message::ExitStatus { chan_id, status } => {
+                self.on_exit(chan_id, crate::sesschan::ExitInfo::Status(status));
+                Ok(())
+            }
+            Message::ExitSignal { chan_id, signal, core_dumped } => {
+                self.on_exit(chan_id, crate::sesschan::ExitInfo::Signal { name: signal, core_dumped });
+                Ok(())
+            }
             Message::ListenOk { req_id, port } => {
                 // Register the target here, in event order: the server's
                 // first ChannelOpen for this listener comes after ListenOk.
@@ -921,9 +1011,12 @@ impl SessionShared {
             c.take()
         };
         self.carrier_state.send_replace(0);
-        if self.role == Role::Server && self.registry.is_some() {
+        let linger = if self.has_pty.load(Ordering::Relaxed) { self.limits.pty_linger } else { Some(self.limits.linger) };
+        if self.role == Role::Server
+            && self.registry.is_some()
+            && let Some(linger) = linger
+        {
             let me = Arc::downgrade(self);
-            let linger = self.limits.linger;
             tokio::spawn(async move {
                 tokio::time::sleep(linger).await;
                 if let Some(s) = me.upgrade()

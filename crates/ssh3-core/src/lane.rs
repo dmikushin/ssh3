@@ -104,11 +104,48 @@ impl Readable for tokio::net::tcp::OwnedReadHalf {
     }
 }
 
-/// The event-log pipe: always treated as ready (one chunk per session).
+/// In-memory pipes and boxed process streams cannot report readiness
+/// without a read: treated as ready (one floor chunk per such lane).
 impl Readable for tokio::io::DuplexStream {
-    async fn readable(&self) -> std::io::Result<()> {
-        Ok(())
+    fn readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
+}
+
+impl Readable for Box<dyn tokio::io::AsyncRead + Send + Unpin> {
+    fn readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+impl Readable for tokio::io::Empty {
+    fn readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+/// SPEC §5 "pty lanes": what a pty output lane does when it cannot take
+/// more bytes (no peer credit or no send budget). The terminal-emulator
+/// crate implements screen mode; the default blocks (stream mode).
+pub trait PtyOverflow: Send + Sync {
+    /// The lane is full. `true`: keep reading the pty and pass the bytes to
+    /// [`feed`](Self::feed) until the lane has room again (screen mode);
+    /// `false`: stop reading the pty (backpressure).
+    fn ring_full(&self) -> bool;
+    /// Bytes read from the pty while the lane is full (screen mode only).
+    fn feed(&self, bytes: &[u8]);
+    /// The lane has room again after a full episode.
+    fn ring_has_room(&self) {}
+}
+
+/// Stream mode only: a full lane blocks the pty.
+pub struct BlockingOverflow;
+
+impl PtyOverflow for BlockingOverflow {
+    fn ring_full(&self) -> bool {
+        false
+    }
+    fn feed(&self, _bytes: &[u8]) {}
 }
 
 /// A QUIC send stream that is **reset**, not finished, when dropped without
@@ -190,6 +227,8 @@ pub struct Lane {
     pub(crate) done: Notify,
     attach_tx: mpsc::UnboundedSender<(LaneSend, u64)>,
     attach_rx: Mutex<Option<mpsc::UnboundedReceiver<(LaneSend, u64)>>>,
+    /// Set on pty output lanes (SPEC §5 hybrid pty lanes).
+    overflow: Mutex<Option<Arc<dyn PtyOverflow>>>,
 }
 
 async fn wait_for<T>(n: &Notify, mut f: impl FnMut() -> Option<T>) -> T {
@@ -249,7 +288,18 @@ impl Lane {
             done: Notify::new(),
             attach_tx,
             attach_rx: Mutex::new(Some(attach_rx)),
+            overflow: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_overflow(&self, o: Arc<dyn PtyOverflow>) {
+        *self.overflow.lock().unwrap() = Some(o);
+    }
+
+    /// Our send side is finished (all bytes accepted after EOF, or the peer
+    /// completed the channel).
+    pub(crate) fn send_complete(&self) -> bool {
+        self.st.lock().unwrap().send_done
     }
 
     /// The absolute limit this side grants before any ack (ChannelOpen/Ok).
@@ -495,14 +545,20 @@ impl Lane {
     /// The peer completed this channel (ChannelDone event): it has accepted
     /// every byte we sent, so our send side is complete even if its final
     /// ack was lost with a carrier.
+    /// The peer completed the channel: it will read nothing more from us, so
+    /// our send side is finished (e.g. a session's stdin after the process
+    /// exited) and the local source is no longer read.
     pub(crate) fn peer_done(&self) {
         let mut st = self.st.lock().unwrap();
-        if st.closed || !st.s_eof {
+        if st.closed {
             return;
         }
+        st.s_eof = true;
         let end = st.sbase + st.sbuf.len() as u64;
         self.release_accepted(&mut st, end);
+        st.send_done = true;
         drop(st);
+        self.wake_source.notify_waiters();
         self.done.notify_waiters();
     }
 
@@ -553,6 +609,7 @@ impl Lane {
         loop {
             // Wait for data (or EOF) before reserving storage for it.
             src.readable().await?;
+            let mut full_episode = false;
             let (mut tail, want) = loop {
                 let lane_fut = self.wake_source.notified();
                 let budget_fut = self.env.send_budget.freed.notified();
@@ -561,7 +618,7 @@ impl Lane {
                 budget_fut.as_mut().enable();
                 {
                     let mut st = self.st.lock().unwrap();
-                    if st.closed {
+                    if st.closed || st.send_done {
                         return Ok(());
                     }
                     let send_end = st.sbase + st.sbuf.len() as u64;
@@ -578,8 +635,27 @@ impl Lane {
                         };
                         if let Some(t) = tail {
                             let want = want.min(t.space());
+                            if full_episode && let Some(o) = self.overflow.lock().unwrap().clone() {
+                                o.ring_has_room();
+                            }
                             break (t, want);
                         }
+                    }
+                }
+                // The lane is full. A pty output lane asks its overflow
+                // policy whether to keep reading the pty (screen mode).
+                let overflow = self.overflow.lock().unwrap().clone();
+                if let Some(o) = overflow {
+                    full_episode = true;
+                    if o.ring_full() {
+                        let mut scratch = [0u8; 4096];
+                        let n = src.read(&mut scratch).await?;
+                        if n > 0 {
+                            o.feed(&scratch[..n]);
+                            continue;
+                        }
+                        // EOF: wait for room; the normal path then reads the
+                        // EOF again and sends LaneFin.
                     }
                 }
                 tokio::select! {

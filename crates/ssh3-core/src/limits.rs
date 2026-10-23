@@ -55,6 +55,9 @@ pub struct Limits {
     // §5 sessions
     pub ack_interval: Duration,
     pub linger: Duration,
+    /// Linger of sessions with a pty; None = until the processes exit
+    /// (SPEC §5 "Session lifetime", as mosh).
+    pub pty_linger: Option<Duration>,
     // §5.1 client roaming
     /// Liveness probe period while attached; None disables probing.
     pub probe_interval: Option<Duration>,
@@ -100,6 +103,7 @@ impl Default for Limits {
             event_queue: 1024,
             ack_interval: Duration::from_secs(1),
             linger: Duration::from_secs(12 * 3600),
+            pty_linger: None,
             probe_interval: Some(Duration::from_secs(1)),
             probe_timeout_min: Duration::from_secs(1),
             auto_resume: true,

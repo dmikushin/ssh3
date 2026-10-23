@@ -81,6 +81,15 @@ impl Drop for Env {
 static DIRS: AtomicU64 = AtomicU64::new(0);
 
 pub fn env_with(limits: Limits) -> Env {
+    env_with_session(limits, ssh3_core::ServerSessionEnv::new(ssh3_session::SessionConfig::default()))
+}
+
+/// The account the tests run as (session processes need a real user).
+pub fn current_user() -> String {
+    std::env::var("USER").expect("USER is set")
+}
+
+pub fn env_with_session(limits: Limits, session: ssh3_core::ServerSessionEnv) -> Env {
     init();
     let dir = PathBuf::from(std::env::var("HOME").unwrap())
         .join("scratch/ssh-udp/core-tests")
@@ -99,6 +108,7 @@ pub fn env_with(limits: Limits) -> Env {
             authenticator: Arc::new(AuthorizedKeysAuthenticator::new(move |_user| Some(ak.clone()))),
             limits: limits.clone(),
             keys: EndpointKeys::random(),
+            session: Some(session),
         },
         dual_stack_socket("[::]:0".parse().unwrap()).unwrap(),
     )

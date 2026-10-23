@@ -46,6 +46,20 @@ pub enum ChannelKind {
     /// -R: a connection accepted by the server's listener `bind_host:bind_port`
     /// (as bound) from `origin`; the client dials its registered target.
     ForwardedTcp { bind_host: String, bind_port: u16, origin_host: String, origin_port: u16 },
+    /// Interactive or exec session (lane 0 stdin/stdout, lane 1 stderr).
+    Session,
+}
+
+/// A request on a session channel (RFC 4254 §6, carried as events).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessReq {
+    Pty { term: String, cols: u32, rows: u32, xpixel: u32, ypixel: u32, modes: Vec<u8> },
+    Env { name: String, value: String },
+    Shell,
+    Exec { command: String },
+    Subsystem { name: String },
+    WindowChange { cols: u32, rows: u32, xpixel: u32, ypixel: u32 },
+    Signal { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,10 +128,18 @@ pub enum Message {
     /// Liveness probe on the control stream (connection-scoped, SPEC §5.1).
     Ping { n: u64 },
     Pong { n: u64 },
+    /// Session-channel request; answered by SessionReply (error text on
+    /// failure).
+    SessionRequest { chan_id: u64, req_id: u64, req: SessReq },
+    SessionReply { chan_id: u64, req_id: u64, error: Option<String> },
+    /// The session's process ended (RFC 4254 §6.10), as events so they are
+    /// replayed after a resume.
+    ExitStatus { chan_id: u64, status: u32 },
+    ExitSignal { chan_id: u64, signal: String, core_dumped: bool },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 19;
+pub const MESSAGE_TYPES: u32 = 23;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;
