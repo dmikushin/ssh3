@@ -1865,6 +1865,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh3-session"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

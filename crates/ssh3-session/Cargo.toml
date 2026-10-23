@@ -1,0 +1,15 @@
+[package]
+name = "ssh3-session"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ssh3-rs server-side session process layer: pty, shell/exec/subsystem, signals, exit status"
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util", "rt", "time", "macros", "process"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
