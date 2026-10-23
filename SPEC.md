@@ -13,7 +13,12 @@ the design invariants. Wire compatibility with Go ssh3 / draft-michel-ssh3 is
   (suspend, tunnel, Wi-Fi ↔ mobile), including open TCP forwards.
 - **O3 NAT traversal.** Two peers behind NAT get a direct path via a
   rendezvous server, with simultaneous open; relay is the fallback, not the
-  only path.
+  only path. **Primary acceptance scenario: IPv4-only mobile access** (the
+  user's mobile operator provides no IPv6; expect carrier-grade NAT, possibly
+  with endpoint-dependent mapping). IPv6 direct paths are secondary. Where
+  direct traversal is impossible (e.g. symmetric/endpoint-dependent mapping
+  on both sides), the relay must carry the session with no loss of
+  function.
 - **O4 OpenSSH parity for advanced users.** `-L/-R/-D/-J`, `~/.ssh/config`
   (incl. `Match`), `authorized_keys`, `known_hosts`, ssh-agent and agent
   forwarding, pty sessions, exec, subsystems.
@@ -429,7 +434,11 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - X4 Hole punching on real NATs (oracle gateway, gambetta, corentin). The
   only historical success was corentin→gambetta over global IPv6 in the
   same /64 with a relay on gambetta — not evidence for NAT traversal. NAT
-  mapping/filtering types and oracle IPv6 are unmeasured.
+  mapping/filtering types and oracle IPv6 are unmeasured. Acceptance must
+  be on IPv4 from the user's mobile operator (CGNAT): measure mapping
+  behaviour (endpoint-independent vs dependent, port allocation pattern,
+  mapping lifetime) via the gateway before choosing techniques beyond
+  plain simultaneous open.
 - X8 Path switch under a virtual peer address: how to make quinn re-probe
   PMTU and reset congestion state (large-PMTU relay → smaller direct path,
   and direct → relay fallback); test asymmetric loss/delay and replayed
