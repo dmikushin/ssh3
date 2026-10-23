@@ -525,22 +525,26 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
    nonce)`, so replayed or cross-session responses are rejected.
    The path socket then switches inner packets to the pair.
    **Path-state reset (X8, measured on loopback, 24 runs):**
-   - Inbound on the direct path is accepted **strictly** from the selected
-     pair only; packets still in flight on the old path are lost and
-     recovered as ordinary loss (no measurable recovery penalty).
-   - The server-side path socket presents a **fresh fd00:: virtual client
-     address per path generation**. quinn then performs a real migration
-     (`migrate()` → `PathData::new` for IPv6): path validation, fresh
-     congestion/RTT, PMTUD from scratch (MTU 1452 regained within
-     0.25–0.5 s).
-   - The client side cannot do the same — quinn drops packets from a new
-     server address (`connection/mod.rs:1131`). quinn-proto has
-     `Connection::path_changed(now)` (`mod.rs:1427`: resets congestion, RTT,
-     pacer, MTUD) but quinn 0.11.12 does not expose it. Required: a minimal
-     quinn patch exposing it, called by `PathManager` on every switch (open
-     item X9). Without it: a smaller new MTU is detected by black-hole
-     detection in ≤ 0.5 s (connection survives); a larger one is not used
-     until the next MTUD interval (600 s default).
+   - Inbound on the direct path is accepted from the **validated addresses
+     of the current round** (punch-validated, current generation) — not only
+     the selected pair: the controlled peer switches on NominateAck before the
+     controlling one, and dropping its direct packets at the still-relayed
+     side deadlocked nomination (ssh3-path implementation). Everything else
+     is dropped; packets in flight on the old path are recovered as ordinary
+     loss.
+   - **Path-state reset on both sides via `path_changed()`** (X9, done: a
+     one-method patch `vendor/quinn/src/connection.rs` exposing quinn-proto
+     `Connection::path_changed(now)`, called by `PathManager` on every
+     switch; measured MTU 1293 → 1452 after relay→direct, stays 1293
+     without). The earlier plan — a fresh fd00:: virtual address per
+     generation on the server side to force a quinn migration — was dropped:
+     it hit quinn-proto's debug assertion
+     `!self.peer_completed_address_validation()` (`mod.rs:1836`); cause not
+     isolated (hypothesis: `migrate()` replaces PathData but keeps the
+     loss-detection timer armed). Candidate for an upstream issue, X10.
+   - Response-to-pair binding: a response counts only if it arrives from
+     the address the punch with that nonce was sent to (the echoed nonce
+     binds the pair).
    - The connection survived every switch, including 400 replayed old-path
      packets and asymmetric 10 ms+1 % loss / 90 ms paths.
 4. Relay stays as fallback; on direct-path loss the path socket falls back to
