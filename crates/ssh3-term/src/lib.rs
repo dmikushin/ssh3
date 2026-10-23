@@ -24,7 +24,8 @@
 //!   with an attribute, alacritty stores the Unicode box-drawing glyph).
 //!
 //! alacritty_terminal keeps part of its state private (scroll region, tab
-//! stops, titles, the inactive screen, keyboard stacks); [`track`] mirrors it.
+//! stops, titles, the inactive screen, keyboard stacks); the `track` module
+//! mirrors it.
 //!
 //! # Bounded memory (SPEC O1)
 //!
@@ -34,13 +35,43 @@
 //! - an unterminated OSC string (vte's `std` parser buffers it: 64 MiB of
 //!   payload grew the heap by 129 MiB) — cut at [`MAX_OSC_BYTES`] here;
 //! - combining characters onto one cell (8 Mi marks: +34 MB) — cut at
-//!   [`track::MAX_ZEROWIDTH`] per cell;
+//!   16 per cell;
 //! - the 4097th kitty keyboard push panics in
 //!   alacritty_terminal term/mod.rs:1296 — dropped at the stack limit.
 //!
 //! Screen dimensions are clamped to [`MIN_COLUMNS`]..=[`MAX_COLUMNS`] ×
 //! [`MIN_LINES`]..=[`MAX_LINES`]: a wide character on a 1-column screen
 //! panics alacritty_terminal as well.
+//!
+//! # Where the model follows xterm instead of alacritty
+//!
+//! The emulator models the *client's* terminal, so where alacritty_terminal
+//! keeps state no terminal has, it is brought in line (each case found by
+//! the round-trip tests, see the `track` module): leaving the alternate
+//! screen restores the saved cursor; a pending wrap exists only in the last
+//! column (tab movements and resizes end it); wrap flags and leading
+//! spacers exist only in the last column (insert, delete and resizes no
+//! longer strand them elsewhere); clears on RIS and on entering the
+//! alternate screen are complete.
+//!
+//! # What a redraw does not reproduce
+//!
+//! The round-trip tests skip or mask exactly these, each named by a
+//! [`Snapshot`] predicate: a pending wrap on a cell that writing would not
+//! recreate (wide character without spacer, leading spacer, tab mark) —
+//! `wrap_reproducible`; rows where a wide character without spacer sits
+//! directly before another wide character or a wrapped last cell, and a few
+//! more layouts only insert mode leaves — `layout_reproducible`; the REP
+//! character on an alternate screen without a free cell — `rep_reproducible`;
+//! a title or mode the program never set.
+//!
+//! # Measured
+//!
+//! Redraw of full screens (vim, htop, nvim at 60% of their recordings):
+//! 6–8 KiB, 0.22–0.25 ms each (release build). RSS per screen: 192 KB at
+//! 80×24, 1.6 MB at 300×100 (two grids of 24-byte cells). The heap also
+//! counts a 2 MiB buffer vte's `Processor` allocates for synchronized
+//! updates, never written here (`NoSync`), so never resident.
 
 use std::time::Duration;
 
