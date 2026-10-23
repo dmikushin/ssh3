@@ -204,6 +204,13 @@ impl ClientSession {
         self.shared.open_direct_tcp(tcp, host.to_string(), port).await
     }
 
+    /// `-R`: the server listens on `bind_host:bind_port` (0 = any) and each
+    /// connection is forwarded to `target_host:target_port` from here.
+    /// Returns the port the server bound.
+    pub async fn forward_remote(&self, bind_host: &str, bind_port: u16, target_host: &str, target_port: u16) -> Result<u16> {
+        self.shared.forward_remote(bind_host.to_string(), bind_port, (target_host.to_string(), target_port)).await
+    }
+
     /// `-L`: accept on `listener`, open a direct-tcp channel per connection.
     pub fn forward_local(&self, listener: TcpListener, host: String, port: u16) -> tokio::task::JoinHandle<()> {
         let shared = Arc::downgrade(&self.shared);

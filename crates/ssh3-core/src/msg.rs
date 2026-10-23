@@ -43,6 +43,9 @@ pub struct LanePos {
 pub enum ChannelKind {
     /// -L / -D CONNECT: the server dials `host:port`.
     DirectTcp { host: String, port: u16 },
+    /// -R: a connection accepted by the server's listener `bind_host:bind_port`
+    /// (as bound) from `origin`; the client dials its registered target.
+    ForwardedTcp { bind_host: String, bind_port: u16, origin_host: String, origin_port: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,7 @@ pub enum FailReason {
     ResourceLimit,
     Prohibited,
     ConnectFailed(String),
+    BindFailed(String),
     UnknownChannel,
     Protocol(String),
 }
@@ -60,6 +64,7 @@ impl std::fmt::Display for FailReason {
             FailReason::ResourceLimit => write!(f, "resource limit reached"),
             FailReason::Prohibited => write!(f, "prohibited by server policy"),
             FailReason::ConnectFailed(e) => write!(f, "connect failed: {e}"),
+            FailReason::BindFailed(e) => write!(f, "bind failed: {e}"),
             FailReason::UnknownChannel => write!(f, "unknown channel"),
             FailReason::Protocol(e) => write!(f, "protocol error: {e}"),
         }
@@ -99,10 +104,17 @@ pub enum Message {
     /// delivered): it holds all bytes the receiver sent. Lets the receiver
     /// finish a channel whose final ack died with a carrier.
     ChannelDone { chan_id: u64 },
+    /// -R: ask the server to listen on `host:port` (port 0 = any).
+    ListenRequest { req_id: u64, host: String, port: u16 },
+    /// The listener is up on `port`.
+    ListenOk { req_id: u64, port: u16 },
+    ListenFail { req_id: u64, reason: FailReason },
+    /// Stop a listener (as bound).
+    ListenCancel { host: String, port: u16 },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 13;
+pub const MESSAGE_TYPES: u32 = 17;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

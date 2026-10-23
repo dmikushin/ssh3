@@ -18,6 +18,11 @@ pub struct Limits {
     // §4 channels
     pub max_channels: usize,
     pub connect_timeout: Duration,
+    /// -R listeners of one session, server side.
+    pub max_listeners: usize,
+    /// While detached, each -R listener keeps at most this many accepted
+    /// connections waiting; more are closed at once (SPEC §5).
+    pub detached_accept_max: usize,
     // §4 lane credit and budgets
     /// Ring capacity per lane direction (cap on credit and on send ring).
     pub lane_buffer: usize,
@@ -52,6 +57,8 @@ impl Default for Limits {
             max_unauthenticated: 64,
             max_channels: 256,
             connect_timeout: Duration::from_secs(10),
+            max_listeners: 64,
+            detached_accept_max: 8,
             lane_buffer: 256 * 1024,
             lane_floor: 16 * 1024,
             lane_credit_budget: 64 * 1024 * 1024,

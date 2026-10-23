@@ -50,12 +50,7 @@ pub struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.accept_task.abort();
-        let all: Vec<_> = self.shared.registry.lock().unwrap().values().cloned().collect();
-        for s in all {
-            s.teardown();
-        }
-        self.endpoint.close(close::SHUTDOWN.into(), b"server shutting down");
+        self.shutdown();
     }
 }
 
@@ -80,6 +75,9 @@ pub struct ServerStats {
     pub resumes_rejected: u64,
     pub protocol_closes: u64,
     pub refused_unauth_cap: u64,
+    /// -R listeners open, and connections they closed while detached.
+    pub listeners: u64,
+    pub refused_detached: u64,
 }
 
 impl Server {
@@ -96,6 +94,17 @@ impl Server {
         });
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self { endpoint, shared, accept_task })
+    }
+
+    /// SPEC I5: tear down every session now — carriers closed with a
+    /// reason, -R listeners released — without waiting for drop.
+    pub fn shutdown(&self) {
+        self.accept_task.abort();
+        let all: Vec<_> = self.shared.registry.lock().unwrap().values().cloned().collect();
+        for s in all {
+            s.teardown();
+        }
+        self.endpoint.close(close::SHUTDOWN.into(), b"server shutting down");
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -129,6 +138,8 @@ impl Server {
                 t.detached += 1;
             }
             t.channels += s.channel_count() as u64;
+            t.listeners += s.listener_count() as u64;
+            t.refused_detached += s.refused_detached.load(Ordering::Relaxed);
             t.send_ring_bytes += s.stats.send_ring_bytes.load(Ordering::Relaxed);
             t.recv_ring_bytes += s.stats.recv_ring_bytes.load(Ordering::Relaxed);
             t.credit_outstanding += s.stats.credit_outstanding.load(Ordering::Relaxed);

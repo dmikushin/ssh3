@@ -30,6 +30,15 @@ pub enum Role {
     Server,
 }
 
+impl Role {
+    fn peer(self) -> Role {
+        match self {
+            Role::Client => Role::Server,
+            Role::Server => Role::Client,
+        }
+    }
+}
+
 /// The process-wide (server-wide) lane storage budgets (SPEC §4).
 pub struct Budgets {
     pub recv: Arc<Budget>,
@@ -49,6 +58,18 @@ impl Budgets {
 }
 
 pub(crate) type Registry = Mutex<HashMap<SessionId, Arc<SessionShared>>>;
+
+/// A server-side -R listener. Dropping it aborts the accept task, which
+/// drops the socket: the port is released at once (SPEC I5).
+struct Listener {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 pub(crate) struct Channel {
     pub chan_id: u64,
@@ -102,6 +123,14 @@ pub struct SessionShared {
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
     next_chan: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<std::result::Result<u64, FailReason>>>>,
+    /// Server: -R listeners owned by the session (dropped = port released).
+    listeners: Mutex<HashMap<(String, u16), Listener>>,
+    /// Client: -R requests in flight, by req_id → (bind host, target), and
+    /// established forwards (bind host, bound port) → target.
+    listen_pending: Mutex<HashMap<u64, (String, (String, u16), oneshot::Sender<std::result::Result<u16, FailReason>>)>>,
+    remote_forwards: Mutex<HashMap<(String, u16), (String, u16)>>,
+    next_req: AtomicU64,
+    pub refused_detached: AtomicU64,
     events: mpsc::Sender<Message>,
     carrier: Mutex<Option<Carrier>>,
     epoch: AtomicU64,
@@ -137,6 +166,11 @@ impl SessionShared {
             channels: Mutex::new(HashMap::new()),
             next_chan: AtomicU64::new(if role == Role::Client { 2 } else { 1 }),
             pending: Mutex::new(HashMap::new()),
+            listeners: Mutex::new(HashMap::new()),
+            listen_pending: Mutex::new(HashMap::new()),
+            remote_forwards: Mutex::new(HashMap::new()),
+            next_req: AtomicU64::new(1),
+            refused_detached: AtomicU64::new(0),
             events: events_tx,
             carrier: Mutex::new(None),
             epoch: AtomicU64::new(0),
@@ -381,13 +415,19 @@ impl SessionShared {
 
     /// Client: open a `direct-tcp` channel and bridge `tcp` to it.
     pub async fn open_direct_tcp(self: &Arc<Self>, tcp: TcpStream, host: String, port: u16) -> Result<u64> {
+        self.open_tcp_channel(tcp, ChannelKind::DirectTcp { host, port }).await
+    }
+
+    /// Open a channel for a local TCP connection and bridge it once the peer
+    /// accepts. Lane streams are always opened by the client.
+    async fn open_tcp_channel(self: &Arc<Self>, tcp: TcpStream, kind: ChannelKind) -> Result<u64> {
         let chan_id = self.next_chan.fetch_add(2, Ordering::Relaxed);
         let ch = self.new_channel(chan_id, 1).map_err(Error::Refused)?;
         ch.opening.store(true, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(chan_id, tx);
         let limit = ch.lanes[0].initial_limit();
-        self.send_event(Message::ChannelOpen { chan_id, kind: ChannelKind::DirectTcp { host, port }, limit }).await?;
+        self.send_event(Message::ChannelOpen { chan_id, kind, limit }).await?;
         // The answer is an event too: it arrives after a resume if the
         // carrier dies meanwhile. Only teardown drops `tx`.
         let peer_limit = match rx.await {
@@ -404,8 +444,10 @@ impl SessionShared {
         ch.lanes[0].set_peer_limit(peer_limit);
         ch.opening.store(false, Ordering::Relaxed);
         self.start_tcp(&ch, tcp);
-        // If no carrier is attached now, the next resume opens the lane.
-        if let Err(e) = self.open_lane(&ch.lanes[0]).await {
+        if self.role == Role::Client
+            && let Err(e) = self.open_lane(&ch.lanes[0]).await
+        {
+            // Detached now: the next resume opens it.
             tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
         }
         Ok(chan_id)
@@ -417,13 +459,26 @@ impl SessionShared {
         if chan_id % 2 != peer_parity || chan_id == EVENT_CHANNEL {
             return Err(Error::Protocol(format!("channel id {chan_id} is not the peer's to open")));
         }
-        if self.role == Role::Client {
-            return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
-        }
-        let ChannelKind::DirectTcp { host, port } = kind;
-        if !self.authz().allows_direct_tcp(&host, port) {
-            return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
-        }
+        let (host, port) = match (self.role, kind) {
+            (Role::Server, ChannelKind::DirectTcp { host, port }) => {
+                if !self.authz().allows_direct_tcp(&host, port) {
+                    return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
+                }
+                (host, port)
+            }
+            (Role::Client, ChannelKind::ForwardedTcp { bind_host, bind_port, .. }) => {
+                match self.remote_forwards.lock().unwrap().get(&(bind_host, bind_port)).cloned() {
+                    Some(target) => target,
+                    None => return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited }),
+                }
+            }
+            (_, k) => return Err(Error::Protocol(format!("{:?} may not open {k:?}", self.role.peer()))),
+        };
+        self.accept_tcp_channel(chan_id, host, port, peer_limit)
+    }
+
+    /// Accept a peer's channel by dialing `host:port`; answer Ok/Fail.
+    fn accept_tcp_channel(self: &Arc<Self>, chan_id: u64, host: String, port: u16, peer_limit: u64) -> Result<()> {
         let ch = match self.new_channel(chan_id, 1) {
             Ok(ch) => ch,
             Err(FailReason::Protocol(m)) => return Err(Error::Protocol(m)),
@@ -446,6 +501,11 @@ impl SessionShared {
                     s.start_tcp(&ch2, tcp);
                     let limit = ch2.lanes[0].initial_limit();
                     let _ = s.send_event(Message::ChannelOk { chan_id, limit }).await;
+                    if s.role == Role::Client
+                        && let Err(e) = s.open_lane(&ch2.lanes[0]).await
+                    {
+                        tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
+                    }
                 }
                 Err(e) => {
                     drop(ch2);
@@ -455,6 +515,81 @@ impl SessionShared {
             }
         });
         Ok(())
+    }
+
+    // ------------------------------------------------------------ -R
+
+    /// Client: ask the server to listen on `bind_host:bind_port` and forward
+    /// accepted connections to `target`. Returns the bound port.
+    pub async fn forward_remote(self: &Arc<Self>, bind_host: String, bind_port: u16, target: (String, u16)) -> Result<u16> {
+        let req_id = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.listen_pending.lock().unwrap().insert(req_id, (bind_host.clone(), target, tx));
+        self.send_event(Message::ListenRequest { req_id, host: bind_host, port: bind_port }).await?;
+        match rx.await {
+            Ok(Ok(port)) => Ok(port),
+            Ok(Err(reason)) => Err(Error::Refused(reason)),
+            Err(_) => Err(Error::CarrierLost),
+        }
+    }
+
+    /// Server: a ListenRequest.
+    async fn on_listen_request(self: &Arc<Self>, req_id: u64, host: String, port: u16) -> Result<()> {
+        if self.role != Role::Server {
+            return Err(Error::Protocol("ListenRequest sent to a client".into()));
+        }
+        if !self.authz().allows_listen(&host, port) {
+            return self.reply_event(Message::ListenFail { req_id, reason: FailReason::Prohibited });
+        }
+        if self.listeners.lock().unwrap().len() >= self.limits.max_listeners {
+            return self.reply_event(Message::ListenFail { req_id, reason: FailReason::ResourceLimit });
+        }
+        // OpenSSH: empty or "localhost" binds loopback; "*" all addresses.
+        let addr = match host.as_str() {
+            "" | "localhost" => "127.0.0.1".to_string(),
+            "*" => "0.0.0.0".to_string(),
+            h => h.to_string(),
+        };
+        let l = match tokio::net::TcpListener::bind((addr.as_str(), port)).await {
+            Ok(l) => l,
+            Err(e) => return self.reply_event(Message::ListenFail { req_id, reason: FailReason::BindFailed(format!("{addr}:{port}: {e}")) }),
+        };
+        let bound = l.local_addr()?.port();
+        let key = (host.clone(), bound);
+        if self.listeners.lock().unwrap().contains_key(&key) {
+            return self.reply_event(Message::ListenFail { req_id, reason: FailReason::BindFailed(format!("{host}:{bound} already forwarded")) });
+        }
+        let me = Arc::downgrade(self);
+        let (bind_host, max) = (host.clone(), self.limits.detached_accept_max);
+        let waiting = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, origin)) = l.accept().await else { return };
+                let Some(s) = me.upgrade() else { return };
+                // While detached, a bounded number of connections may wait.
+                if !s.is_attached() && waiting.load(Ordering::Acquire) >= max as u64 {
+                    s.refused_detached.fetch_add(1, Ordering::Relaxed);
+                    drop(tcp);
+                    continue;
+                }
+                waiting.fetch_add(1, Ordering::AcqRel);
+                let waiting = waiting.clone();
+                let kind = ChannelKind::ForwardedTcp { bind_host: bind_host.clone(), bind_port: bound, origin_host: origin.ip().to_string(), origin_port: origin.port() };
+                tokio::spawn(async move {
+                    let r = s.open_tcp_channel(tcp, kind).await;
+                    waiting.fetch_sub(1, Ordering::AcqRel);
+                    if let Err(e) = r {
+                        tracing::debug!("-R connection from {origin} not forwarded: {e}");
+                    }
+                });
+            }
+        });
+        self.listeners.lock().unwrap().insert(key, Listener { task });
+        self.reply_event(Message::ListenOk { req_id, port: bound })
+    }
+
+    pub fn listener_count(&self) -> usize {
+        self.listeners.lock().unwrap().len()
     }
 
     // ---------------------------------------------------------- dispatch
@@ -479,6 +614,30 @@ impl SessionShared {
             Message::ChannelClose { chan_id, reason } => {
                 tracing::debug!(chan = chan_id, "peer closed channel: {reason}");
                 drop(self.drop_channel(chan_id));
+                Ok(())
+            }
+            Message::ListenRequest { req_id, host, port } => self.on_listen_request(req_id, host, port).await,
+            Message::ListenOk { req_id, port } => {
+                // Register the target here, in event order: the server's
+                // first ChannelOpen for this listener comes after ListenOk.
+                let p = self.listen_pending.lock().unwrap().remove(&req_id);
+                match p {
+                    Some((host, target, tx)) => {
+                        self.remote_forwards.lock().unwrap().insert((host, port), target);
+                        let _ = tx.send(Ok(port));
+                        Ok(())
+                    }
+                    None => Err(Error::Protocol(format!("ListenOk for unknown request {req_id}"))),
+                }
+            }
+            Message::ListenFail { req_id, reason } => {
+                if let Some((_, _, tx)) = self.listen_pending.lock().unwrap().remove(&req_id) {
+                    let _ = tx.send(Err(reason));
+                }
+                Ok(())
+            }
+            Message::ListenCancel { host, port } => {
+                drop(self.listeners.lock().unwrap().remove(&(host, port)));
                 Ok(())
             }
             Message::ChannelDone { chan_id } => {
@@ -689,6 +848,10 @@ impl SessionShared {
     /// Drop everything: carrier, channels, pending opens, registry entry.
     pub fn teardown(&self) {
         self.detach(close::SHUTDOWN, b"session closed");
+        let listeners: Vec<_> = self.listeners.lock().unwrap().drain().collect();
+        drop(listeners);
+        let lp: Vec<_> = self.listen_pending.lock().unwrap().drain().collect();
+        drop(lp);
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();
         drop(pending);
         let chans: Vec<_> = self.channels.lock().unwrap().drain().collect();
