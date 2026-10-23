@@ -185,6 +185,16 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     to the floor after `CreditIdle` (default 5 s) without arrivals. So idle
     lanes hold only their floor (accounted outside the budgets), and the
     budgets are shared among lanes that actually move data.
+    Constraints (review model `retract-model.py`): every grant
+    (`LaneAck.limit`) carries the lane's current fence `seq`; the sender
+    ignores grants with an older `seq` than the last Retract it acknowledged,
+    and the receiver serialises retractions per lane (one outstanding). After
+    a unilateral retraction while detached, the sender on resume replays its
+    retained bytes only up to the NEW limit (its old high-water mark grants
+    nothing) and then waits for fresh grants; Resume validation therefore
+    accepts a limit lower than before when the attach epoch is newer. Before
+    releasing reservations unilaterally, the server fences the old carrier's
+    tasks so none can still write into the session's rings.
   - The receiver **always** drains every QUIC stream into the ring
     immediately (it never receives beyond `limit`; bytes beyond `limit` are a
     protocol error), so reading QUIC never blocks on the local sink.
@@ -302,6 +312,17 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     redraw is larger than the free ring space, the server waits for room
     (still consuming pty output into the emulator, regenerating the redraw
     when it finally appends).
+  - Implementation constraints (review): (i) snapshot, append and the
+    switch back to stream mode are one atomic step with respect to the pty
+    reader — no byte may be fed to the emulator after the snapshot and
+    before the switch without also going into the ring after the redraw;
+    (ii) the redraw size is bounded by construction (screen size ×
+    max bytes per cell + fixed overhead) and `LaneBuffer` for pty lanes must
+    be ≥ that bound (validated), so the append cannot wait forever;
+    (iii) the client's parser may be inside an unterminated OSC/DCS/CSI/SOS
+    string, so the redraw starts with a parser-synchronising prefix (CAN,
+    ST, then full reset) before rendering; tested with a real emulator fed a
+    prefix ending in an unterminated `ESC ] 0 ;` before overflow.
   - Output produced in screen mode is lost except for its effect on the
     screen — the same trade mosh makes (that period's scrollback is lost).
   TCP forwards and non-pty exec never use screen mode: byte-exact or nothing.
