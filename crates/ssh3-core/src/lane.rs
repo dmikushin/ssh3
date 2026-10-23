@@ -31,7 +31,7 @@ use crate::budget::{Budget, Permit};
 use crate::error::{Error, Result, close};
 use crate::frame;
 use crate::msg::{LaneHeader, LanePos, Message};
-use crate::ring::{CHUNK, ChunkPermit, Ring, Tail};
+use crate::ring::{CHUNK, ChunkPermit, ChunkSlice, Ring, Tail};
 
 /// Chunks a lane may hold beyond the budget: enough to store its floor grant
 /// (16 KiB, which may straddle two chunks) so that budget exhaustion caused
@@ -600,7 +600,7 @@ impl Lane {
     pub(crate) async fn sender_task(self: Arc<Self>) {
         let mut rx = self.attach_rx.lock().unwrap().take().expect("sender_task started twice");
         let mut cur: Option<(LaneSend, u64)> = None;
-        let mut buf = bytes::Bytes::new();
+        let mut buf: Option<ChunkSlice> = None;
         loop {
             enum Next {
                 Attach(LaneSend, u64),
@@ -621,7 +621,7 @@ impl Lane {
                     let sent = (*sent).max(st.sbase);
                     if upto > sent {
                         let off = (sent - st.sbase) as usize;
-                        buf = st.sbuf.peek(off, (upto - sent) as usize).expect("offset inside the send ring");
+                        buf = Some(st.sbuf.peek(off, (upto - sent) as usize).expect("offset inside the send ring"));
                         Some(Next::Data(sent))
                     } else if st.send_done && s.s.is_some() {
                         Some(Next::Finish)
@@ -651,7 +651,8 @@ impl Lane {
                 // All bytes accepted and LaneFin sent: end the stream cleanly.
                 Next::Finish => cur.as_mut().unwrap().0.finish(),
                 Next::Data(sent) => {
-                    let end = sent + buf.len() as u64;
+                    let slice = buf.take().expect("Data carries a slice");
+                    let end = sent + slice.len() as u64;
                     // Raise the bound first: the peer may accept part of
                     // this chunk before write_all returns.
                     {
@@ -659,10 +660,10 @@ impl Lane {
                         st.sent_hi = st.sent_hi.max(end);
                     }
                     let c = cur.as_mut().unwrap();
-                    match c.0.get().write_all(&buf).await {
+                    match c.0.get().write_all(&slice).await {
                         Ok(()) => {
                             c.1 = end;
-                            self.env.stats.lane_bytes_sent.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                            self.env.stats.lane_bytes_sent.fetch_add(slice.len() as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
                             tracing::debug!(chan = self.chan_id, lane = self.lane, "lane write failed ({e}); waiting for a new carrier");
@@ -759,7 +760,7 @@ impl Lane {
 
     /// Receive ring → local sink.
     pub(crate) async fn sink_task<W: AsyncWriteExt + Unpin>(self: Arc<Self>, mut sink: W) -> Result<()> {
-        let mut buf = bytes::Bytes::new();
+        let mut buf: Option<ChunkSlice> = None;
         loop {
             let fin = wait_for(&self.wake_sink, || {
                 let st = self.st.lock().unwrap();
@@ -767,7 +768,7 @@ impl Lane {
                     return Some(None);
                 }
                 if !st.rbuf.is_empty() {
-                    buf = st.rbuf.peek(0, CHUNK).expect("non-empty ring");
+                    buf = Some(st.rbuf.peek(0, CHUNK).expect("non-empty ring"));
                     return Some(Some(false));
                 }
                 (st.fin_offset == Some(st.delivered)).then_some(Some(true))
@@ -782,14 +783,17 @@ impl Lane {
                     return Ok(());
                 }
                 Some(false) => {
-                    sink.write_all(&buf).await?;
+                    let slice = buf.take().expect("a slice to deliver");
+                    sink.write_all(&slice).await?;
+                    let n = slice.len() as u64;
                     let mut st = self.st.lock().unwrap();
+                    // Release the chunk only after the ring has dropped it
+                    // too: the slice keeps its permit until here.
                     if st.closed {
                         return Ok(());
                     }
-                    let n = buf.len() as u64;
-                    st.rbuf.drain(buf.len());
-                    buf = bytes::Bytes::new();
+                    st.rbuf.drain(n as usize);
+                    drop(slice);
                     st.delivered += n;
                     st.last_delivery = Instant::now();
                     self.env.stats.recv_ring_bytes.fetch_sub(n, Ordering::Relaxed);

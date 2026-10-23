@@ -230,12 +230,13 @@ async fn limit_reached_then_sink_drains_no_deadlock() {
     let _ = writer.await.unwrap();
 }
 
-/// One session exhausting the receive budget does not starve another
-/// session's floor grant.
+/// Budget exhaustion never starves a floor grant: with a zero receive
+/// budget (exhausted from the start, deterministically) a session with
+/// stalled lanes and another session moving 1 MiB both live on floor
+/// credit alone, and nothing is ever charged to the budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_exhaustion_does_not_starve_floor() {
-    let budget = 32 * 1024;
-    let env = env_with(Limits { idle_timeout: Duration::from_secs(10), lane_credit_budget: budget, ..fast_limits() });
+    let env = env_with(Limits { idle_timeout: Duration::from_secs(10), lane_credit_budget: 0, ..fast_limits() });
     let hog = env.client().await;
     let (stalled, mut accepted) = stalled_server(true).await;
     let fwd = forward(&hog, stalled).await;
@@ -249,7 +250,7 @@ async fn budget_exhaustion_does_not_starve_floor() {
         }));
         held.push(accepted.recv().await.unwrap());
     }
-    wait_until("budget exhausted", Duration::from_secs(20), || env.server.stats().recv_budget_used == budget, || format!("{:?}", env.server.stats())).await;
+    wait_until("hog lanes hold data", Duration::from_secs(20), || env.server.stats().recv_ring_bytes > 0, || format!("{:?}", env.server.stats())).await;
     let other = env.client().await;
     let echo = echo_server().await;
     let fwd2 = forward(&other, echo).await;
@@ -257,7 +258,7 @@ async fn budget_exhaustion_does_not_starve_floor() {
     let out = echo_roundtrip(fwd2, data.clone()).await;
     assert_eq!(sha(&out), sha(&data));
     let st = env.server.stats();
-    assert!(st.recv_budget_used <= budget, "{st:?}");
+    assert_eq!(st.recv_budget_used, 0, "{st:?}");
     for w in writers {
         w.abort();
     }

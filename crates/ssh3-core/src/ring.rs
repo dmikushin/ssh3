@@ -6,6 +6,12 @@
 //! last slice of the chunk is dropped — never when its bytes are merely
 //! consumed. Reads from QUIC or the local source go directly into the spare
 //! part of a reserved chunk (`Tail`), so there is no unaccounted buffer.
+//!
+//! **No chunk memory leaves the ring detached from its permit.** The only
+//! way out is [`ChunkSlice`], which carries the chunk's permit with the bytes
+//! and exposes nothing but `&[u8]`; a slice held across an `.await` (QUIC
+//! write, local sink write, replay after resume) keeps the chunk charged even
+//! if the ring drained it meanwhile.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -50,6 +56,20 @@ impl Tail {
     }
 }
 
+/// Bytes of one chunk together with the chunk's permit. Deliberately offers
+/// no way to take the `Bytes` out.
+pub(crate) struct ChunkSlice {
+    bytes: Bytes,
+    _owner: Arc<ChunkPermit>,
+}
+
+impl std::ops::Deref for ChunkSlice {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Ring {
     segs: VecDeque<(Bytes, Arc<ChunkPermit>)>,
@@ -86,12 +106,12 @@ impl Ring {
         }
     }
     /// Up to `max` bytes starting `off` bytes into the ring, as one
-    /// zero-copy slice of a single segment.
-    pub(crate) fn peek(&self, mut off: usize, max: usize) -> Option<Bytes> {
-        for (b, _) in &self.segs {
+    /// zero-copy slice of a single segment, still charged to its chunk.
+    pub(crate) fn peek(&self, mut off: usize, max: usize) -> Option<ChunkSlice> {
+        for (b, owner) in &self.segs {
             if off < b.len() {
                 let end = b.len().min(off + max);
-                return Some(b.slice(off..end));
+                return Some(ChunkSlice { bytes: b.slice(off..end), _owner: owner.clone() });
             }
             off -= b.len();
         }
@@ -118,5 +138,29 @@ impl Ring {
         self.segs.clear();
         self.len = 0;
         self.tail = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{Budget, Permit};
+
+    /// Reviewer's repro: a slice handed out by the ring must keep its
+    /// chunk's budget charge alive for as long as the slice lives.
+    #[test]
+    fn peek_slice_keeps_chunk_budget_charged() {
+        let budget = Budget::new("review", CHUNK as u64);
+        let permit = Permit::try_new(&budget, CHUNK as u64).unwrap();
+        let mut tail = Tail::new(ChunkPermit { _permit: permit, floor: None });
+        tail.spare(CHUNK).fill(0x42);
+        let mut ring = Ring::default();
+        ring.commit(tail, CHUNK);
+        let slice = ring.peek(0, CHUNK).unwrap();
+        ring.drain(CHUNK);
+        assert_eq!(slice[CHUNK - 1], 0x42);
+        assert_eq!(budget.used(), CHUNK as u64, "live zero-copy slice lost its chunk permit");
+        drop(slice);
+        assert_eq!(budget.used(), 0);
     }
 }
