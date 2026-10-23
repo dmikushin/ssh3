@@ -19,6 +19,20 @@ fn sched(base: Limits) -> Limits {
     }
 }
 
+/// Write into `fwd` (a discard sink behind it) until `done()` holds; the
+/// property under test is the scheduler's, not the bytes (other suites
+/// verify integrity), so transfer only as much as it takes.
+async fn pump_until(fwd: std::net::SocketAddr, what: &str, mut done: impl FnMut() -> bool, dump: impl Fn() -> String) {
+    use tokio::io::AsyncWriteExt;
+    let mut s = tokio::net::TcpStream::connect(fwd).await.unwrap();
+    let chunk = vec![5u8; 64 * 1024];
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(t.elapsed() < Duration::from_secs(20), "pumped 20 s without {what}: {}", dump());
+        s.write_all(&chunk).await.unwrap();
+    }
+}
+
 async fn client_via(env: &Env, rtt: Duration) -> ClientSession {
     let front = delay::relay(env.server_addr(), rtt).await;
     let mut opts = env.opts(&env.key);
@@ -32,13 +46,10 @@ async fn client_via(env: &Env, rtt: Duration) -> ClientSession {
 async fn window_limited_transfer_raises_the_window() {
     let env = env_with(sched(fast_limits()));
     let c = client_via(&env, Duration::from_millis(40)).await;
-    let echo = echo_server().await;
-    let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(8 << 20, 61));
-    assert_same(&echo_roundtrip(fwd, data.clone()).await, &data);
+    let fwd = forward(&c, discard_server().await).await;
     let sess = env.server.session(&c.session_id()).unwrap();
+    pump_until(fwd, "a raise", || env.server.stats().window_raises >= 1, || format!("{:?}", env.server.stats())).await;
     let st = env.server.stats();
-    assert!(st.window_raises >= 1, "{st:?}");
     let w = sess.stats.conn_window.load(Ordering::Relaxed);
     assert!(w > env.limits.floor_window && w <= env.limits.conn_window_ceiling, "window {w}");
     assert_eq!(st.conn_window_budget_used, sess.stats.conn_window_charged.load(Ordering::Relaxed) - env.limits.floor_window, "{st:?}");
@@ -51,19 +62,24 @@ async fn raises_stay_within_the_budget() {
     let budget = 512 * 1024;
     let env = env_with(sched(Limits { conn_window_budget: budget, ..fast_limits() }));
     let (a, b) = (client_via(&env, Duration::from_millis(40)).await, client_via(&env, Duration::from_millis(40)).await);
-    let echo = echo_server().await;
-    let (fa, fb) = (forward(&a, echo).await, forward(&b, echo).await);
-    let data = Arc::new(pattern(6 << 20, 62));
-    let mut max_used = 0;
-    let (ra, rb) = (tokio::spawn(echo_roundtrip(fa, data.clone())), tokio::spawn(echo_roundtrip(fb, data.clone())));
-    while !(ra.is_finished() && rb.is_finished()) {
-        max_used = max_used.max(env.server.stats().conn_window_budget_used);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_same(&ra.await.unwrap(), &data);
-    assert_same(&rb.await.unwrap(), &data);
+    let sink = discard_server().await;
+    let (fa, fb) = (forward(&a, sink).await, forward(&b, sink).await);
+    // Both pump until the budget is fully used (raises beyond it would need
+    // more than it has); the maximum ever observed must stay within it.
+    let max_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probe = |m: &Arc<std::sync::atomic::AtomicU64>| {
+        let used = env.server.stats().conn_window_budget_used;
+        m.fetch_max(used, Ordering::Relaxed);
+        used >= budget
+    };
+    let (m1, m2) = (max_used.clone(), max_used.clone());
+    tokio::join!(
+        pump_until(fa, "a full budget", || probe(&m1), || format!("{:?}", env.server.stats())),
+        pump_until(fb, "a full budget", || probe(&m2), || format!("{:?}", env.server.stats())),
+    );
     let st = env.server.stats();
-    assert!(st.window_raises >= 1, "{st:?}");
+    assert!(st.window_raises >= 2, "{st:?}");
+    let max_used = max_used.load(Ordering::Relaxed);
     assert!(max_used <= budget, "budget {budget} exceeded: {max_used}");
     for c in [&a, &b] {
         let s = env.server.session(&c.session_id()).unwrap();
@@ -75,13 +91,14 @@ async fn raises_stay_within_the_budget() {
 /// many bytes have been received; then the charge returns to the floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lowering_keeps_the_charge_until_the_old_window_is_read() {
-    let env = env_with(sched(Limits { window_lower_after: Duration::from_millis(200), ..fast_limits() }));
+    // Ceiling = 2 × floor: one raise, and the debt to trickle off is only
+    // 512 KiB (the trickle dominates this test's time).
+    let env = env_with(sched(Limits { window_lower_after: Duration::from_millis(200), conn_window_ceiling: 512 * 1024, ..fast_limits() }));
     let c = client_via(&env, Duration::from_millis(40)).await;
-    let echo = echo_server().await;
-    let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(8 << 20, 63));
-    assert_same(&echo_roundtrip(fwd, data.clone()).await, &data);
+    let sink = discard_server().await;
+    let fwd = forward(&c, sink).await;
     let sess = env.server.session(&c.session_id()).unwrap();
+    pump_until(fwd, "a raise", || sess.stats.window_raises.load(Ordering::Relaxed) >= 1, || format!("{:?}", env.server.stats())).await;
     let raised = sess.stats.conn_window.load(Ordering::Relaxed);
     assert!(raised > env.limits.floor_window);
     wait_until("lowered while idle", Duration::from_secs(10), || sess.stats.window_lowers.load(Ordering::Relaxed) >= 1, || format!("{:?}", env.server.stats())).await;
@@ -90,7 +107,6 @@ async fn lowering_keeps_the_charge_until_the_old_window_is_read() {
     assert!(charged > env.limits.floor_window, "charge dropped before the old window was read: {charged}");
     // Trickle more than the old window, too slowly to be window-limited,
     // into a sink that reads everything (an unread echo would block us).
-    let sink = discard_server().await;
     let fwd2 = forward(&c, sink).await;
     let mut s = tokio::net::TcpStream::connect(fwd2).await.unwrap();
     let t0 = std::time::Instant::now();
