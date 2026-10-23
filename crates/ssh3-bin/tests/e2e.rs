@@ -683,3 +683,65 @@ fn agent_forwarding() {
     let o = run(env.cmd("user_key", &["-o", &agent_opt, "t", "ssh-add -l"]), b"");
     assert_ne!(o.code, Some(0), "remote reached an agent without -A");
 }
+
+// -------------------------------------------------------- multi-key auth
+
+/// UDP relay in front of the server that counts client 4-tuples: every dial
+/// uses a fresh socket, so the count is the number of connections the
+/// client made.
+fn counting_relay(server_port: u16) -> (u16, std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::net::SocketAddr>>>) {
+    use std::collections::HashMap;
+    use std::net::UdpSocket;
+    use std::sync::{Arc, Mutex};
+    let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = front.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        let mut ups: HashMap<std::net::SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        let mut b = [0u8; 65536];
+        while let Ok((n, from)) = front.recv_from(&mut b) {
+            let up = ups.entry(from).or_insert_with(|| {
+                seen2.lock().unwrap().insert(from);
+                let up = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+                up.connect(("127.0.0.1", server_port)).unwrap();
+                let (up2, front2) = (up.clone(), front.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let mut b = [0u8; 65536];
+                    while let Ok(n) = up2.recv(&mut b) {
+                        let _ = front2.send_to(&b[..n], from);
+                    }
+                });
+                up
+            });
+            let _ = up.send(&b[..n]);
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn several_keys_on_one_connection() {
+    let env = Env::new();
+    let (rport, seen) = counting_relay(env.port);
+    let host_pub = std::fs::read_to_string(env.dir.join("host_key.pub")).unwrap();
+    std::fs::write(env.dir.join("known_hosts.relay"), format!("[127.0.0.1]:{rport} {host_pub}")).unwrap();
+    let cfg = env.dir.join("ssh_config.two_keys");
+    // Only the second identity is in authorized_keys.
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host t\n  HostName 127.0.0.1\n  Port {rport}\n  User {user}\n  IdentityFile {d}/other_key\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {d}/known_hosts.relay\n  GlobalKnownHostsFile none\n",
+            user = me(),
+            d = env.dir.display()
+        ),
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    cmd.arg("-F").arg(&cfg).args(["t", "echo ok"]);
+    let o = run(cmd, b"");
+    assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
+    assert_eq!(o.stdout, b"ok\n");
+    assert_eq!(seen.lock().unwrap().len(), 1, "client connections through the relay");
+    assert_eq!(env.stats()["auth_failures"], 1, "the first key must have been offered and refused");
+}

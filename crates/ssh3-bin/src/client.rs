@@ -303,8 +303,8 @@ fn client_limits(c: &ClientConfig) -> Limits {
     l
 }
 
-async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signer: Arc<dyn Signer>) -> Result<ClientSession, Error> {
-    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: vec![signer], user: c.user.clone(), limits: client_limits(c), sockets: dual_stack_factory() };
+async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signers: &[Arc<dyn Signer>]) -> Result<ClientSession, Error> {
+    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: signers.to_vec(), user: c.user.clone(), limits: client_limits(c), sockets: dual_stack_factory() };
     let sock = (opts.sockets)().map_err(Error::Io)?;
     let fut = ClientSession::connect(opts, sock);
     match c.connect_timeout {
@@ -320,7 +320,8 @@ enum Outcome {
     Fatal(String),
 }
 
-/// Try every address until one answers, then every key on it.
+/// Try every address until one answers; on it, every key is offered in
+/// order on that one connection (core stops at MaxAuthTries), as ssh(1).
 async fn connect(c: &ClientConfig) -> Outcome {
     let addrs = match resolve_addrs(c).await {
         Ok(a) => a,
@@ -333,21 +334,16 @@ async fn connect(c: &ClientConfig) -> Outcome {
         return Outcome::Fatal(denied);
     }
     let mut last = String::new();
-    'addr: for addr in addrs {
-        for s in &signers {
-            match dial(c, addr, &host, s.clone()).await {
-                Ok(sess) => return Outcome::Connected(sess),
-                Err(Error::Auth(why)) => {
-                    tracing::info!("key {} refused: {why}", s.public_key().fingerprint(Default::default()));
-                }
-                Err(Error::HostKey(why)) => return Outcome::Fatal(format!("{why}\nHost key verification failed.")),
-                Err(e) => {
-                    last = format!("ssh3: connect to host {} port {}: {e}", c.hostname, c.port);
-                    continue 'addr;
-                }
+    for addr in addrs {
+        match dial(c, addr, &host, &signers).await {
+            Ok(sess) => return Outcome::Connected(sess),
+            Err(Error::Auth(why)) => {
+                tracing::info!("authentication refused: {why}");
+                return Outcome::Fatal(denied);
             }
+            Err(Error::HostKey(why)) => return Outcome::Fatal(format!("{why}\nHost key verification failed.")),
+            Err(e) => last = format!("ssh3: connect to host {} port {}: {e}", c.hostname, c.port),
         }
-        return Outcome::Fatal(denied);
     }
     Outcome::Fatal(last)
 }
