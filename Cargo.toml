@@ -20,6 +20,11 @@ panic = "unwind"
 # Keep line tables in the shipped binary: crashes on oracle are diagnosed from
 # backtraces there, and stripping them has repeatedly cost a rebuild.
 debug = "line-tables-only"
+# Arithmetic overflow must panic (and be contained by I2) rather than wrap into
+# silently wrong offsets, lengths or terminal coordinates: ssh3-term's resync
+# underflowed in a reachable state (review case 89) and would have emitted wrong
+# cursor positions in a release build. All workspace crates parse peer input.
+overflow-checks = true
 
 # quinn 0.11.12 with one added method, `Connection::path_changed` (SPEC.md §7.3, X9):
 # the path socket switches the real network path below an unchanged virtual peer
