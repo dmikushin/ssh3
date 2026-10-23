@@ -102,6 +102,10 @@ pub struct ServerStats {
     pub reassembly_bytes: u64,
     pub reassembly_evicted: u64,
     pub udp_evicted: u64,
+    /// §4 fenced credit retraction: completed retractions (acked or
+    /// unilateral while detached) and carriers cut for an unacked Retract.
+    pub credit_retractions: u64,
+    pub retract_timeouts: u64,
 }
 
 impl Server {
@@ -186,6 +190,8 @@ impl Server {
             t.datagrams_dropped += s.stats.dgrams_dropped.load(Ordering::Relaxed);
             t.reassembly_evicted += s.stats.reasm_evicted.load(Ordering::Relaxed);
             t.udp_evicted += s.stats.udp_evicted.load(Ordering::Relaxed);
+            t.credit_retractions += s.stats.credit_retractions.load(Ordering::Relaxed);
+            t.retract_timeouts += s.stats.retract_timeouts.load(Ordering::Relaxed);
             t.refused_detached += s.refused_detached.load(Ordering::Relaxed);
             t.send_ring_bytes += s.stats.send_ring_bytes.load(Ordering::Relaxed);
             t.recv_ring_bytes += s.stats.recv_ring_bytes.load(Ordering::Relaxed);

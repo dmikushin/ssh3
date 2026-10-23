@@ -359,7 +359,7 @@ async fn over_credit_peer_is_cut_while_others_work() {
     let (mut ev, mut ev_r) = conn.open_bi().await.unwrap();
     ev.write_all(&frame::encode(&LaneHeader { chan_id: 0, lane: 0, offset_out: 0 })).await.unwrap();
     frame::read_frame(&mut ev_r, 64).await.unwrap().unwrap();
-    frame::write_message(&mut ctl, &Message::LaneAck { chan_id: 0, lane: 0, accepted: 0, limit: 1 << 20 }).await.unwrap();
+    frame::write_message(&mut ctl, &Message::LaneAck { chan_id: 0, lane: 0, accepted: 0, limit: 1 << 20, seq: 0 }).await.unwrap();
     let open = Message::ChannelOpen { chan_id: 2, kind: ChannelKind::DirectTcp { host: "127.0.0.1".into(), port: stalled.port() }, limit: 1 << 20 };
     ev.write_all(&frame::encode(&open)).await.unwrap();
     let server_limit = loop {

@@ -218,7 +218,7 @@ async fn malformed_resume_does_not_detach_the_session() {
     let conn = raw_conn(&env).await;
     let (mut send, _recv, first) = raw_auth(&conn, &env.key, Intent::Resume).await;
     assert!(matches!(first, Message::AuthOk { .. }), "{first:?}");
-    let bogus = ssh3_core::msg::LanePos { chan_id: 0, lane: 9, accepted: 0, limit: 0 };
+    let bogus = ssh3_core::msg::LanePos { chan_id: 0, lane: 9, accepted: 0, limit: 0, seq: 0 };
     frame::write_message(&mut send, &Message::Resume { session_id: sid, lanes: vec![bogus] }).await.unwrap();
     let reason = conn.closed().await;
     match reason {

@@ -46,6 +46,11 @@ pub struct Limits {
     /// The receiver acks (releasing the sender's ring) after this many newly
     /// accepted bytes; credit updates follow 1/4 of the grant.
     pub lane_ack_bytes: u64,
+    /// A lane without arrivals this long has its credit retracted to the
+    /// floor (SPEC §4 demand-driven grants, `CreditIdle`).
+    pub credit_idle: Duration,
+    /// A Retract unacknowledged after max(4·RTT, this) cuts the carrier.
+    pub retract_timeout_min: Duration,
     /// LaneCreditBudget: receive-ring chunk storage, server-wide.
     pub lane_credit_budget: u64,
     /// LaneSendBudget: send-ring chunk storage, server-wide.
@@ -108,6 +113,8 @@ impl Default for Limits {
             lane_buffer: 8 * 1024 * 1024,
             lane_floor: 16 * 1024,
             lane_ack_bytes: 16 * 1024,
+            credit_idle: Duration::from_secs(5),
+            retract_timeout_min: Duration::from_secs(2),
             lane_credit_budget: 64 * 1024 * 1024,
             lane_send_budget: 64 * 1024 * 1024,
             event_queue: 1024,

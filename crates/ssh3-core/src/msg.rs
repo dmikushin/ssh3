@@ -37,6 +37,8 @@ pub struct LanePos {
     pub lane: u8,
     pub accepted: u64,
     pub limit: u64,
+    /// The receiver's fence seq for this lane (SPEC §4 retraction).
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +121,7 @@ pub enum Message {
     /// Receiver → sender: `accepted` bytes are in the receiver's ring (replay
     /// retention); the sender may send bytes with offset < `limit`
     /// (absolute, monotone credit; SPEC §4).
-    LaneAck { chan_id: u64, lane: u8, accepted: u64, limit: u64 },
+    LaneAck { chan_id: u64, lane: u8, accepted: u64, limit: u64, seq: u64 },
     /// End of one lane direction at `final_offset` (half-close), as an event
     /// so it is never confused with a carrier death (SPEC §5).
     LaneFin { chan_id: u64, lane: u8, final_offset: u64 },
@@ -148,10 +150,15 @@ pub enum Message {
     /// -R UDP: listen on `host:port` (0 = any); answered by ListenOk/Fail.
     UdpListenRequest { req_id: u64, host: String, port: u16 },
     UdpListenCancel { host: String, port: u16 },
+    /// Receiver → sender (control stream): stop at max(sent, new_limit);
+    /// opens fence `seq` (SPEC §4 fenced credit retraction).
+    Retract { chan_id: u64, lane: u8, seq: u64, new_limit: u64 },
+    /// Sender → receiver: it stopped; `sent` = end of bytes sent on the lane.
+    RetractAck { chan_id: u64, lane: u8, seq: u64, sent: u64 },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 25;
+pub const MESSAGE_TYPES: u32 = 27;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

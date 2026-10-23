@@ -32,6 +32,8 @@ pub fn to_json(s: &ServerStats) -> Value {
         reassembly_bytes,
         reassembly_evicted,
         udp_evicted,
+        credit_retractions,
+        retract_timeouts,
     } = *s;
     json!({
         "sessions": sessions,
@@ -59,5 +61,7 @@ pub fn to_json(s: &ServerStats) -> Value {
         "reassembly_bytes": reassembly_bytes,
         "reassembly_evicted": reassembly_evicted,
         "udp_evicted": udp_evicted,
+        "credit_retractions": credit_retractions,
+        "retract_timeouts": retract_timeouts,
     })
 }

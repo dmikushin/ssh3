@@ -69,6 +69,10 @@ pub struct Stats {
     pub dgrams_dropped: AtomicU64,
     pub reasm_evicted: AtomicU64,
     pub udp_evicted: AtomicU64,
+    /// §4 fenced retraction: completed (acked or unilateral), and peers cut
+    /// for not acknowledging one in time.
+    pub credit_retractions: AtomicU64,
+    pub retract_timeouts: AtomicU64,
 }
 
 /// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
@@ -85,6 +89,8 @@ pub(crate) struct LaneEnv {
     pub cap: u64,
     pub floor: u64,
     pub ack_bytes: u64,
+    /// Retract a lane's credit to the floor after this long without arrivals.
+    pub credit_idle: Duration,
     pub ack_interval: Duration,
     pub stats: Arc<Stats>,
     pub acks: Arc<AckQueue>,
@@ -188,6 +194,23 @@ impl Drop for LaneSend {
     }
 }
 
+/// A Retract sent and not yet acknowledged.
+#[derive(Clone, Copy)]
+struct Retracting {
+    seq: u64,
+    new_limit: u64,
+    deadline: Instant,
+}
+
+/// What the periodic credit check wants done for a lane.
+pub(crate) enum CreditAction {
+    None,
+    /// Send `Retract{seq, new_limit}`.
+    Retract { seq: u64, new_limit: u64 },
+    /// The peer did not acknowledge a Retract in time.
+    Violation(String),
+}
+
 struct LaneState {
     // ---- send direction
     sbuf: Ring,
@@ -198,6 +221,9 @@ struct LaneState {
     send_from: u64,
     send_done: bool,
     sfloor: Arc<AtomicU32>,
+    /// Fence seq of the last Retract we acknowledged: grants with an older
+    /// seq are stale and ignored.
+    peer_seq: u64,
     // ---- receive direction
     rbuf: Ring,
     delivered: u64,
@@ -223,6 +249,11 @@ struct LaneState {
     last_ack_limit: u64,
     queued_lazy: bool,
     queued_urgent: bool,
+    /// Receiver: current fence seq, the outstanding Retract (one per lane),
+    /// and when bytes last arrived (demand-driven grants).
+    seq: u64,
+    retract: Option<Retracting>,
+    last_arrival: Instant,
     // ---- lifecycle
     ever_attached: bool,
     epoch: u64,
@@ -274,6 +305,7 @@ impl Lane {
                 send_from: 0,
                 send_done: false,
                 sfloor: Arc::new(AtomicU32::new(0)),
+                peer_seq: 0,
                 rbuf: Ring::default(),
                 delivered: 0,
                 received: 0,
@@ -290,6 +322,9 @@ impl Lane {
                 last_ack_limit: floor,
                 queued_lazy: false,
                 queued_urgent: false,
+                seq: 0,
+                retract: None,
+                last_arrival: Instant::now(),
                 ever_attached: false,
                 epoch: 0,
                 closed: false,
@@ -380,7 +415,8 @@ impl Lane {
             st.reserve.shrink(n);
         }
         let target = st.delivered + st.granted;
-        if target > st.limit {
+        // No new credit while a Retract is outstanding (SPEC §4).
+        if target > st.limit && st.retract.is_none() {
             let need = round_up((target - st.received).saturating_sub(free));
             if need > st.reserve.amount() {
                 let want = need - st.reserve.amount();
@@ -444,19 +480,124 @@ impl Lane {
         self.queue_ack(Some(true));
     }
 
-    /// The `(accepted, limit)` to send now. Works on closed lanes too: the
-    /// final ack of a completed lane must still go out.
-    pub(crate) fn take_ack(&self) -> (u64, u64) {
+    /// The `(accepted, limit, seq)` to send now. Works on closed lanes too:
+    /// the final ack of a completed lane must still go out. While a Retract
+    /// is outstanding the advertised limit is at most its new limit.
+    pub(crate) fn take_ack(&self) -> (u64, u64, u64) {
         let mut st = self.st.lock().unwrap();
         st.queued_lazy = false;
         st.queued_urgent = false;
         st.last_ack_accepted = st.received;
         st.last_ack_limit = st.limit;
-        (st.received, st.limit)
+        let limit = match st.retract {
+            Some(r) => st.limit.min(r.new_limit.max(st.received)),
+            None => st.limit,
+        };
+        (st.received, limit, st.seq)
     }
 
-    /// Sender side: LaneAck from the peer.
-    pub(crate) fn on_ack(&self, accepted: u64, limit: u64) -> Result<()> {
+    // ---------------------------------------------------------- retraction
+
+    /// Receiver, periodic: retract an idle lane's credit to the floor
+    /// (demand-driven grants), or report a Retract that timed out.
+    pub(crate) fn credit_check(&self, retract_timeout: Duration) -> CreditAction {
+        let mut st = self.st.lock().unwrap();
+        if st.closed {
+            return CreditAction::None;
+        }
+        if let Some(r) = st.retract {
+            if Instant::now() > r.deadline {
+                return CreditAction::Violation(format!(
+                    "lane {}/{}: Retract seq {} not acknowledged within {retract_timeout:?}",
+                    self.chan_id, self.lane, r.seq
+                ));
+            }
+            return CreditAction::None;
+        }
+        let floor = self.env.floor;
+        if st.limit - st.delivered <= floor || st.last_arrival.elapsed() < self.env.credit_idle {
+            return CreditAction::None;
+        }
+        let new_limit = st.received.max(st.delivered + floor);
+        if new_limit >= st.limit {
+            return CreditAction::None;
+        }
+        st.seq += 1;
+        st.granted = floor;
+        st.retract = Some(Retracting { seq: st.seq, new_limit, deadline: Instant::now() + retract_timeout });
+        CreditAction::Retract { seq: st.seq, new_limit }
+    }
+
+    /// Receiver: the sender stopped at `sent`. The effective limit is
+    /// max(sent, new_limit); reservations above it are released only now.
+    pub(crate) fn on_retract_ack(&self, seq: u64, sent: u64) -> Result<()> {
+        let mut st = self.st.lock().unwrap();
+        if st.closed {
+            return Ok(());
+        }
+        let r = match st.retract {
+            Some(r) if r.seq == seq => r,
+            _ => return Err(Error::Protocol(format!("lane {}/{}: RetractAck seq {seq} without that Retract outstanding", self.chan_id, self.lane))),
+        };
+        if sent > st.limit || sent < st.received {
+            return Err(Error::Protocol(format!(
+                "lane {}/{}: RetractAck says {sent} bytes sent; limit {} received {}",
+                self.chan_id, self.lane, st.limit, st.received
+            )));
+        }
+        self.lower_limit(&mut st, sent.max(r.new_limit));
+        st.retract = None;
+        self.env.stats.credit_retractions.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn lower_limit(&self, st: &mut LaneState, new_limit: u64) {
+        if new_limit < st.limit {
+            self.env.stats.credit_outstanding.fetch_sub(st.limit - new_limit, Ordering::Relaxed);
+            st.limit = new_limit;
+            st.last_ack_limit = st.last_ack_limit.min(new_limit);
+        }
+        st.rbuf.release_budget_tail();
+        // Releases the reservation no longer backing credit.
+        self.recompute_limit(st);
+    }
+
+    /// Receiver while detached: retract to the floor without a message (no
+    /// byte can be in flight once the old carrier's tasks are fenced; the
+    /// new limit travels in Resume).
+    pub(crate) fn retract_unilaterally(&self) {
+        let mut st = self.st.lock().unwrap();
+        st.epoch += 1; // fence the old carrier's readers first
+        let new_limit = st.received.max(st.delivered + self.env.floor);
+        if st.closed || (new_limit >= st.limit && st.retract.is_none()) {
+            return;
+        }
+        st.seq += 1;
+        st.retract = None;
+        st.granted = self.env.floor;
+        self.lower_limit(&mut st, new_limit);
+        self.env.stats.credit_retractions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sender: stop at once at max(sent, new_limit) and report what was sent.
+    pub(crate) fn on_retract(&self, seq: u64, new_limit: u64) -> Result<u64> {
+        let mut st = self.st.lock().unwrap();
+        if seq <= st.peer_seq {
+            return Err(Error::Protocol(format!("lane {}/{}: Retract seq {seq} not newer than {}", self.chan_id, self.lane, st.peer_seq)));
+        }
+        if new_limit < st.sbase {
+            return Err(Error::Protocol(format!("lane {}/{}: Retract to {new_limit} below accepted {}", self.chan_id, self.lane, st.sbase)));
+        }
+        // sent_hi already covers a chunk being written right now.
+        let sent = st.sent_hi.max(st.sbase);
+        st.peer_limit = sent.max(new_limit);
+        st.peer_seq = seq;
+        Ok(sent)
+    }
+
+    /// Sender side: LaneAck from the peer. A grant from an older fence seq
+    /// than the last Retract we acknowledged is stale: its limit is ignored.
+    pub(crate) fn on_ack(&self, accepted: u64, limit: u64, seq: u64) -> Result<()> {
         let mut st = self.st.lock().unwrap();
         if st.closed {
             return Ok(());
@@ -471,14 +612,17 @@ impl Lane {
         // event (event-lane stream) may overtake an earlier LaneAck (control
         // stream) — QUIC orders bytes within a stream, never across streams.
         let accepted = accepted.max(st.sbase);
-        if limit < st.peer_limit {
-            return Err(Error::Protocol(format!(
-                "lane {}/{}: limit went down from {} to {limit}",
-                self.chan_id, self.lane, st.peer_limit
-            )));
-        }
         self.release_accepted(&mut st, accepted);
-        st.peer_limit = limit;
+        if seq >= st.peer_seq {
+            if seq == st.peer_seq && limit < st.peer_limit {
+                return Err(Error::Protocol(format!(
+                    "lane {}/{}: limit went down from {} to {limit} within fence {seq}",
+                    self.chan_id, self.lane, st.peer_limit
+                )));
+            }
+            st.peer_seq = seq;
+            st.peer_limit = st.peer_limit.max(limit);
+        }
         drop(st);
         self.wake_source.notify_waiters();
         self.wake_sender.notify_waiters();
@@ -520,7 +664,7 @@ impl Lane {
     pub(crate) fn fence(&self) -> LanePos {
         let mut st = self.st.lock().unwrap();
         st.epoch += 1;
-        LanePos { chan_id: self.chan_id, lane: self.lane, accepted: st.received, limit: st.limit }
+        LanePos { chan_id: self.chan_id, lane: self.lane, accepted: st.received, limit: st.limit, seq: st.seq }
     }
 
     /// Would the peer's position be acceptable? No mutation (resume is
@@ -534,10 +678,12 @@ impl Lane {
                 self.chan_id, self.lane, p.accepted, st.sbase
             )));
         }
-        if p.limit < st.peer_limit {
+        // A lower limit than before is valid: Resume is a new fence epoch,
+        // and the peer may have retracted unilaterally while detached.
+        if p.limit < p.accepted || p.seq < st.peer_seq {
             return Err(Error::Protocol(format!(
-                "lane {}/{}: resumed limit {} below the {} granted before",
-                self.chan_id, self.lane, p.limit, st.peer_limit
+                "lane {}/{}: resumed limit {} below accepted {} or seq {} older than {}",
+                self.chan_id, self.lane, p.limit, p.accepted, p.seq, st.peer_seq
             )));
         }
         Ok(())
@@ -548,7 +694,10 @@ impl Lane {
         self.check_resume(p)?;
         let mut st = self.st.lock().unwrap();
         self.release_accepted(&mut st, p.accepted);
+        // Replay only up to the NEW limit; the old high-water mark grants
+        // nothing (SPEC §4).
         st.peer_limit = p.limit;
+        st.peer_seq = p.seq;
         st.send_from = p.accepted;
         drop(st);
         self.wake_source.notify_waiters();
@@ -792,108 +941,52 @@ impl Lane {
         }
     }
 
-    /// QUIC stream → receive ring, reading directly into a reserved chunk.
-    /// Never waits on the sink: credit guarantees storage. One per attach,
-    /// fenced by `epoch`.
+    /// QUIC stream → receive ring. Waits for data holding none of our
+    /// storage (an idle lane must not pin a chunk), then copies it into
+    /// chunks allocated from the lane's reservation or floor — credit
+    /// guarantees they exist. Keeps reading at zero credit, so a byte beyond
+    /// the limit is detected (and a byte made legitimate by credit that grew
+    /// meanwhile is kept). Never waits on the sink. One per attach, fenced by
+    /// `epoch`.
     async fn quic_reader(self: Arc<Self>, mut recv: RecvStream, epoch: u64) -> Result<()> {
         loop {
-            let (mut tail, want) = {
-                let fut = self.wake_rx.notified();
-                tokio::pin!(fut);
-                fut.as_mut().enable();
-                let got = {
-                    let mut st = self.st.lock().unwrap();
-                    if st.closed || st.epoch != epoch {
-                        return Ok(());
-                    }
-                    let allowed = (st.limit - st.received) as usize;
-                    if allowed == 0 {
-                        None
-                    } else {
-                        let tail = match st.rbuf.take_tail() {
-                            Some(t) => t,
-                            None => match self.recv_chunk(&mut st) {
-                                Some(t) => t,
-                                None => {
-                                    return Err(Error::Protocol(format!(
-                                        "lane {}/{}: internal: credit {allowed} granted without storage",
-                                        self.chan_id, self.lane
-                                    )));
-                                }
-                            },
-                        };
-                        let want = allowed.min(tail.space());
-                        Some((tail, want))
-                    }
-                };
-                match got {
-                    Some(v) => v,
-                    None => {
-                        // No credit left: keep polling QUIC anyway. A
-                        // conforming peer sends nothing now; any byte that
-                        // arrives while we are still at the limit is a
-                        // violation and cuts the connection (bytes left in
-                        // quinn would hold connection credit hostage).
-                        let mut probe = [0u8; 1];
-                        tokio::select! {
-                            _ = fut => continue,
-                            r = recv.read(&mut probe) => {
-                                let n = match r {
-                                    Ok(Some(n)) => n,
-                                    Ok(None) => return Ok(()),
-                                    Err(e) => {
-                                        tracing::debug!(chan = self.chan_id, lane = self.lane, "lane read ended: {e}");
-                                        return Ok(());
-                                    }
-                                };
-                                let mut st = self.st.lock().unwrap();
-                                if st.closed || st.epoch != epoch {
-                                    return Ok(());
-                                }
-                                if st.received + n as u64 > st.limit {
-                                    return Err(Error::Protocol(format!(
-                                        "lane {}/{}: peer sent beyond limit {} (received {}, +{n})",
-                                        self.chan_id, self.lane, st.limit, st.received
-                                    )));
-                                }
-                                // Credit grew meanwhile: a legitimate byte.
-                                let mut tail = match st.rbuf.take_tail() {
-                                    Some(t) => t,
-                                    None => self.recv_chunk(&mut st).ok_or_else(|| {
-                                        Error::Protocol(format!("lane {}/{}: internal: credit granted without storage", self.chan_id, self.lane))
-                                    })?,
-                                };
-                                tail.spare(n).copy_from_slice(&probe[..n]);
-                                st.rbuf.commit(tail, n);
-                                st.received += n as u64;
-                                self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                                let u = self.ack_need(&mut st);
-                                drop(st);
-                                self.queue_ack(u);
-                                self.wake_sink.notify_waiters();
-                                continue;
-                            }
-                        }
-                    }
+            let fut = self.wake_rx.notified();
+            tokio::pin!(fut);
+            fut.as_mut().enable();
+            let allowed = {
+                let st = self.st.lock().unwrap();
+                if st.closed || st.epoch != epoch {
+                    return Ok(());
                 }
+                (st.limit - st.received) as usize
             };
-            let r = recv.read(tail.spare(want)).await;
-            let mut st = self.st.lock().unwrap();
-            if st.closed || st.epoch != epoch {
-                return Ok(());
-            }
-            let n = match r {
-                Ok(Some(n)) => n,
-                Ok(None) => {
-                    st.rbuf.commit(tail, 0);
-                    return Ok(()); // end of this carrier's stream; LaneFin is an event
+            let r = if allowed == 0 {
+                tokio::select! {
+                    r = recv.read_chunk(1, true) => r,
+                    _ = fut => continue, // credit changed: read larger chunks
                 }
+            } else {
+                recv.read_chunk(allowed.min(CHUNK), true).await
+            };
+            let data = match r {
+                Ok(Some(c)) => c.bytes,
+                Ok(None) => return Ok(()), // end of this carrier's stream; LaneFin is an event
                 Err(e) => {
-                    st.rbuf.commit(tail, 0);
                     tracing::debug!(chan = self.chan_id, lane = self.lane, "lane read ended: {e}");
                     return Ok(());
                 }
             };
+            let n = data.len();
+            let mut st = self.st.lock().unwrap();
+            if st.closed || st.epoch != epoch {
+                return Ok(());
+            }
+            if st.received + n as u64 > st.limit {
+                return Err(Error::Protocol(format!(
+                    "lane {}/{}: peer sent beyond limit {} (received {}, +{n})",
+                    self.chan_id, self.lane, st.limit, st.received
+                )));
+            }
             if let Some(f) = st.fin_offset
                 && st.received + n as u64 > f
             {
@@ -903,7 +996,20 @@ impl Lane {
             if was_empty {
                 st.sink_progress = Instant::now();
             }
-            st.rbuf.commit(tail, n);
+            st.last_arrival = Instant::now();
+            let mut off = 0;
+            while off < n {
+                let mut tail = match st.rbuf.take_tail() {
+                    Some(t) => t,
+                    None => self.recv_chunk(&mut st).ok_or_else(|| {
+                        Error::Protocol(format!("lane {}/{}: internal: credit granted without storage", self.chan_id, self.lane))
+                    })?,
+                };
+                let k = tail.space().min(n - off);
+                tail.spare(k).copy_from_slice(&data[off..off + k]);
+                st.rbuf.commit(tail, k);
+                off += k;
+            }
             st.received += n as u64;
             self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
             // A sink holding bytes for longer than ack_interval is stalled:

@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let m = Message::LaneAck { chan_id: 7, lane: 1, accepted: 1 << 40, limit: 1 << 41 };
+        let m = Message::LaneAck { chan_id: 7, lane: 1, accepted: 1 << 40, limit: 1 << 41, seq: 3 };
         let f = encode(&m);
         // strip the length prefix
         let mut i = 0;

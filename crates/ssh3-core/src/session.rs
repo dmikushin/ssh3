@@ -251,6 +251,7 @@ impl SessionShared {
             cap: self.limits.lane_buffer as u64,
             floor: self.limits.lane_floor,
             ack_bytes: self.limits.lane_ack_bytes,
+            credit_idle: self.limits.credit_idle,
             ack_interval: self.limits.ack_interval,
             stats: self.stats.clone(),
             acks: self.acks.clone(),
@@ -895,11 +896,28 @@ impl SessionShared {
                 });
                 Ok(())
             }
-            Message::LaneAck { chan_id, lane, accepted, limit } => {
+            Message::LaneAck { chan_id, lane, accepted, limit, seq } => {
                 // A channel closed locally may still receive in-flight acks.
                 if let Some(ch) = self.channel(chan_id) {
                     let l = ch.lanes.get(lane as usize).ok_or_else(|| Error::Protocol(format!("ack for lane {lane} of channel {chan_id}")))?;
-                    l.on_ack(accepted, limit)?;
+                    l.on_ack(accepted, limit, seq)?;
+                }
+                Ok(())
+            }
+            Message::Retract { chan_id, lane, seq, new_limit } => {
+                if let Some(ch) = self.channel(chan_id) {
+                    let l = ch.lanes.get(lane as usize).ok_or_else(|| Error::Protocol(format!("Retract for lane {lane} of channel {chan_id}")))?;
+                    let sent = l.on_retract(seq, new_limit)?;
+                    if !self.send_ctrl(Message::RetractAck { chan_id, lane, seq, sent }) {
+                        return Err(Error::Protocol("control queue full: RetractAck not sent".into()));
+                    }
+                }
+                Ok(())
+            }
+            Message::RetractAck { chan_id, lane, seq, sent } => {
+                if let Some(ch) = self.channel(chan_id) {
+                    let l = ch.lanes.get(lane as usize).ok_or_else(|| Error::Protocol(format!("RetractAck for lane {lane} of channel {chan_id}")))?;
+                    l.on_retract_ack(seq, sent)?;
                 }
                 Ok(())
             }
@@ -936,9 +954,44 @@ impl SessionShared {
     }
 
     async fn write_ack(send: &mut SendStream, l: &Lane) -> bool {
-        let (accepted, limit) = l.take_ack();
-        let m = Message::LaneAck { chan_id: l.chan_id, lane: l.lane, accepted, limit };
+        let (accepted, limit, seq) = l.take_ack();
+        let m = Message::LaneAck { chan_id: l.chan_id, lane: l.lane, accepted, limit, seq };
         frame::write_message(send, &m).await.is_ok()
+    }
+
+    fn all_lanes(&self) -> Vec<Arc<Lane>> {
+        self.channels.lock().unwrap().values().flat_map(|ch| ch.lanes.iter().cloned()).collect()
+    }
+
+    /// Receiver side of §4 retraction, every ack tick: retract idle lanes'
+    /// credit, and cut a peer that left a Retract unacknowledged.
+    async fn credit_tick(&self, send: &mut SendStream) -> std::result::Result<(), String> {
+        let rtt = self.rtt().unwrap_or_default();
+        let timeout = (rtt * 4).max(self.limits.retract_timeout_min);
+        for l in self.all_lanes() {
+            match l.credit_check(timeout) {
+                crate::lane::CreditAction::None => {}
+                crate::lane::CreditAction::Retract { seq, new_limit } => {
+                    let m = Message::Retract { chan_id: l.chan_id, lane: l.lane, seq, new_limit };
+                    if frame::write_message(send, &m).await.is_err() {
+                        return Ok(()); // carrier gone; detach retracts unilaterally
+                    }
+                }
+                crate::lane::CreditAction::Violation(why) => {
+                    self.stats.retract_timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Err(why);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// While detached: every receiver retracts to the floor unilaterally,
+    /// after fencing the old carrier's readers (SPEC §4).
+    fn retract_all_unilaterally(&self) {
+        for l in self.all_lanes() {
+            l.retract_unilaterally();
+        }
     }
 
     async fn control_writer(self: Arc<Self>, mut send: SendStream, mut rx: mpsc::Receiver<Message>, first: Option<Message>) {
@@ -974,6 +1027,13 @@ impl SessionShared {
                         if !Self::write_ack(&mut send, &l).await {
                             return;
                         }
+                    }
+                    if let Err(why) = self.credit_tick(&mut send).await {
+                        tracing::warn!(session = %hex(&self.id), "closing carrier: {why}");
+                        if let Some((c, _)) = self.conn() {
+                            c.close(close::PROTOCOL.into(), why.as_bytes());
+                        }
+                        return;
                     }
                 }
             }
@@ -1107,6 +1167,7 @@ impl SessionShared {
             c.take()
         };
         self.carrier_state.send_replace(0);
+        self.retract_all_unilaterally();
         let linger = if self.has_pty.load(Ordering::Relaxed) { self.limits.pty_linger } else { Some(self.limits.linger) };
         if self.role == Role::Server
             && self.registry.is_some()
@@ -1132,7 +1193,8 @@ impl SessionShared {
     /// Returns the new attach epoch.
     pub(crate) fn install_carrier(self: &Arc<Self>, conn: Connection, send: SendStream, recv: RecvStream, first: impl FnOnce(u64) -> Option<Message>) -> u64 {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let (tx, rx) = mpsc::channel(16);
+        // Pong and RetractAck replies go here without waiting.
+        let (tx, rx) = mpsc::channel(256);
         let mut tasks = JoinSet::new();
         tasks.spawn(self.clone().control_writer(send, rx, first(epoch)));
         tasks.spawn(self.clone().control_reader(conn.clone(), recv));
@@ -1155,6 +1217,7 @@ impl SessionShared {
             c.conn.close(code.into(), reason);
         }
         self.carrier_state.send_replace(0);
+        self.retract_all_unilaterally();
     }
 
     /// Drop everything: carrier, channels, pending opens, registry entry.

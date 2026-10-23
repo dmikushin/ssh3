@@ -54,6 +54,10 @@ impl Tail {
     pub(crate) fn spare(&mut self, n: usize) -> &mut [u8] {
         &mut self.buf[..n]
     }
+    /// Charged to the floor pool rather than a budget.
+    pub(crate) fn is_floor(&self) -> bool {
+        self.owner.floor.is_some()
+    }
 }
 
 /// Bytes of one chunk together with the chunk's permit. Deliberately offers
@@ -133,6 +137,15 @@ impl Ring {
             }
         }
     }
+    /// An empty ring keeps its spare tail chunk for the next bytes; when the
+    /// lane's credit drops, a budget-charged spare is returned (an idle lane
+    /// holds only floor storage, SPEC §4).
+    pub(crate) fn release_budget_tail(&mut self) {
+        if self.len == 0 && self.tail.as_ref().is_some_and(|t| !t.is_floor()) {
+            self.tail = None;
+        }
+    }
+
     /// Drop everything, including the tail.
     pub(crate) fn clear(&mut self) {
         self.segs.clear();
