@@ -71,6 +71,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1430,8 +1439,6 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 [[package]]
 name = "quinn"
 version = "0.11.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2177,6 +2184,21 @@ dependencies = [
  "tempfile",
  "thiserror",
  "x509-parser",
+]
+
+[[package]]
+name = "ssh3-path"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "libc",
+ "quinn",
+ "rcgen",
+ "ring",
+ "rustls",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

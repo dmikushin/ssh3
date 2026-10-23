@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# vendor/ holds patched upstream crates; they must not become workspace members.
+exclude = ["vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -18,3 +20,9 @@ panic = "unwind"
 # Keep line tables in the shipped binary: crashes on oracle are diagnosed from
 # backtraces there, and stripping them has repeatedly cost a rebuild.
 debug = "line-tables-only"
+
+# quinn 0.11.12 with one added method, `Connection::path_changed` (SPEC.md §7.3, X9):
+# the path socket switches the real network path below an unchanged virtual peer
+# address and must reset congestion/RTT/MTU state. See vendor/quinn/src/connection.rs.
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }
