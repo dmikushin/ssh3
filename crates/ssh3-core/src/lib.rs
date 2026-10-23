@@ -21,5 +21,5 @@ pub use error::{Error, Result};
 pub use limits::Limits;
 pub use server::{Server, ServerOptions, ServerStats};
 pub use session::Budgets;
-pub use sesschan::{Command, ExitInfo, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec};
+pub use sesschan::{Command, ExitInfo, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec, UserLookup};
 pub use lane::{BlockingOverflow, PtyOverflow};

@@ -84,17 +84,30 @@ pub fn env_with(limits: Limits) -> Env {
     env_with_session(limits, ssh3_core::ServerSessionEnv::new(ssh3_session::SessionConfig::default()))
 }
 
+/// Test sessions run /bin/sh with HOME inside the test directory: the
+/// developer's real login shell and dotfiles must not run (fish config was
+/// being executed and resets SSH_AUTH_SOCK).
+fn isolate_user(session: &mut ssh3_core::ServerSessionEnv, home: PathBuf) {
+    session.users = Arc::new(move |name| {
+        let mut u = ssh3_session::UserRecord::lookup(name).map_err(|e| e.to_string())?;
+        u.shell = PathBuf::from("/bin/sh");
+        u.home = home.clone();
+        Ok(u)
+    });
+}
+
 /// The account the tests run as (session processes need a real user).
 pub fn current_user() -> String {
     std::env::var("USER").expect("USER is set")
 }
 
-pub fn env_with_session(limits: Limits, session: ssh3_core::ServerSessionEnv) -> Env {
+pub fn env_with_session(limits: Limits, mut session: ssh3_core::ServerSessionEnv) -> Env {
     init();
     let dir = PathBuf::from(std::env::var("HOME").unwrap())
         .join("scratch/ssh-udp/core-tests")
         .join(format!("{}-{}", std::process::id(), DIRS.fetch_add(1, AtOrd::Relaxed)));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    isolate_user(&mut session, dir.join("home"));
     let host = HostIdentity::from_private_key(&ed25519(200)).unwrap();
     let key = user_key(7);
     let authorized_keys = dir.join("authorized_keys");

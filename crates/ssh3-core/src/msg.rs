@@ -155,10 +155,13 @@ pub enum Message {
     Retract { chan_id: u64, lane: u8, seq: u64, new_limit: u64 },
     /// Sender → receiver: it stopped; `sent` = end of bytes sent on the lane.
     RetractAck { chan_id: u64, lane: u8, seq: u64, sent: u64 },
+    /// Client → server, event log: the client ends the session on purpose;
+    /// the server destroys it at once (SPEC §5 "Deliberate end").
+    SessionEnd,
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 27;
+pub const MESSAGE_TYPES: u32 = 28;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

@@ -463,8 +463,18 @@ async fn run(c: ClientConfig) -> ExitCode {
     for t in tasks {
         t.abort();
     }
+    // Every way out of here except a given-up resume is a deliberate end
+    // (command exited, SIGINT/SIGTERM/SIGHUP, -N stopped): tell the server
+    // so it destroys the session instead of lingering (SPEC §5).
+    if !sess.roam_stats().gave_up.load(std::sync::atomic::Ordering::Relaxed) {
+        sess.end(END_BOUND).await;
+    }
     code
 }
+
+/// How long a deliberate end waits for the server's confirmation; the
+/// SESSION_END close that follows ends the session even without it.
+const END_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The "Last contact" watcher for this run, if stderr is a terminal.
 fn status_watch(c: &ClientConfig, sess: &ClientSession, line: StatusLine) -> Option<tokio::task::JoinHandle<()>> {

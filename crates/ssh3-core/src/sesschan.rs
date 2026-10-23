@@ -21,17 +21,27 @@ use crate::session::{Completion, SessionShared};
 /// supplies screen mode; the default blocks).
 pub type OverflowFactory = Arc<dyn Fn() -> Arc<dyn PtyOverflow> + Send + Sync>;
 
+/// Resolves a user name to its account record (system passwd by default;
+/// an alternative user database — containers, tests — plugs in here).
+pub type UserLookup = Arc<dyn Fn(&str) -> std::result::Result<ssh3_session::UserRecord, String> + Send + Sync>;
+
 /// Server-wide settings for session channels.
 pub struct ServerSessionEnv {
     pub config: ssh3_session::SessionConfig,
     pub overflow: OverflowFactory,
+    pub users: UserLookup,
     /// The server's UDP port (SSH_CONNECTION).
     pub(crate) local_port: u16,
 }
 
 impl ServerSessionEnv {
     pub fn new(config: ssh3_session::SessionConfig) -> Self {
-        Self { config, overflow: Arc::new(|| Arc::new(BlockingOverflow) as Arc<dyn PtyOverflow>), local_port: 0 }
+        Self {
+            config,
+            overflow: Arc::new(|| Arc::new(BlockingOverflow) as Arc<dyn PtyOverflow>),
+            users: Arc::new(|name| ssh3_session::UserRecord::lookup(name).map_err(|e| e.to_string())),
+            local_port: 0,
+        }
     }
 }
 
@@ -359,7 +369,8 @@ impl SessionShared {
         if self.agent.lock().unwrap().is_some() {
             return Ok(());
         }
-        let user = ssh3_session::UserRecord::lookup(&self.user).map_err(|e| e.to_string())?;
+        let env = self.server_env.clone().ok_or("no session environment")?;
+        let user = (env.users)(&self.user)?;
         let dir = private_dir().map_err(|e| format!("agent socket directory: {e}"))?;
         let path = dir.join(format!("agent.{}", std::process::id()));
         let listener = tokio::net::UnixListener::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -442,7 +453,7 @@ impl SessionShared {
             return Err("the session already runs a process".into());
         }
         let env = self.server_env.clone().expect("checked by the caller");
-        let user = ssh3_session::UserRecord::lookup(&self.user).map_err(|e| e.to_string())?;
+        let user = (env.users)(&self.user)?;
         let connection = self.conn_addrs().map(|(remote, local_ip)| ssh3_session::ConnectionInfo {
             remote_ip: remote.ip().to_canonical().to_string(),
             remote_port: remote.port(),

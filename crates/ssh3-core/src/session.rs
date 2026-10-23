@@ -852,6 +852,14 @@ impl SessionShared {
                 drop(self.listeners.lock().unwrap().remove(&(host, port)));
                 Ok(())
             }
+            Message::SessionEnd => {
+                if self.role != Role::Server {
+                    return Err(Error::Protocol("SessionEnd sent to a client".into()));
+                }
+                tracing::info!(session = %hex(&self.id), "session ended by the client");
+                self.end_now();
+                Ok(())
+            }
             Message::ChannelDone { chan_id } => {
                 if let Some(ch) = self.channel(chan_id) {
                     for l in &ch.lanes {
@@ -1155,7 +1163,26 @@ impl SessionShared {
     async fn watch_death(self: Arc<Self>, conn: Connection, epoch: u64) {
         let reason = conn.closed().await;
         tracing::debug!(session = %hex(&self.id), epoch, "carrier closed: {reason}");
+        // A client that closes with SESSION_END ended the session on purpose,
+        // even if its SessionEnd event was lost: destroy, do not linger.
+        if self.role == Role::Server
+            && let quinn::ConnectionError::ApplicationClosed(c) = &reason
+            && c.error_code.into_inner() == close::SESSION_END as u64
+        {
+            tracing::info!(session = %hex(&self.id), "session ended by the client (close code)");
+            self.end_now();
+            return;
+        }
         self.on_carrier_death(epoch);
+    }
+
+    /// Server: destroy the session now — carrier closed with SESSION_END,
+    /// listeners, channels (processes as on channel close), rings, permits.
+    fn end_now(&self) {
+        if let Some((c, _)) = self.conn() {
+            c.close(close::SESSION_END.into(), b"session ended");
+        }
+        self.teardown();
     }
 
     fn on_carrier_death(self: &Arc<Self>, epoch: u64) {

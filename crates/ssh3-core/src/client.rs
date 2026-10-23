@@ -265,6 +265,29 @@ impl ClientSession {
         self.shared.last_contact()
     }
 
+    /// End the session on purpose (SPEC §5 "Deliberate end"): no linger on
+    /// the server. Sends SessionEnd on the event log, waits at most `bound`
+    /// for the server to confirm by closing with SESSION_END, then closes
+    /// with SESSION_END itself — which ends the session even if the event
+    /// was lost. Returns true if the server confirmed within `bound`.
+    pub async fn end(&self, bound: Duration) -> bool {
+        self.roamer.abort();
+        let confirmed = match self.shared.current_conn() {
+            Some((conn, _)) => {
+                let _ = self.shared.send_event(crate::msg::Message::SessionEnd).await;
+                let ok = matches!(
+                    tokio::time::timeout(bound, conn.closed()).await,
+                    Ok(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code.into_inner() == close::SESSION_END as u64
+                );
+                conn.close(close::SESSION_END.into(), b"session ended");
+                ok
+            }
+            None => false,
+        };
+        self.shared.teardown();
+        confirmed
+    }
+
     /// Resolves once automatic resume has given up (the session is gone).
     pub async fn gave_up(&self) {
         let mut rx = self.inner.gave_up.subscribe();

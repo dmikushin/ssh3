@@ -8,6 +8,9 @@ pub mod close {
     pub const SUPERSEDED: u32 = 3;
     pub const RESOURCE_LIMIT: u32 = 4;
     pub const INTERNAL: u32 = 5;
+    /// The client ended the session on purpose (SPEC §5): destroy it, do not
+    /// linger.
+    pub const SESSION_END: u32 = 6;
 }
 
 #[derive(Debug, thiserror::Error)]

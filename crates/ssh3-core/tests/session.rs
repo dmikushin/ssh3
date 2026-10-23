@@ -18,19 +18,14 @@ async fn client_as_me(env: &Env) -> ssh3_core::ClientSession {
     ssh3_core::ClientSession::connect(o, ssh3_core::udp_socket(ssh3_core::transport::dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap()
 }
 
-/// Sessions run `<login shell> -c command` (sshd); the login shell may be
-/// fish, so test scripts are POSIX sh wrapped in `sh -c '…'`.
-fn sh(script: &str) -> String {
-    assert!(!script.contains('\''), "keep single quotes out of test scripts");
-    format!("sh -c '{script}'")
-}
-
+/// Sessions run `<login shell> -c command` (sshd); the test login shell is
+/// /bin/sh (common::isolate_user), so scripts are POSIX sh.
 fn exec(script: &str) -> SessionSpec {
-    SessionSpec { pty: None, env: vec![], command: Command::Exec(sh(script)), forward_agent: None }
+    SessionSpec { pty: None, env: vec![], command: Command::Exec(script.into()), forward_agent: None }
 }
 
 fn exec_pty(script: &str, rows: u32, cols: u32) -> SessionSpec {
-    SessionSpec { pty: Some(PtySpec { term: "xterm".into(), cols, rows, ..Default::default() }), env: vec![], command: Command::Exec(sh(script)), forward_agent: None }
+    SessionSpec { pty: Some(PtySpec { term: "xterm".into(), cols, rows, ..Default::default() }), env: vec![], command: Command::Exec(script.into()), forward_agent: None }
 }
 
 async fn read_all(r: &mut tokio::io::DuplexStream) -> String {
@@ -194,10 +189,8 @@ async fn agent_with_key(dir: &std::path::Path) -> Agent {
     agent
 }
 
-/// Agent forwarding: through the session's forwarded socket, `ssh-add -l`
-/// lists exactly what the local agent holds. The remote command names the
-/// socket explicitly: a login shell's own config may reset SSH_AUTH_SOCK (the
-/// developer's fish config does), which sshd would not prevent either.
+/// Agent forwarding: in the remote session (SSH_AUTH_SOCK set by the
+/// server), `ssh-add -l` lists exactly what the local agent holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_forwarding_reaches_the_local_agent() {
     let env = env_with(Limits { linger: Duration::from_millis(100), idle_timeout: Duration::from_millis(300), ..fast_limits() });
@@ -206,16 +199,13 @@ async fn agent_forwarding_reaches_the_local_agent() {
     let local = String::from_utf8(local.stdout).unwrap();
     assert!(local.contains("ED25519") && local.lines().count() == 1, "{local}");
     let c = client_as_me(&env).await;
-    // Enable forwarding with a first session, then use its socket.
-    let spec = SessionSpec { forward_agent: Some(agent.sock.clone()), ..exec("true") };
-    let mut first = c.open_session(spec).await.unwrap();
-    assert_eq!(exit_of(&mut first).await, ExitInfo::Status(0));
+    let spec = SessionSpec { forward_agent: Some(agent.sock.clone()), ..exec("ssh-add -l") };
+    let mut ch = c.open_session(spec).await.unwrap();
+    assert_eq!(read_all(&mut ch.stdout).await, local);
+    assert_eq!(exit_of(&mut ch).await, ExitInfo::Status(0));
     let fwd = env.server.session(&c.session_id()).unwrap().agent_socket().expect("forwarded agent socket");
     let meta = std::fs::metadata(fwd.parent().unwrap()).unwrap();
     assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o700);
-    let mut ch = c.open_session(exec(&format!("SSH_AUTH_SOCK={} ssh-add -l", fwd.display()))).await.unwrap();
-    assert_eq!(read_all(&mut ch.stdout).await, local);
-    assert_eq!(exit_of(&mut ch).await, ExitInfo::Status(0));
     // The socket and its directory live as long as the session.
     drop(c);
     wait_until("session expired", LIMIT, || env.server.stats().sessions == 0, || format!("{:?}", env.server.stats())).await;
@@ -233,4 +223,41 @@ async fn agent_forwarding_refused_by_authorized_keys() {
         Err(e) => assert!(e.to_string().contains("no-agent-forwarding"), "{e}"),
         Ok(_) => panic!("agent forwarding was not refused"),
     }
+}
+
+/// SPEC §5 deliberate end: a finished command plus end() leaves no session
+/// on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deliberate_end_destroys_the_session() {
+    let env = env_with(fast_limits());
+    let c = client_as_me(&env).await;
+    let mut ch = c.open_session(exec("echo done")).await.unwrap();
+    assert_eq!(read_all(&mut ch.stdout).await, "done\n");
+    assert_eq!(exit_of(&mut ch).await, ExitInfo::Status(0));
+    assert!(c.end(LIMIT).await, "server did not confirm the end");
+    let st = env.server.stats();
+    assert_eq!((st.sessions, st.detached), (0, 0), "{st:?}");
+}
+
+/// The close code alone ends the session (the SessionEnd event may be lost).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_end_close_code_destroys_without_the_event() {
+    let env = env_with(fast_limits());
+    let conn = raw_conn(&env).await;
+    let (_s, _r, m) = raw_auth(&conn, &env.key, ssh3_core::msg::Intent::New).await;
+    assert!(matches!(m, ssh3_core::msg::Message::AuthOk { .. }));
+    wait_until("session exists", LIMIT, || env.server.stats().sessions == 1, || format!("{:?}", env.server.stats())).await;
+    conn.close(ssh3_core::error::close::SESSION_END.into(), b"bye");
+    wait_until("session destroyed", LIMIT, || env.server.stats().sessions == 0, || format!("{:?}", env.server.stats())).await;
+}
+
+/// An unannounced carrier death still detaches (linger), unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn carrier_death_still_detaches() {
+    let env = env_with(Limits { idle_timeout: Duration::from_millis(400), ..fast_limits() });
+    let (c, bh) = client_bh(&env).await;
+    bh.set_down(true);
+    c.carrier_lost().await;
+    wait_until("detached", LIMIT, || env.server.stats().detached == 1, || format!("{:?}", env.server.stats())).await;
+    assert_eq!(env.server.stats().sessions, 1);
 }
