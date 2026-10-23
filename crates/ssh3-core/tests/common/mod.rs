@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod blackhole;
+pub mod delay;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -239,6 +240,21 @@ pub async fn stalled_server(small_rcvbuf: bool) -> (SocketAddr, tokio::sync::mps
         }
     });
     (a, rx)
+}
+
+/// Reads and discards everything.
+pub async fn discard_server() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut s, &mut sink).await;
+            });
+        }
+    });
+    a
 }
 
 /// Reads until EOF, then answers with the byte count and SHA-256, closes.

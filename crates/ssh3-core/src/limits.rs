@@ -6,6 +6,17 @@ use std::time::Duration;
 pub struct Limits {
     // §1 transport
     pub floor_window: u64,
+    /// Connection windows are raised up to this (§1 scheduler).
+    pub conn_window_ceiling: u64,
+    /// Server-wide budget for connection windows above the floor.
+    pub conn_window_budget: u64,
+    /// The scheduler samples every max(RTT, this).
+    pub window_sample_min: Duration,
+    /// Raise after this many consecutive window-limited samples.
+    pub window_raise_after: u32,
+    /// Lower to the floor after this long below `window_lower_util_pct`.
+    pub window_lower_after: Duration,
+    pub window_lower_util_pct: u8,
     pub stream_receive_window: u64,
     pub max_bidi_streams: u32,
     pub datagram_buffer: usize,
@@ -24,7 +35,10 @@ pub struct Limits {
     /// connections waiting; more are closed at once (SPEC §5).
     pub detached_accept_max: usize,
     // §4 lane credit and budgets
-    /// Ring capacity per lane direction (cap on credit and on send ring).
+    /// Ring capacity per lane direction: the cap on one lane's credit and
+    /// send ring. It caps a single forward's throughput at lane_buffer/RTT,
+    /// so it defaults to the connection-window ceiling; memory is bounded by
+    /// the server-wide budgets, not by this cap.
     pub lane_buffer: usize,
     /// Credit every lane gets without the budget.
     pub lane_floor: u64,
@@ -56,6 +70,12 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             floor_window: 256 * 1024,
+            conn_window_ceiling: 8 * 1024 * 1024,
+            conn_window_budget: 256 * 1024 * 1024,
+            window_sample_min: Duration::from_millis(100),
+            window_raise_after: 2,
+            window_lower_after: Duration::from_secs(5),
+            window_lower_util_pct: 10,
             stream_receive_window: 8 * 1024 * 1024,
             max_bidi_streams: 64,
             datagram_buffer: 64 * 1024,
@@ -68,7 +88,7 @@ impl Default for Limits {
             connect_timeout: Duration::from_secs(10),
             max_listeners: 64,
             detached_accept_max: 8,
-            lane_buffer: 256 * 1024,
+            lane_buffer: 8 * 1024 * 1024,
             lane_floor: 16 * 1024,
             lane_credit_budget: 64 * 1024 * 1024,
             lane_send_budget: 64 * 1024 * 1024,

@@ -45,6 +45,8 @@ pub struct Budgets {
     pub send: Arc<Budget>,
     /// Floor chunks; unlimited, counted.
     pub floor: Arc<Budget>,
+    /// Connection windows above the floor (§1).
+    pub conn: Arc<Budget>,
 }
 
 impl Budgets {
@@ -53,6 +55,7 @@ impl Budgets {
             recv: Budget::new("LaneCreditBudget", l.lane_credit_budget),
             send: Budget::new("LaneSendBudget", l.lane_send_budget),
             floor: Budget::new("lane floor", u64::MAX),
+            conn: Budget::new("ConnWindowBudget", l.conn_window_budget),
         })
     }
 }
@@ -818,6 +821,87 @@ impl SessionShared {
         while conn.read_datagram().await.is_ok() {}
     }
 
+    /// §1 connection-window scheduler. Every max(RTT, window_sample_min) it
+    /// compares the bytes moved (either direction) with what the window
+    /// allows per RTT. After `window_raise_after` window-limited samples the
+    /// windows double, up to the ceiling, charged to the ConnWindowBudget
+    /// (only what the budget gives is granted). After `window_lower_after`
+    /// below `window_lower_util_pct` they drop to the floor — but credit
+    /// already granted cannot be revoked (X6), so the charge stays at the old
+    /// window until that many bytes have been received since the change.
+    async fn window_scheduler(self: Arc<Self>, conn: Connection) {
+        use crate::budget::Permit;
+        let l = self.limits.clone();
+        let floor = l.floor_window;
+        let mut window = floor;
+        let mut charge = Permit::empty(self.budgets.conn.clone()); // above the floor
+        let mut debt: Option<(u64, u64)> = None; // (old window, rx when lowered)
+        let mut streak = 0u32;
+        let mut low_since: Option<std::time::Instant> = None;
+        let st0 = conn.stats();
+        let (mut last_rx, mut last_tx) = (st0.udp_rx.bytes, st0.udp_tx.bytes);
+        let publish = |window: u64, charge: &Permit| {
+            self.stats.conn_window.store(window, Ordering::Relaxed);
+            self.stats.conn_window_charged.store(floor + charge.amount(), Ordering::Relaxed);
+        };
+        publish(window, &charge);
+        loop {
+            let rtt = conn.rtt().max(std::time::Duration::from_micros(100));
+            let period = rtt.max(l.window_sample_min);
+            tokio::time::sleep(period).await;
+            let st = conn.stats();
+            let (rx, tx) = (st.udp_rx.bytes, st.udp_tx.bytes);
+            let moved = (rx - last_rx).max(tx - last_tx);
+            (last_rx, last_tx) = (rx, tx);
+            if let Some((old, at)) = debt
+                && rx - at >= old
+            {
+                debt = None;
+                charge.set(window - floor);
+            }
+            // What the window allows in one period at this RTT.
+            let allowed = (window as f64 * period.as_secs_f64() / rtt.as_secs_f64()).max(1.0);
+            let util = moved as f64 / allowed;
+            tracing::trace!(session = %hex(&self.id), ?rtt, ?period, moved, allowed, util, window, "window sample");
+            if util >= 0.8 {
+                streak += 1;
+                low_since = None;
+            } else {
+                streak = 0;
+                if util * 100.0 < l.window_lower_util_pct as f64 {
+                    low_since.get_or_insert_with(std::time::Instant::now);
+                } else {
+                    low_since = None;
+                }
+            }
+            if streak >= l.window_raise_after && window < l.conn_window_ceiling {
+                let target = (window * 2).min(l.conn_window_ceiling);
+                if target - floor > charge.amount() {
+                    let want = target - floor - charge.amount();
+                    charge.grow_upto(want);
+                }
+                let new = target.min(floor + charge.amount());
+                if new > window {
+                    window = new;
+                    conn.set_receive_window(quinn::VarInt::from_u64(window).expect("window fits a varint"));
+                    conn.set_send_window(window);
+                    self.stats.window_raises.fetch_add(1, Ordering::Relaxed);
+                }
+                streak = 0;
+            }
+            if low_since.is_some_and(|t| t.elapsed() >= l.window_lower_after) && window > floor {
+                // Keep charging the old window until it has been read.
+                debt = Some((window, rx));
+                window = floor;
+                conn.set_receive_window(quinn::VarInt::from_u64(window).expect("window fits a varint"));
+                conn.set_send_window(window);
+                self.stats.window_lowers.fetch_add(1, Ordering::Relaxed);
+                low_since = None;
+            }
+            publish(window, &charge);
+        }
+    }
+
     async fn watch_death(self: Arc<Self>, conn: Connection, epoch: u64) {
         let reason = conn.closed().await;
         tracing::debug!(session = %hex(&self.id), epoch, "carrier closed: {reason}");
@@ -862,6 +946,7 @@ impl SessionShared {
         tasks.spawn(self.clone().acceptor(conn.clone()));
         tasks.spawn(Self::datagram_sink(conn.clone()));
         tasks.spawn(self.clone().watch_death(conn.clone(), epoch));
+        tasks.spawn(self.clone().window_scheduler(conn.clone()));
         let old = self.carrier.lock().unwrap().replace(Carrier { epoch, conn, _ctrl: tx, _tasks: tasks });
         if let Some(old) = old {
             old.conn.close(close::SUPERSEDED.into(), b"superseded by a newer carrier");

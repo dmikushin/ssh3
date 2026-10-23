@@ -78,6 +78,10 @@ pub struct ServerStats {
     /// -R listeners open, and connections they closed while detached.
     pub listeners: u64,
     pub refused_detached: u64,
+    /// §1 scheduler: ConnWindowBudget in use, raises and lowers so far.
+    pub conn_window_budget_used: u64,
+    pub window_raises: u64,
+    pub window_lowers: u64,
 }
 
 impl Server {
@@ -124,6 +128,7 @@ impl Server {
             recv_budget_used: b.recv.used(),
             send_budget_used: b.send.used(),
             floor_chunks_bytes: b.floor.used(),
+            conn_window_budget_used: b.conn.used(),
             auth_failures: c.auth_failures.load(Ordering::Relaxed),
             resumes_accepted: c.resumes_accepted.load(Ordering::Relaxed),
             resumes_rejected: c.resumes_rejected.load(Ordering::Relaxed),
@@ -139,6 +144,8 @@ impl Server {
             }
             t.channels += s.channel_count() as u64;
             t.listeners += s.listener_count() as u64;
+            t.window_raises += s.stats.window_raises.load(Ordering::Relaxed);
+            t.window_lowers += s.stats.window_lowers.load(Ordering::Relaxed);
             t.refused_detached += s.refused_detached.load(Ordering::Relaxed);
             t.send_ring_bytes += s.stats.send_ring_bytes.load(Ordering::Relaxed);
             t.recv_ring_bytes += s.stats.recv_ring_bytes.load(Ordering::Relaxed);

@@ -55,6 +55,12 @@ pub struct Stats {
     pub credit_outstanding: AtomicU64,
     pub channels: AtomicU64,
     pub lane_bytes_sent: AtomicU64,
+    /// Current connection window (§1 scheduler), what is charged for it,
+    /// and how often it was raised / lowered.
+    pub conn_window: AtomicU64,
+    pub conn_window_charged: AtomicU64,
+    pub window_raises: AtomicU64,
+    pub window_lowers: AtomicU64,
 }
 
 /// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
@@ -146,8 +152,15 @@ struct LaneState {
     received: u64,
     limit: u64,
     granted: u64,
-    want_grow: bool,
-    last_delivery: Instant,
+    /// Grant auto-tuning: start of the current epoch (in delivered bytes)
+    /// and whether the sink drained the ring empty during it.
+    epoch_start: u64,
+    epoch_emptied: bool,
+    /// Undelivered bytes have waited in the ring since this instant (set
+    /// when the ring becomes non-empty, renewed by every delivery). A sink is
+    /// stalled only if this is old while the ring is non-empty — merely not
+    /// delivering while waiting for the network is not a stall.
+    sink_progress: Instant,
     fin_offset: Option<u64>,
     sink_done: bool,
     /// Receive storage reserved (from `recv_budget`) for credit that is
@@ -212,8 +225,9 @@ impl Lane {
                 received: 0,
                 limit: floor,
                 granted: floor,
-                want_grow: false,
-                last_delivery: Instant::now(),
+                epoch_start: 0,
+                epoch_emptied: false,
+                sink_progress: Instant::now(),
                 fin_offset: None,
                 sink_done: false,
                 reserve: Permit::empty(env.recv_budget.clone()),
@@ -794,17 +808,18 @@ impl Lane {
             {
                 return Err(Error::Protocol(format!("lane {}/{}: data beyond LaneFin offset {f}", self.chan_id, self.lane)));
             }
+            let was_empty = st.rbuf.is_empty();
+            if was_empty {
+                st.sink_progress = Instant::now();
+            }
             st.rbuf.commit(tail, n);
             st.received += n as u64;
             self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
-            if st.received == st.limit {
-                // Sender is credit-limited: grow the grant if the sink keeps
-                // up, collapse it to the floor if the sink has stalled.
-                if st.last_delivery.elapsed() > self.env.ack_interval && !st.rbuf.is_empty() {
-                    st.granted = self.env.floor;
-                } else {
-                    st.want_grow = true;
-                }
+            // A sink holding bytes for longer than ack_interval is stalled:
+            // stop granting it more than the floor.
+            if !was_empty && st.sink_progress.elapsed() > self.env.ack_interval && st.granted > self.env.floor {
+                tracing::trace!(chan = self.chan_id, lane = self.lane, granted = st.granted, "grant collapsed: sink stalled");
+                st.granted = self.env.floor;
             }
             let u = self.ack_need(&mut st);
             drop(st);
@@ -850,12 +865,24 @@ impl Lane {
                     st.rbuf.drain(n as usize);
                     drop(slice);
                     st.delivered += n;
-                    st.last_delivery = Instant::now();
+                    st.sink_progress = Instant::now();
                     self.env.stats.recv_ring_bytes.fetch_sub(n, Ordering::Relaxed);
                     self.env.stats.credit_outstanding.fetch_sub(n, Ordering::Relaxed);
-                    if st.want_grow && st.rbuf.is_empty() {
-                        st.granted = (st.granted * 2).min(self.env.cap);
-                        st.want_grow = false;
+                    // Auto-tune: after each `granted` bytes delivered, if the
+                    // sink drained the ring empty at least once, it keeps up
+                    // and credit is what limits the sender — double the grant
+                    // (cap and budgets bound it). A sink-limited lane never
+                    // empties its ring. (`received == limit` is no signal:
+                    // every delivery moves the limit ahead; peak occupancy is
+                    // none either: a floor grant always arrives as one burst.)
+                    st.epoch_emptied |= st.rbuf.is_empty();
+                    if st.delivered - st.epoch_start >= st.granted {
+                        if st.epoch_emptied && st.granted < self.env.cap {
+                            st.granted = (st.granted * 2).min(self.env.cap);
+                            tracing::trace!(chan = self.chan_id, lane = self.lane, granted = st.granted, "grant grown");
+                        }
+                        st.epoch_start = st.delivered;
+                        st.epoch_emptied = false;
                     }
                     self.recompute_limit(&mut st);
                     let u = self.ack_need(&mut st);
