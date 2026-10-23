@@ -15,7 +15,10 @@ use crate::dest::{self, Uri};
 use crate::env::LocalEnv;
 use crate::expand;
 use crate::forward::{self, Connect, Listen};
-use crate::options::{Ctx, Flags, IdentitySource, LineError, Options, RequestTty, SessionType};
+use crate::options::{
+    AddressFamily, Ctx, Flags, IdentitySource, LineError, LogLevel, Options, RequestTty,
+    SessionType,
+};
 
 /// OpenSSH's optstring plus ssh3's `U:` and `u:`.
 const OPTSTRING: &str =
@@ -30,22 +33,14 @@ pub struct CommandLine {
     pub command: Vec<String>,
     /// `-F` value.
     pub config_file: Option<String>,
-    /// Number of `-v` (log level above INFO).
-    pub verbose: u8,
-    /// `-q`.
-    pub quiet: bool,
     /// `-G`: print the resolved configuration and exit.
     pub config_test: bool,
-    /// `-n` (or `-f`).
-    pub stdin_null: bool,
-    /// `-f`.
-    pub fork_after_authentication: bool,
-    /// `-g`.
-    pub gateway_ports: bool,
     /// OpenSSH options ssh3 parses but does not implement, as written
     /// (e.g. `-X`, `-c aes128-ctr`). The caller decides how to report them.
     pub unsupported: Vec<String>,
     pub(crate) user_on_commandline: bool,
+    /// Number of `-v` seen (ssh.c `debug_flag`).
+    pub(crate) debug_flag: u8,
     pub(crate) opts: Options,
 }
 
@@ -82,12 +77,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S], env: &LocalEnv) -> Result<CommandLi
         host: String::new(),
         command: Vec::new(),
         config_file: None,
-        verbose: 0,
-        quiet: false,
         config_test: false,
-        stdin_null: false,
-        fork_after_authentication: false,
-        gateway_ports: false,
+        debug_flag: 0,
         unsupported: Vec::new(),
         user_on_commandline: false,
         opts: Options::default(),
@@ -205,13 +196,31 @@ fn apply_flag(
     match c {
         '1' => return Err("SSH protocol v.1 is no longer supported".into()),
         '2' => {}
-        'n' => cl.stdin_null = true,
+        '4' => o.address_family = Some(AddressFamily::Inet),
+        '6' => o.address_family = Some(AddressFamily::Inet6),
+        'n' => o.stdin_null = Some(true),
         'f' => {
-            cl.fork_after_authentication = true;
-            cl.stdin_null = true;
+            o.fork_after_authentication = Some(true);
+            o.stdin_null = Some(true);
         }
         'G' => cl.config_test = true,
-        'g' => cl.gateway_ports = true,
+        'g' => o.gateway_ports = Some(true),
+        'b' => o.bind_address = Some(arg),
+        'B' => o.bind_interface = Some(arg),
+        'e' => {
+            let b = arg.as_bytes();
+            o.escape_char = Some(
+                if b.len() == 2 && b[0] == b'^' && (64..128).contains(&b[1]) {
+                    Some(b[1] & 31)
+                } else if b.len() == 1 {
+                    Some(b[0])
+                } else if arg == "none" {
+                    None
+                } else {
+                    return Err(format!("Bad escape character '{arg}'."));
+                },
+            );
+        }
         'P' => {
             if o.tag.is_none() {
                 o.tag = Some(arg);
@@ -251,8 +260,16 @@ fn apply_flag(
                 RequestTty::Yes
             })
         }
-        'v' => cl.verbose = (cl.verbose + 1).min(3),
-        'q' => cl.quiet = true,
+        'v' => {
+            if cl.debug_flag == 0 {
+                cl.debug_flag = 1;
+                o.log_level = Some(LogLevel::Debug1);
+            } else if o.log_level.is_some_and(|l| l < LogLevel::Debug3) {
+                cl.debug_flag += 1;
+                o.log_level = o.log_level.map(LogLevel::next);
+            }
+        }
+        'q' => o.log_level = Some(LogLevel::Quiet),
         'W' => {
             if o.stdio_forward.is_some() {
                 return Err("stdio forward already specified".into());

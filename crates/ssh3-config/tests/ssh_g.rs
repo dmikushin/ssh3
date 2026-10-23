@@ -14,6 +14,8 @@ use std::sync::Once;
 
 use ssh3_config::{LocalEnv, resolve_args};
 
+/// Every keyword ssh3 acts on must be listed here: a keyword that is acted
+/// on but not compared is invisible to this suite.
 const COMPARED: &[&str] = &[
     "host",
     "user",
@@ -39,12 +41,40 @@ const COMPARED: &[&str] = &[
     "forwardagent",
     "connecttimeout",
     "proxyjump",
+    "proxycommand",
+    "hostkeyalias",
+    "addressfamily",
+    "batchmode",
+    "clearallforwardings",
+    "gatewayports",
+    "sessiontype",
+    "stdinnull",
+    "forkafterauthentication",
+    "streamlocalbindunlink",
+    "streamlocalbindmask",
+    "connectionattempts",
+    "loglevel",
+    "bindaddress",
+    "bindinterface",
+    "globalknownhostsfile",
+    "permitremoteopen",
+    "escapechar",
 ];
 
 /// Cases where `ssh -G` must fail. Every other case must succeed, so a
 /// typo in a test config cannot turn a positive case into a vacuous
 /// "both failed" pass.
 const EXPECT_FAIL: &[&str] = &[
+    "tk-af-bad",
+    "tk-loglevel-bad",
+    "tk-esc-bad",
+    "tk-attempts-zero",
+    "tk-mask-bad",
+    "tk-pro-mixed",
+    "tk-pro-badport",
+    "tk-gkh-none-mixed",
+    "tk-e-bad",
+    "tk-f-nocmd",
     "agent-bad-env",
     "agent-unset-env",
     "alive-bad",
@@ -205,6 +235,7 @@ fn run_case(case: &Case, env: &LocalEnv) -> Option<String> {
 }
 
 fn check(cases: &[Case]) {
+    assert!(!cases.is_empty(), "an empty case list would pass vacuously");
     setup_env();
     let env = LocalEnv::from_system(22).unwrap();
     let failures: Vec<String> = cases.iter().filter_map(|c| run_case(c, &env)).collect();
@@ -622,6 +653,9 @@ fn includes() {
         case!("inc-nested", "Include @DIR@/n1\n", files: &[("n1", "Include @DIR@/n2\n"), ("n2", "Port 4006\n")], ["h"]),
         case!("inc-token", "Include @DIR@/inc-%h\n", files: &[("inc-h", "Port 4007\n")], ["h"]),
         case!("inc-env", "Include @DIR@/${SSH3_CFG_T_PORT}.conf\n", files: &[("4022.conf", "Port 4008\n")], ["h"]),
+        case!("inc-double-star", "Include @DIR@/conf/**/extra.conf\n", files: &[("conf/a/b/extra.conf", "Port 4009\n"), ("conf/a/extra.conf", "User onelevel\n")], ["h"]),
+        case!("inc-brace", "Include @DIR@/{a,b}.conf\n", files: &[("a.conf", "Port 4010\n"), ("{a,b}.conf", "User literal\n")], ["h"]),
+        case!("inc-bracket-class", "Include @DIR@/c[12].conf\n", files: &[("c2.conf", "Port 4011\n")], ["h"]),
         case!("inc-bad-file", "Include @DIR@/badinc\n", files: &[("badinc", "Port nope\n")], ["h"]),
     ]);
 }
@@ -660,4 +694,96 @@ fn generated_blocks() {
         }
     }
     check(&cases);
+}
+
+/// Keywords ssh3 acts on, beyond the first set: typed fields, first value
+/// wins, command-line flags and `-o` take precedence.
+#[test]
+fn typed_keywords() {
+    check(&[
+        case!("tk-gw", "GatewayPorts yes\n", ["h"]),
+        case!("tk-gw-g", "GatewayPorts no\n", ["-g", "h"]),
+        case!(
+            "tk-gw-o",
+            "GatewayPorts yes\n",
+            ["-o", "GatewayPorts=no", "h"]
+        ),
+        case!("tk-gw-first", "GatewayPorts no\nGatewayPorts yes\n", ["h"]),
+        case!("tk-gw-host", "Host other\n  GatewayPorts yes\n", ["h"]),
+        case!("tk-af", "AddressFamily inet6\n", ["h"]),
+        case!("tk-af-4", "AddressFamily inet6\n", ["-4", "h"]),
+        case!("tk-af-6", "", ["-6", "h"]),
+        case!("tk-af-bad", "AddressFamily ipx\n", ["h"]),
+        case!(
+            "tk-bind",
+            "BindAddress 192.0.2.1\nBindInterface eth9\n",
+            ["h"]
+        ),
+        case!(
+            "tk-bind-cli",
+            "BindAddress 192.0.2.1\n",
+            ["-b", "10.0.0.1", "-B", "wg0", "h"]
+        ),
+        case!("tk-unlink", "StreamLocalBindUnlink yes\n", ["h"]),
+        case!("tk-mask", "StreamLocalBindMask 0077\n", ["h"]),
+        case!(
+            "tk-mask-last-wins",
+            "StreamLocalBindMask 0077\nStreamLocalBindMask 0007\n",
+            ["h"]
+        ),
+        case!(
+            "tk-mask-inactive",
+            "Host other\n  StreamLocalBindMask 0111\n",
+            ["h"]
+        ),
+        case!("tk-mask-trailing", "StreamLocalBindMask 07x\n", ["h"]),
+        case!("tk-mask-bad", "StreamLocalBindMask 01000\n", ["h"]),
+        case!("tk-pro", "PermitRemoteOpen host:22 [::1]:80 *.x:*\n", ["h"]),
+        case!(
+            "tk-pro-any",
+            "PermitRemoteOpen any\nPermitRemoteOpen a:1\n",
+            ["h"]
+        ),
+        case!("tk-pro-mixed", "PermitRemoteOpen any a:1\n", ["h"]),
+        case!("tk-pro-badport", "PermitRemoteOpen a:0\n", ["h"]),
+        case!("tk-attempts", "ConnectionAttempts 3\n", ["h"]),
+        case!("tk-attempts-zero", "ConnectionAttempts 0\n", ["h"]),
+        case!("tk-batch", "BatchMode yes\n", ["h"]),
+        case!("tk-loglevel", "LogLevel debug\n", ["h"]),
+        case!("tk-loglevel-verbose", "LogLevel VERBOSE\n", ["h"]),
+        case!("tk-loglevel-bad", "LogLevel loud\n", ["h"]),
+        case!("tk-v", "LogLevel ERROR\n", ["-v", "h"]),
+        case!("tk-vvv", "", ["-vvvv", "h"]),
+        case!("tk-q", "LogLevel DEBUG3\n", ["-q", "h"]),
+        case!("tk-qv", "", ["-q", "-v", "-v", "h"]),
+        case!("tk-vq", "", ["-v", "-q", "h"]),
+        case!("tk-esc", "EscapeChar %\n", ["h"]),
+        case!("tk-esc-ctrl", "EscapeChar ^]\n", ["h"]),
+        case!("tk-esc-none", "EscapeChar none\n", ["h"]),
+        case!("tk-esc-space", "EscapeChar \" \"\n", ["h"]),
+        case!("tk-esc-backslash", "EscapeChar \\\\\n", ["h"]),
+        case!("tk-esc-bad", "EscapeChar ab\n", ["h"]),
+        case!("tk-e", "EscapeChar %\n", ["-e", "^A", "h"]),
+        case!("tk-e-none", "", ["-e", "none", "h"]),
+        case!("tk-e-bad", "", ["-e", "xy", "h"]),
+        case!("tk-gkh", "GlobalKnownHostsFile ~/gk1 /etc/gk2\n", ["h"]),
+        case!("tk-gkh-none", "GlobalKnownHostsFile none\n", ["h"]),
+        case!("tk-gkh-none-mixed", "GlobalKnownHostsFile none /x\n", ["h"]),
+        case!("tk-stdinnull", "StdinNull yes\n", ["h"]),
+        case!("tk-n", "", ["-n", "h"]),
+        case!("tk-f", "", ["-f", "h", "true"]),
+        case!("tk-f-nocmd", "", ["-f", "h"]),
+        case!("tk-f-N", "", ["-f", "-N", "h"]),
+        case!(
+            "tk-fork-kw",
+            "ForkAfterAuthentication yes\nSessionType none\n",
+            ["h"]
+        ),
+        case!("tk-sessiontype", "SessionType subsystem\n", ["h", "sftp"]),
+        case!("tk-s", "", ["-s", "h", "sftp"]),
+        case!("tk-hka", "HostKeyAlias MyAlias\n", ["h"]),
+        case!("tk-proxycommand", "ProxyCommand nc %h %p\n", ["h"]),
+        case!("tk-proxycommand-none", "ProxyCommand none\n", ["h"]),
+        case!("tk-clear", "ClearAllForwardings yes\n", ["h"]),
+    ]);
 }

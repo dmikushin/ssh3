@@ -26,8 +26,11 @@
 //! * No DNS canonicalisation: `CanonicalizeHostname` only triggers the final
 //!   configuration pass (`Match canonical` then matches in that pass).
 //! * `Match localnetwork` and `Match version` are rejected as unsupported.
-//! * Values of OpenSSH keywords ssh3 does not interpret (`Ciphers`,
-//!   `Compression`, ...) are kept in [`ClientConfig::other`] unvalidated.
+//! * Values of OpenSSH keywords ssh3 does not implement at all (cipher and
+//!   MAC lists, X11, GSSAPI, connection multiplexing, tunnels, ...) are kept
+//!   in [`ClientConfig::other`] unvalidated. Every keyword whose value ssh3
+//!   acts on has a typed field and is compared against `ssh -G` in
+//!   `tests/ssh_g.rs` (`COMPARED`).
 //! * `-D`/`DynamicForward` with a Unix-socket target and `-W port` (no host)
 //!   are rejected; OpenSSH accepts them with no useful meaning.
 //! * OpenSSH options that ssh3 does not implement (`-X`, `-c`, `-M`, ...)
@@ -48,5 +51,8 @@ pub use cli::{CommandLine, parse_args};
 pub use dest::{Hop, ProxyJump};
 pub use env::LocalEnv;
 pub use forward::{Connect, Forward, Listen};
-pub use options::{IdentitySource, RawOption, RequestTty, SessionType, StrictHostKeyChecking};
+pub use options::{
+    AddressFamily, EscapeChar, IdentitySource, LogLevel, RawOption, RequestTty, SessionType,
+    StrictHostKeyChecking,
+};
 pub use resolve::{ClientConfig, ForwardAgent, IdentityFile, resolve, resolve_args};

@@ -37,6 +37,11 @@ fn hpdelim(s: &str) -> Option<(&str, Option<&str>)> {
     Some((h, rest))
 }
 
+/// `hpdelim()` for callers outside this module: (host, optional port).
+pub(crate) fn hpdelim_colon(s: &str) -> Option<(&str, Option<&str>)> {
+    hpdelim(s)
+}
+
 /// `cleanhostname()`: strip one pair of enclosing brackets.
 pub fn cleanhostname(h: &str) -> &str {
     if h.len() >= 2 && h.starts_with('[') && h.ends_with(']') {

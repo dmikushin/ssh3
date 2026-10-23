@@ -83,6 +83,111 @@ pub enum Canonicalize {
     Always,
 }
 
+/// `AddressFamily` / `-4` / `-6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Any,
+    Inet,
+    Inet6,
+}
+
+impl AddressFamily {
+    pub fn dump(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Inet => "inet",
+            Self::Inet6 => "inet6",
+        }
+    }
+}
+
+/// `LogLevel` / `-q` / `-v` (log.c `log_levels[]`, in severity order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Quiet,
+    Fatal,
+    Error,
+    Info,
+    Verbose,
+    Debug1,
+    Debug2,
+    Debug3,
+}
+
+impl LogLevel {
+    /// `log_level_name()`: the first name in the table, so DEBUG1 prints
+    /// as `DEBUG`.
+    pub fn dump(self) -> &'static str {
+        match self {
+            Self::Quiet => "QUIET",
+            Self::Fatal => "FATAL",
+            Self::Error => "ERROR",
+            Self::Info => "INFO",
+            Self::Verbose => "VERBOSE",
+            Self::Debug1 => "DEBUG",
+            Self::Debug2 => "DEBUG2",
+            Self::Debug3 => "DEBUG3",
+        }
+    }
+
+    /// `log_level_number()`, case-insensitive; `DEBUG` = `DEBUG1`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_uppercase().as_str() {
+            "QUIET" => Self::Quiet,
+            "FATAL" => Self::Fatal,
+            "ERROR" => Self::Error,
+            "INFO" => Self::Info,
+            "VERBOSE" => Self::Verbose,
+            "DEBUG" | "DEBUG1" => Self::Debug1,
+            "DEBUG2" => Self::Debug2,
+            "DEBUG3" => Self::Debug3,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Quiet => Self::Fatal,
+            Self::Fatal => Self::Error,
+            Self::Error => Self::Info,
+            Self::Info => Self::Verbose,
+            Self::Verbose => Self::Debug1,
+            Self::Debug1 => Self::Debug2,
+            Self::Debug2 | Self::Debug3 => Self::Debug3,
+        }
+    }
+}
+
+/// `EscapeChar` / `-e`: a byte, or `none`.
+pub type EscapeChar = Option<u8>;
+
+/// Parse an `EscapeChar` value as readconf.c does: `none`, one character,
+/// or `^X` with X in 64..128.
+pub(crate) fn parse_escape_keyword(arg: &str) -> Option<EscapeChar> {
+    let b = arg.as_bytes();
+    if arg == "none" {
+        Some(None)
+    } else if b.len() == 1 {
+        Some(Some(b[0]))
+    } else if b.len() == 2 && b[0] == b'^' && (64..128).contains(&b[1]) {
+        Some(Some(b[1] & 31))
+    } else {
+        None
+    }
+}
+
+/// `vis(buf, c, VIS_WHITE, 0)` as `ssh -G` prints the escape character.
+pub fn dump_escape_char(c: EscapeChar) -> String {
+    match c {
+        None => "none".into(),
+        Some(b'\\') => "\\\\".into(),
+        Some(b' ') => "\\040".into(),
+        Some(c) if c < 0x20 => format!("\\^{}", (c + 64) as char),
+        Some(0x7f) => "\\^?".into(),
+        Some(c) => (c as char).to_string(),
+    }
+}
+
 /// Which source added an identity file. OpenSSH de-duplicates identity
 /// files only within the same source class (`identity_file_userprovided`:
 /// 0 = system config/default, 1 = `-i`, 2 = user config/`-o`).
@@ -142,6 +247,21 @@ pub(crate) struct Options {
     pub remote_command: Option<String>,
     /// `-W host:port`.
     pub stdio_forward: Option<(String, u16)>,
+    pub gateway_ports: Option<bool>,
+    pub address_family: Option<AddressFamily>,
+    pub bind_address: Option<String>,
+    pub bind_interface: Option<String>,
+    pub streamlocal_bind_unlink: Option<bool>,
+    pub streamlocal_bind_mask: Option<u32>,
+    /// `PermitRemoteOpen` entries as written (`None` = unset = any).
+    pub permit_remote_open: Option<Vec<String>>,
+    pub connection_attempts: Option<u32>,
+    pub batch_mode: Option<bool>,
+    pub log_level: Option<LogLevel>,
+    pub escape_char: Option<EscapeChar>,
+    pub global_known_hosts_files: Vec<String>,
+    pub stdin_null: Option<bool>,
+    pub fork_after_authentication: Option<bool>,
     pub other: Vec<RawOption>,
     pub unknown: Vec<RawOption>,
     pub warnings: Vec<String>,
@@ -225,6 +345,20 @@ const HANDLED: &[(&str, &str)] = &[
     ("host", "host"),
     ("match", "match"),
     ("include", "include"),
+    ("gatewayports", "gatewayports"),
+    ("addressfamily", "addressfamily"),
+    ("bindaddress", "bindaddress"),
+    ("bindinterface", "bindinterface"),
+    ("streamlocalbindunlink", "streamlocalbindunlink"),
+    ("streamlocalbindmask", "streamlocalbindmask"),
+    ("permitremoteopen", "permitremoteopen"),
+    ("connectionattempts", "connectionattempts"),
+    ("batchmode", "batchmode"),
+    ("loglevel", "loglevel"),
+    ("escapechar", "escapechar"),
+    ("globalknownhostsfile", "globalknownhostsfile"),
+    ("stdinnull", "stdinnull"),
+    ("forkafterauthentication", "forkafterauthentication"),
     // ssh3 extensions (UDP forwarding).
     ("localudpforward", "localudpforward"),
     ("remoteudpforward", "remoteudpforward"),
@@ -241,7 +375,6 @@ const OTHER: &[&str] = &[
     "forwardx11trusted",
     "forwardx11timeout",
     "xauthlocation",
-    "gatewayports",
     "passwordauthentication",
     "kbdinteractiveauthentication",
     "kbdinteractivedevices",
@@ -255,29 +388,20 @@ const OTHER: &[&str] = &[
     "addkeystoagent",
     "ciphers",
     "macs",
-    "permitremoteopen",
-    "escapechar",
-    "globalknownhostsfile",
-    "connectionattempts",
-    "batchmode",
     "checkhostip",
     "compression",
     "tcpkeepalive",
     "keepalive",
     "numberofpasswordprompts",
     "syslogfacility",
-    "loglevel",
     "logverbose",
     "preferredauthentications",
     "hostkeyalgorithms",
     "casignaturealgorithms",
-    "bindaddress",
-    "bindinterface",
     "enablesshkeysign",
     "verifyhostkeydns",
     "nohostauthenticationforlocalhost",
     "rekeylimit",
-    "addressfamily",
     "controlpath",
     "controlmaster",
     "controlpersist",
@@ -288,15 +412,11 @@ const OTHER: &[&str] = &[
     "visualhostkey",
     "kexalgorithms",
     "ipqos",
-    "stdinnull",
-    "forkafterauthentication",
     "proxyusefdpass",
     "canonicaldomains",
     "canonicalizefallbacklocal",
     "canonicalizemaxdots",
     "canonicalizepermittedcnames",
-    "streamlocalbindmask",
-    "streamlocalbindunlink",
     "revokedhostkeys",
     "fingerprinthash",
     "updatehostkeys",
@@ -663,10 +783,122 @@ impl Options {
                     }
                 }
             }
+            "addressfamily" => {
+                let arg = next(&mut args);
+                let v = match arg.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("inet") => AddressFamily::Inet,
+                    Some("inet6") => AddressFamily::Inet6,
+                    Some("any") => AddressFamily::Any,
+                    _ => {
+                        return bad(format!(
+                            "unsupported option \"{}\".",
+                            arg.unwrap_or_default()
+                        ));
+                    }
+                };
+                set_if_unset!(self.address_family, v);
+            }
+            "loglevel" => {
+                let arg = next(&mut args);
+                let Some(v) = arg.as_deref().and_then(LogLevel::parse) else {
+                    return bad(format!(
+                        "unsupported log level '{}'",
+                        arg.unwrap_or_else(|| "<NONE>".into())
+                    ));
+                };
+                set_if_unset!(self.log_level, v);
+            }
+            "escapechar" => {
+                let Some(arg) = next(&mut args).filter(|a| !a.is_empty()) else {
+                    return bad("Missing argument.".into());
+                };
+                let Some(v) = parse_escape_keyword(&arg) else {
+                    return bad("Bad escape character.".into());
+                };
+                set_if_unset!(self.escape_char, v);
+            }
+            "connectionattempts" => {
+                let arg = next(&mut args);
+                match atoi_err(arg.as_deref()) {
+                    Ok(v) => set_if_unset!(self.connection_attempts, v),
+                    Err(e) => return bad(format!("integer value {e}.")),
+                }
+            }
+            "streamlocalbindmask" => {
+                let Some(arg) = next(&mut args).filter(|a| !a.is_empty()) else {
+                    return bad("Missing StreamLocalBindMask argument.".into());
+                };
+                // strtol(arg, &end, 8): leading octal digits; the rest of the
+                // string is ignored, as in readconf.c.
+                let t = arg.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let (neg, t) = match t.as_bytes().first() {
+                    Some(b'-') => (true, &t[1..]),
+                    Some(b'+') => (false, &t[1..]),
+                    _ => (false, t),
+                };
+                let digits: String = t.chars().take_while(|c| ('0'..='7').contains(c)).collect();
+                let value = if digits.is_empty() {
+                    None
+                } else {
+                    u64::from_str_radix(&digits, 8)
+                        .ok()
+                        .filter(|v| !neg && *v <= 0o777)
+                };
+                let Some(v) = value else {
+                    return bad("Bad mask.".into());
+                };
+                // readconf.c assigns unconditionally: no first-value-wins
+                // and no Host/Match gating for this keyword.
+                self.streamlocal_bind_mask = Some(v as u32);
+            }
+            "permitremoteopen" => {
+                let found = self.permit_remote_open.is_none();
+                let mut strs: Vec<String> = Vec::new();
+                while let Some(arg) = next(&mut args) {
+                    if arg.eq_ignore_ascii_case("none") || arg.eq_ignore_ascii_case("any") {
+                        if !strs.is_empty() || !args.is_empty() {
+                            return bad(format!(
+                                "keyword {keyword} \"{arg}\" argument must appear alone."
+                            ));
+                        }
+                    } else {
+                        // hpdelim(): host (possibly [bracketed]) then ':' port.
+                        let Some((_host, port)) = dest::hpdelim_colon(&arg) else {
+                            return Err(LineError::Fatal(format!(
+                                "{filename} line {linenum}: missing host in permitremoteopen"
+                            )));
+                        };
+                        let ok = match port {
+                            Some("*") => true,
+                            Some(p) => a2port(p).is_some_and(|v| v > 0),
+                            None => false,
+                        };
+                        if !ok {
+                            return Err(LineError::Fatal(format!(
+                                "{filename} line {linenum}: bad port number in permitremoteopen"
+                            )));
+                        }
+                    }
+                    strs.push(arg);
+                }
+                if strs.is_empty() {
+                    return Err(LineError::Fatal(format!(
+                        "{filename} line {linenum}: missing permitremoteopen specification"
+                    )));
+                }
+                if found && *active {
+                    self.permit_remote_open = Some(strs);
+                }
+            }
             "exitonforwardfailure"
             | "identitiesonly"
             | "hashknownhosts"
-            | "clearallforwardings" => {
+            | "clearallforwardings"
+            | "gatewayports"
+            | "streamlocalbindunlink"
+            | "batchmode"
+            | "stdinnull"
+            | "forkafterauthentication" => {
                 let arg = next(&mut args);
                 let Some(v) = arg.as_deref().and_then(flag_value) else {
                     return bad(format!(
@@ -678,6 +910,11 @@ impl Options {
                     "exitonforwardfailure" => set_if_unset!(self.exit_on_forward_failure, v),
                     "identitiesonly" => set_if_unset!(self.identities_only, v),
                     "hashknownhosts" => set_if_unset!(self.hash_known_hosts, v),
+                    "gatewayports" => set_if_unset!(self.gateway_ports, v),
+                    "streamlocalbindunlink" => set_if_unset!(self.streamlocal_bind_unlink, v),
+                    "batchmode" => set_if_unset!(self.batch_mode, v),
+                    "stdinnull" => set_if_unset!(self.stdin_null, v),
+                    "forkafterauthentication" => set_if_unset!(self.fork_after_authentication, v),
                     _ => set_if_unset!(self.clear_all_forwardings, v),
                 }
             }
@@ -734,7 +971,8 @@ impl Options {
                     self.add_identity_file(arg, src).or_else(&bad)?;
                 }
             }
-            "user" | "hostname" | "hostkeyalias" | "tag" | "ignoreunknown" => {
+            "user" | "hostname" | "hostkeyalias" | "tag" | "ignoreunknown" | "bindaddress"
+            | "bindinterface" => {
                 let Some(arg) = next(&mut args).filter(|a| !a.is_empty()) else {
                     return bad("Missing argument.".into());
                 };
@@ -743,11 +981,18 @@ impl Options {
                     "hostname" => set_if_unset!(self.hostname, arg),
                     "hostkeyalias" => set_if_unset!(self.host_key_alias, arg),
                     "tag" => set_if_unset!(self.tag, arg),
+                    "bindaddress" => set_if_unset!(self.bind_address, arg),
+                    "bindinterface" => set_if_unset!(self.bind_interface, arg),
                     _ => set_if_unset!(self.ignore_unknown, arg),
                 }
             }
-            "userknownhostsfile" => {
-                let was_empty = self.user_known_hosts_files.is_empty();
+            "userknownhostsfile" | "globalknownhostsfile" => {
+                let list = if canon == "userknownhostsfile" {
+                    &mut self.user_known_hosts_files
+                } else {
+                    &mut self.global_known_hosts_files
+                };
+                let was_empty = list.is_empty();
                 let mut i = 0;
                 while let Some(arg) = next(&mut args) {
                     if arg.is_empty() {
@@ -760,10 +1005,10 @@ impl Options {
                     }
                     i += 1;
                     if *active && was_empty {
-                        if self.user_known_hosts_files.len() >= MAX_HOSTS_FILES {
+                        if list.len() >= MAX_HOSTS_FILES {
                             return bad(format!("too many {keyword} entries."));
                         }
-                        self.user_known_hosts_files.push(arg);
+                        list.push(arg);
                     }
                 }
             }
@@ -1206,19 +1451,19 @@ impl Options {
             } else {
                 p
             };
-            let pattern = expand::tilde(&anchored, ctx.env)
-                .map_err(|e| LineError::Fatal(format!("{filename} line {linenum}: {e}")))?;
-            let paths: Vec<_> = match glob::glob(&pattern) {
-                Ok(g) => g.filter_map(Result::ok).collect(),
+            // readconf.c: glob(arg2, GLOB_TILDE, NULL, &gl). POSIX glob(3)
+            // does its own `~` expansion and has no recursive `**` and no
+            // brace expansion, so the C library is called directly.
+            let paths = match posix_glob_tilde(&anchored) {
+                Ok(p) => p,
                 Err(e) => {
                     return Err(LineError::Bad(format!(
-                        "{filename} line {linenum}: glob failed for {pattern}: {e}"
+                        "{filename} line {linenum}: glob failed for {anchored}: {e}"
                     )));
                 }
             };
             let oactive = *active;
             for path in paths {
-                let path = path.to_string_lossy().into_owned();
                 let sub = Flags {
                     checkperm: true,
                     nevermatch: flags.nevermatch || !oactive,
@@ -1283,6 +1528,34 @@ impl Options {
             )));
         }
         Ok(true)
+    }
+}
+
+/// `glob(pattern, GLOB_TILDE, NULL, &gl)` from the C library, as
+/// readconf.c calls it. Returns the sorted matches; no match is an empty
+/// list (GLOB_NOMATCH).
+fn posix_glob_tilde(pattern: &str) -> Result<Vec<String>, String> {
+    let cpat = std::ffi::CString::new(pattern).map_err(|_| "pattern contains NUL".to_string())?;
+    // SAFETY: glob_t is plain data that glob() initialises; we pass a valid
+    // NUL-terminated pattern and no error callback, read gl_pathv only for
+    // gl_pathc entries, and always release it with globfree().
+    unsafe {
+        let mut gl: libc::glob_t = std::mem::zeroed();
+        let r = libc::glob(cpat.as_ptr(), libc::GLOB_TILDE, None, &mut gl);
+        let result = match r {
+            0 => {
+                let mut v = Vec::with_capacity(gl.gl_pathc);
+                for i in 0..gl.gl_pathc {
+                    let p = *gl.gl_pathv.add(i);
+                    v.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+                }
+                Ok(v)
+            }
+            libc::GLOB_NOMATCH => Ok(Vec::new()),
+            other => Err(format!("glob() returned {other}")),
+        };
+        libc::globfree(&mut gl);
+        result
     }
 }
 

@@ -13,8 +13,9 @@ use crate::env::LocalEnv;
 use crate::expand;
 use crate::forward::{Connect, Forward};
 use crate::options::{
-    Canonicalize, Ctx, Flags, IdentitySource, LineError, Options, RawOption, RequestTty,
-    SYSTEM_CONFIG, SessionType, StrictHostKeyChecking,
+    AddressFamily, Canonicalize, Ctx, EscapeChar, Flags, IdentitySource, LineError, LogLevel,
+    Options, RawOption, RequestTty, SYSTEM_CONFIG, SessionType, StrictHostKeyChecking,
+    dump_escape_char,
 };
 
 /// An identity file as configured.
@@ -84,12 +85,26 @@ pub struct ClientConfig {
     pub config_remote_command: Option<String>,
     pub host_key_alias: Option<String>,
     pub tag: Option<String>,
-    pub verbose: u8,
-    pub quiet: bool,
+    pub log_level: LogLevel,
     pub config_test: bool,
     pub stdin_null: bool,
     pub fork_after_authentication: bool,
+    /// Allow remote hosts to connect to local forwarded ports (`-g`).
     pub gateway_ports: bool,
+    pub address_family: AddressFamily,
+    pub bind_address: Option<String>,
+    pub bind_interface: Option<String>,
+    pub streamlocal_bind_unlink: bool,
+    pub streamlocal_bind_mask: u32,
+    /// `PermitRemoteOpen` entries as written; empty = any.
+    pub permit_remote_open: Vec<String>,
+    pub connection_attempts: u32,
+    pub batch_mode: bool,
+    /// `None` = no escape character.
+    pub escape_char: EscapeChar,
+    /// `~`-expanded; empty for `GlobalKnownHostsFile none`.
+    pub global_known_hosts_files: Vec<String>,
+    pub clear_all_forwardings: bool,
     pub unsupported_flags: Vec<String>,
     /// Known OpenSSH keywords ssh3 does not interpret, as written.
     pub other: Vec<RawOption>,
@@ -101,6 +116,8 @@ pub struct ClientConfig {
     /// Local and dynamic forwards in their original combined order, for
     /// `ssh -G` output.
     local_all: Vec<Forward>,
+    /// `GlobalKnownHostsFile` as written, for `ssh -G` output.
+    global_known_hosts_raw: Vec<String>,
 }
 
 /// `ssh_connection_hash()`: SHA-1 of thishost, host, port, user, jumphost.
@@ -228,7 +245,8 @@ pub fn resolve(mut cl: CommandLine, env: &LocalEnv) -> Result<ClientConfig, Stri
     // fill_default_options()
     let stdio = o.stdio_forward.is_some();
     let exit_on_forward_failure = o.exit_on_forward_failure.unwrap_or(stdio);
-    if o.clear_all_forwardings.unwrap_or(stdio) {
+    let clear_all_forwardings = o.clear_all_forwardings.unwrap_or(stdio);
+    if clear_all_forwardings {
         o.local_forwards.clear();
         o.remote_forwards.clear();
         o.local_udp_forwards.clear();
@@ -246,6 +264,12 @@ pub fn resolve(mut cl: CommandLine, env: &LocalEnv) -> Result<ClientConfig, Stri
             o.identity_files
                 .push((format!("~/.ssh/{f}"), IdentitySource::Default));
         }
+    }
+    if o.global_known_hosts_files.is_empty() {
+        o.global_known_hosts_files = vec![
+            "/etc/ssh/ssh_known_hosts".into(),
+            "/etc/ssh/ssh_known_hosts2".into(),
+        ];
     }
     if o.user_known_hosts_files.is_empty() {
         o.user_known_hosts_files = vec!["~/.ssh/known_hosts".into(), "~/.ssh/known_hosts2".into()];
@@ -289,7 +313,12 @@ pub fn resolve(mut cl: CommandLine, env: &LocalEnv) -> Result<ClientConfig, Stri
     if !command.is_empty() && o.remote_command.is_some() {
         return Err("Cannot execute command-line and remote command.".into());
     }
-    if cl.fork_after_authentication
+    let connection_attempts = o.connection_attempts.unwrap_or(1);
+    if connection_attempts == 0 {
+        return Err("Invalid number of ConnectionAttempts".into());
+    }
+    let fork_after_authentication = o.fork_after_authentication.unwrap_or(false);
+    if fork_after_authentication
         && command.is_empty()
         && o.remote_command.is_none()
         && o.session_type != Some(SessionType::None)
@@ -346,6 +375,27 @@ pub fn resolve(mut cl: CommandLine, env: &LocalEnv) -> Result<ClientConfig, Stri
         (None, true) => ForwardAgent::Yes,
         (None, false) => ForwardAgent::No,
     };
+    // GlobalKnownHostsFile: "none" alone means no file; only ~ expansion
+    // (ssh.c tilde_expand_paths), after `ssh -G` prints the raw values.
+    let global_known_hosts_raw = o.global_known_hosts_files.clone();
+    let global_known_hosts_files = if o.global_known_hosts_files[0].eq_ignore_ascii_case("none") {
+        if o.global_known_hosts_files.len() > 1 {
+            return Err(
+                "Invalid GlobalKnownHostsFiles: \"none\" appears with other entries".into(),
+            );
+        }
+        Vec::new()
+    } else {
+        o.global_known_hosts_files
+            .iter()
+            .map(|f| expand::tilde(f, env))
+            .collect::<Result<_, _>>()?
+    };
+    if o.user_known_hosts_files[0].eq_ignore_ascii_case("none")
+        && o.user_known_hosts_files.len() > 1
+    {
+        return Err("Invalid UserKnownHostsFiles: \"none\" appears with other entries".into());
+    }
     let user_known_hosts_files = if o.user_known_hosts_files[0].eq_ignore_ascii_case("none") {
         Vec::new()
     } else {
@@ -449,18 +499,29 @@ pub fn resolve(mut cl: CommandLine, env: &LocalEnv) -> Result<ClientConfig, Stri
         config_remote_command,
         host_key_alias,
         tag: o.tag,
-        verbose: cl.verbose,
-        quiet: cl.quiet,
+        log_level: o.log_level.unwrap_or(LogLevel::Info),
         config_test: cl.config_test,
-        stdin_null: cl.stdin_null,
-        fork_after_authentication: cl.fork_after_authentication,
-        gateway_ports: cl.gateway_ports,
+        stdin_null: o.stdin_null.unwrap_or(false),
+        fork_after_authentication,
+        gateway_ports: o.gateway_ports.unwrap_or(false),
+        address_family: o.address_family.unwrap_or(AddressFamily::Any),
+        bind_address: o.bind_address,
+        bind_interface: o.bind_interface,
+        streamlocal_bind_unlink: o.streamlocal_bind_unlink.unwrap_or(false),
+        streamlocal_bind_mask: o.streamlocal_bind_mask.unwrap_or(0o177),
+        permit_remote_open: o.permit_remote_open.unwrap_or_default(),
+        connection_attempts,
+        batch_mode: o.batch_mode.unwrap_or(false),
+        escape_char: o.escape_char.unwrap_or(Some(b'~')),
+        global_known_hosts_files,
+        clear_all_forwardings,
         unsupported_flags: cl.unsupported,
         other: o.other,
         unknown: o.unknown,
         warnings: o.warnings,
         jump_dump,
         local_all,
+        global_known_hosts_raw,
     })
 }
 
@@ -498,6 +559,52 @@ impl ClientConfig {
         line("user", &self.user);
         line("hostname", &self.hostname);
         line("port", &self.port.to_string());
+        line("addressfamily", self.address_family.dump());
+        line("batchmode", yes_no(self.batch_mode));
+        line("clearallforwardings", yes_no(self.clear_all_forwardings));
+        line("gatewayports", yes_no(self.gateway_ports));
+        line(
+            "sessiontype",
+            match self.session_type {
+                SessionType::Default => "default",
+                SessionType::None => "none",
+                SessionType::Subsystem => "subsystem",
+            },
+        );
+        line("stdinnull", yes_no(self.stdin_null));
+        line(
+            "forkafterauthentication",
+            yes_no(self.fork_after_authentication),
+        );
+        line(
+            "streamlocalbindunlink",
+            yes_no(self.streamlocal_bind_unlink),
+        );
+        line("connectionattempts", &self.connection_attempts.to_string());
+        line("loglevel", self.log_level.dump());
+        if let Some(b) = &self.bind_address {
+            line("bindaddress", b);
+        }
+        if let Some(b) = &self.bind_interface {
+            line("bindinterface", b);
+        }
+        if let Some(a) = &self.host_key_alias {
+            line("hostkeyalias", a);
+        }
+        line(
+            "globalknownhostsfile",
+            &self.global_known_hosts_raw.join(" "),
+        );
+        if self.permit_remote_open.is_empty() {
+            line("permitremoteopen", "any");
+        } else {
+            line("permitremoteopen", &self.permit_remote_open.join(" "));
+        }
+        line("escapechar", &dump_escape_char(self.escape_char));
+        line(
+            "streamlocalbindmask",
+            &format!("0{:o}", self.streamlocal_bind_mask),
+        );
         line("exitonforwardfailure", yes_no(self.exit_on_forward_failure));
         line("hashknownhosts", yes_no(self.hash_known_hosts));
         line("identitiesonly", yes_no(self.identities_only));
