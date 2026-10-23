@@ -326,6 +326,19 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   - Output produced in screen mode is lost except for its effect on the
     screen — the same trade mosh makes (that period's scrollback is lost).
   TCP forwards and non-pty exec never use screen mode: byte-exact or nothing.
+- **Deliberate end vs. carrier loss.** Linger exists only for carrier
+  *loss*. A client that ends on purpose — its last session channel exited
+  and nothing else (forward, -N) keeps it, or it received SIGINT/SIGTERM/
+  SIGHUP, or the user typed the escape to quit — sends `SessionEnd` on the
+  event log, waits (bounded) for its delivery, then closes the connection.
+  The server destroys the session at once: listeners closed, rings and
+  permits freed, processes treated as on channel close (§ session
+  semantics). A server that sees a client close the connection with the
+  application close code `SESSION_END` does the same even if the event was
+  lost. Only an unannounced carrier death detaches. *(Coordinator smoke test
+  at f604db2: after two finished `ssh3 host cmd` runs the server still held
+  2 detached sessions, each for the 12 h linger — the Go-ssh3 leak class
+  again.)*
 - **Session lifetime.** Sessions with at least one pty channel default to
   no linger limit (as mosh: alive until the process exits or an explicit
   timeout); others use `SessionLinger`. Both configurable.
