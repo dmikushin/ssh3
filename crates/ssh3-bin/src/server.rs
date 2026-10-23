@@ -129,7 +129,10 @@ fn run(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     rt.block_on(async move {
         let socket = dual_stack_socket(cfg.listen).map_err(|e| format!("listen {}: {e}", cfg.listen))?;
-        let server = Server::bind(ServerOptions { tls, authenticator, limits, keys }, socket).map_err(|e| e.to_string())?;
+        // Session channels with sshd defaults until the config file grows
+        // session settings (AcceptEnv, Subsystem, SetEnv).
+        let session = Some(ssh3_core::ServerSessionEnv::new(ssh3_session::SessionConfig::default()));
+        let server = Server::bind(ServerOptions { tls, authenticator, limits, keys, session }, socket).map_err(|e| e.to_string())?;
         println!("ssh3-server: listening on {}", server.local_addr());
         let _ = std::io::stdout().flush();
         let server = Arc::new(server);
