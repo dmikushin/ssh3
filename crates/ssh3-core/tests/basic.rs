@@ -490,3 +490,18 @@ async fn several_keys_on_one_connection() {
         other => panic!("expected an auth error, got {:?}", other.err()),
     }
 }
+
+/// R7: connection counters — accepted (cumulative), active (open now).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_counters() {
+    let env = env_with(fast_limits());
+    let c1 = env.client().await;
+    let stranger = user_key(97);
+    let _ = ClientSession::connect(env.opts(&stranger), udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await;
+    wait_until("refused connection closed", Duration::from_secs(5), || env.server.stats().conns_active == 1, || format!("{:?}", env.server.stats())).await;
+    let st = env.server.stats();
+    assert_eq!((st.conns_accepted, st.conns_active, st.auth_failures), (2, 1, 1), "{st:?}");
+    assert!(c1.end(Duration::from_secs(5)).await);
+    wait_until("all closed", Duration::from_secs(5), || env.server.stats().conns_active == 0, || format!("{:?}", env.server.stats())).await;
+    assert_eq!(env.server.stats().conns_accepted, 2);
+}

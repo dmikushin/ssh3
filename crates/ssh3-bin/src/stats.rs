@@ -7,6 +7,8 @@ use ssh3_core::ServerStats;
 
 pub fn to_json(s: &ServerStats) -> Value {
     let ServerStats {
+        conns_accepted,
+        conns_active,
         sessions,
         attached,
         detached,
@@ -36,6 +38,8 @@ pub fn to_json(s: &ServerStats) -> Value {
         retract_timeouts,
     } = *s;
     json!({
+        "conns_accepted": conns_accepted,
+        "conns_active": conns_active,
         "sessions": sessions,
         "attached": attached,
         "detached": detached,

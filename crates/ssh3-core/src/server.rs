@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, TokioRuntime};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TokioRuntime};
 use rand::RngCore;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -28,6 +28,8 @@ pub struct ServerOptions {
 
 #[derive(Default)]
 struct Counters {
+    conns_accepted: AtomicU64,
+    conns_active: AtomicU64,
     auth_failures: AtomicU64,
     resumes_accepted: AtomicU64,
     resumes_rejected: AtomicU64,
@@ -60,6 +62,12 @@ impl Drop for Server {
 /// Snapshot of every counter a test or operator waits on (SPEC §8 I6).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ServerStats {
+    /// QUIC connections: accepted for a handshake (cumulative), currently
+    /// open (handshaking, authenticating or attached), and refused at accept
+    /// because `max_unauthenticated` handshakes were in progress
+    /// (`refused_unauth_cap`, cumulative). Auth refusals: `auth_failures`.
+    pub conns_accepted: u64,
+    pub conns_active: u64,
     pub sessions: usize,
     pub attached: usize,
     pub detached: usize,
@@ -82,6 +90,8 @@ pub struct ServerStats {
     pub recv_budget_used: u64,
     pub send_budget_used: u64,
     pub floor_chunks_bytes: u64,
+    /// Auth attempts refused (each AuthFail), plus connections that did not
+    /// authenticate within LoginGraceTime (cumulative).
     pub auth_failures: u64,
     pub resumes_accepted: u64,
     pub resumes_rejected: u64,
@@ -163,6 +173,8 @@ impl Server {
         let c = &self.shared.counters;
         let b = &self.shared.budgets;
         let mut t = ServerStats {
+            conns_accepted: c.conns_accepted.load(Ordering::Relaxed),
+            conns_active: c.conns_active.load(Ordering::Relaxed),
             sessions: all.len(),
             recv_budget_used: b.recv.used(),
             send_budget_used: b.send.used(),
@@ -211,11 +223,25 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<ServerShared>) {
             continue;
         };
         let shared = shared.clone();
+        shared.counters.conns_accepted.fetch_add(1, Ordering::Relaxed);
+        shared.counters.conns_active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let peer = incoming.remote_address();
-            if let Err(e) = handle(incoming, shared, permit).await {
-                tracing::info!(%peer, "connection ended: {e}");
+            let counters = shared.clone();
+            // Active until the QUIC connection is closed, however it ends.
+            match incoming.accept() {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => {
+                        if let Err(e) = handle(conn.clone(), shared, permit).await {
+                            tracing::info!(%peer, "connection ended: {e}");
+                        }
+                        conn.closed().await;
+                    }
+                    Err(e) => tracing::info!(%peer, "handshake failed: {e}"),
+                },
+                Err(e) => tracing::info!(%peer, "connection not accepted: {e}"),
             }
+            counters.counters.conns_active.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -225,8 +251,7 @@ enum Authed {
     Resume { user: String, key: Vec<u8>, authz: Authz, session_id: SessionId, lanes: Vec<LanePos> },
 }
 
-async fn handle(incoming: Incoming, shared: Arc<ServerShared>, permit: OwnedSemaphorePermit) -> Result<()> {
-    let conn = incoming.accept()?.await?;
+async fn handle(conn: Connection, shared: Arc<ServerShared>, permit: OwnedSemaphorePermit) -> Result<()> {
     let grace = shared.limits.login_grace;
     let pre = tokio::time::timeout(grace, pre_auth(&conn, &shared)).await;
     drop(permit);

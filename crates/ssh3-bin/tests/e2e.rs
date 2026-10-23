@@ -743,5 +743,8 @@ fn several_keys_on_one_connection() {
     assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
     assert_eq!(o.stdout, b"ok\n");
     assert_eq!(seen.lock().unwrap().len(), 1, "client connections through the relay");
-    assert_eq!(env.stats()["auth_failures"], 1, "the first key must have been offered and refused");
+    // The server agrees: one connection, the first key refused on it.
+    let st = env.stats();
+    assert_eq!(st["conns_accepted"], 1, "{st}");
+    assert_eq!(st["auth_failures"], 1, "the first key must have been offered and refused");
 }
