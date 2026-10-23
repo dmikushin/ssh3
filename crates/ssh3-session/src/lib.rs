@@ -6,11 +6,11 @@
 //! halves, window-change / signal control, and the exit outcome. It knows
 //! nothing about the transport; ssh3-core connects these streams to lanes.
 //!
-//! Process lifetime is owned: dropping a [`SessionProcess`] hangs up and then
-//! kills the whole process group and reaps the leader (no orphans, no
-//! zombies). The leader is reaped only after the group has been signalled, so
-//! its pid — which is also the process-group id — cannot be reused by an
-//! unrelated process while it is still a signal target.
+//! Session end follows sshd exactly: dropping a [`SessionProcess`] signals
+//! nothing. With a pty, closing the master hangs up the terminal and the
+//! kernel delivers SIGHUP; without one, the pipes close. `nohup cmd &`
+//! survives in both modes. The leader is reaped when it exits (no zombies),
+//! and Drop never blocks.
 
 mod env;
 mod process;
@@ -19,7 +19,6 @@ mod user;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub use env::match_pattern;
 pub use process::{Exit, SessionProcess};
@@ -117,8 +116,6 @@ pub struct SessionConfig {
     pub superuser_path: String,
     /// MAIL is `<mail_dir>/<user>`.
     pub mail_dir: String,
-    /// On drop: SIGHUP to the process group, then SIGKILL after this grace.
-    pub drop_grace: Duration,
 }
 
 impl Default for SessionConfig {
@@ -131,7 +128,6 @@ impl Default for SessionConfig {
             default_path: "/usr/bin:/bin:/usr/sbin:/sbin".into(),
             superuser_path: "/usr/bin:/bin:/usr/sbin:/sbin".into(),
             mail_dir: "/var/mail".into(),
-            drop_grace: Duration::from_secs(1),
         }
     }
 }

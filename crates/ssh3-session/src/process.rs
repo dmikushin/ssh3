@@ -7,7 +7,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -27,8 +26,8 @@ pub enum Exit {
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 type Reader = Box<dyn AsyncRead + Send + Unpin>;
 
-/// A running session process. Dropping it hangs up and kills the process
-/// group and reaps the leader.
+/// A running session process. Dropping it ends the session the way sshd
+/// does — see the `Drop` impl — and reaps the leader once it exits.
 pub struct SessionProcess {
     pid: libc::pid_t,
     pidfd: Option<AsyncFd<OwnedFd>>,
@@ -40,7 +39,6 @@ pub struct SessionProcess {
     stderr: Option<Reader>,
     /// Why signals are refused (forced command / subsystem), as OpenSSH.
     signal_refusal: Option<&'static str>,
-    drop_grace: Duration,
 }
 
 /// Values the child needs between fork and exec, prepared in the parent so
@@ -210,7 +208,9 @@ pub(crate) fn spawn(cfg: &SessionConfig, req: &SessionRequest) -> Result<Session
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if pidfd == -1 {
         let e = io::Error::last_os_error();
+        // Untrackable child of a failed spawn: stop it and reap it.
         unsafe { libc::kill(pid, libc::SIGKILL) };
+        reap_in_background(pid);
         return Err(Error::Os("pidfd_open".into(), e));
     }
     // SAFETY: an OwnedFd keeps its descriptor open and unchanged for the
@@ -230,7 +230,6 @@ pub(crate) fn spawn(cfg: &SessionConfig, req: &SessionRequest) -> Result<Session
         stdout: None,
         stderr: None,
         signal_refusal: refusal,
-        drop_grace: cfg.drop_grace,
     };
     match pty {
         Some(p) => {
@@ -346,53 +345,40 @@ impl SessionProcess {
     }
 }
 
-/// SIGKILL the process group and the leader itself, then reap the leader on
-/// a short-lived thread. Never blocks the caller: Drop and runtime shutdown
-/// stay non-blocking. The leader is killed directly as well, so its death —
-/// and therefore the reap — does not depend on it still leading the group.
-fn kill_and_reap(pid: libc::pid_t) {
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let _ = std::thread::Builder::new().name(format!("ssh3-reap-{pid}")).spawn(move || {
-        let _ = waitid(pid, 0);
-    });
-}
-
-/// Escalates to [`kill_and_reap`] when dropped: at the end of the grace
-/// period, or when the grace task is cancelled (runtime shutdown).
-struct Escalate(libc::pid_t);
-
-impl Drop for Escalate {
-    fn drop(&mut self) {
-        kill_and_reap(self.0);
+/// Reap the leader whenever it exits, without blocking the caller. One
+/// small thread per still-running leader; it holds no signal power over the
+/// process, so pid reuse cannot make it harm anyone.
+fn reap_in_background(pid: libc::pid_t) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("ssh3-reap-{pid}"))
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let _ = waitid(pid, 0);
+        });
+    if let Err(e) = spawned {
+        // The leader stays a zombie until the server exits; say so.
+        eprintln!("ssh3-session: cannot start reaper thread for pid {pid}: {e}");
     }
 }
 
+/// Session end with OpenSSH semantics (session.c `session_close_by_channel`,
+/// `session_pty_cleanup2`): nothing is signalled. Dropping the pty master
+/// (when the last of this value and its reader/writer halves is gone) hangs
+/// up the terminal, and the kernel delivers SIGHUP to the terminal's session
+/// as for any hangup; without a pty the pipes close and the program sees EOF
+/// / EPIPE. Processes that ignore SIGHUP (`nohup cmd &`) outlive the session.
 impl Drop for SessionProcess {
     fn drop(&mut self) {
         let pid = self.pid;
         if self.pidfd.take().is_none() {
             return;
         }
-        // The leader is not reaped yet, so the process group id cannot have
-        // been reused: signalling it reaches only this session's processes.
-        // The leader is reaped only after SIGKILL has been sent.
-        unsafe { libc::killpg(pid, libc::SIGHUP) };
-        let escalate = Escalate(pid);
-        let leader_exited = self.exit.is_some() || matches!(waitid(pid, libc::WNOHANG | libc::WNOWAIT), Ok(Some(_)));
-        if leader_exited {
-            // The session is over: no grace for leftover group members.
-            return; // `escalate` drops here
+        let exited = self.exit.is_some() || matches!(waitid(pid, libc::WNOHANG | libc::WNOWAIT), Ok(Some(_)));
+        if exited {
+            // Already a zombie: reaping cannot block.
+            let _ = waitid(pid, libc::WNOHANG);
+        } else {
+            reap_in_background(pid);
         }
-        let grace = self.drop_grace;
-        if let Ok(h) = tokio::runtime::Handle::try_current() {
-            h.spawn(async move {
-                let _escalate = escalate;
-                tokio::time::sleep(grace).await;
-            });
-        }
-        // Without a runtime `escalate` drops here: immediate SIGKILL.
     }
 }

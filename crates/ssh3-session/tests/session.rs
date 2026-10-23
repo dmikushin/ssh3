@@ -3,7 +3,6 @@
 //! (`unshare --map-root-user --map-auto`), see `root_path_*`.
 
 use std::collections::HashMap;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,7 +10,6 @@ use ssh3_session::{
     ConnectionInfo, Error, Exit, Kind, PtyRequest, SessionConfig, SessionProcess, SessionRequest, UserRecord,
     WindowSize, spawn,
 };
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 fn me() -> UserRecord {
@@ -363,117 +361,134 @@ async fn cannot_start_session_for_another_user_without_privileges() {
 }
 
 
-fn pidfd(pid: i32) -> AsyncFd<OwnedFd> {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-    assert!(fd >= 0, "pidfd_open({pid}): {}", std::io::Error::last_os_error());
-    unsafe { AsyncFd::register_with_interest(OwnedFd::from_raw_fd(fd), tokio::io::Interest::READABLE) }
-        .map_err(|e| e.into_parts().1)
-        .unwrap()
-}
+/// A background process the test itself started (pid printed by the
+/// child as `$!`); killed by that pid when the test ends, pass or fail.
+struct Leftover(i32);
 
-/// Wait (bounded) until the process behind `fd` has exited; SIGKILL delivery
-/// is asynchronous, so "signalled" is not yet "dead".
-async fn exited_within(fd: &AsyncFd<OwnedFd>, pid: i32, limit: Duration) {
-    if tokio::time::timeout(limit, fd.readable()).await.is_err() {
-        panic!("pid {pid} still running {limit:?} after the session was dropped");
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
     }
 }
 
-fn group_members(pgid: u32) -> Vec<i32> {
-    let mut v = Vec::new();
-    for e in std::fs::read_dir("/proc").unwrap().flatten() {
-        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
-        // Fields after the parenthesised comm: state ppid pgrp ...
-        let rest = &stat[stat.rfind(')').unwrap() + 2..];
-        let f: Vec<&str> = rest.split(' ').collect();
-        if f[2].parse::<u32>() == Ok(pgid) && f[0] != "Z" {
-            v.push(pid);
+fn running(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => &stat[stat.rfind(')').unwrap() + 2..stat.rfind(')').unwrap() + 3] != "Z",
+        Err(_) => false,
+    }
+}
+
+/// Value of `key=<pid>` in the child's output.
+fn pid_of(out: &str, key: &str) -> i32 {
+    let tag = format!("{key}=");
+    let line = out.lines().find(|l| l.trim_end_matches('\r').starts_with(&tag)).unwrap_or_else(|| panic!("no {tag} in {out:?}"));
+    line.trim_end_matches('\r')[tag.len()..].parse().unwrap()
+}
+
+/// Per-test marker file in the target's scratch dir (not /tmp).
+fn marker(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ssh3-session-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// Poll (2 ms) for `path` to contain a line; fails after LIMIT naming it.
+fn file_within(path: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && s.ends_with('\n')
+        {
+            return s;
         }
+        assert!(std::time::Instant::now() < deadline, "{} not written within {LIMIT:?}", path.display());
+        std::thread::sleep(Duration::from_millis(2));
     }
-    v
+}
+
+/// End the session as the channel layer does: drop the process and all of
+/// its stream halves.
+fn end_session(p: SessionProcess, halves: Vec<Box<dyn std::any::Any>>) {
+    drop(halves);
+    drop(p);
 }
 
 #[tokio::test]
-async fn drop_kills_the_whole_process_group_and_reaps_the_leader() {
-    let cfg = SessionConfig { drop_grace: Duration::from_millis(50), ..Default::default() };
-    // Background children that ignore SIGHUP must still die (SIGKILL after
-    // the grace period).
-    let r = exec("trap '' HUP; sleep 1000 & sleep 1000 & echo ready; wait");
-    let mut p: SessionProcess = spawn(&cfg, &r).expect("spawn");
-    let pid = p.pid();
+async fn without_pty_session_end_signals_nothing_and_children_survive() {
+    let mut p = spawn(
+        &SessionConfig::default(),
+        &exec("nohup sleep 1000 >/dev/null 2>&1 & echo nohup=$!; sleep 1000 >/dev/null 2>&1 & echo plain=$!; echo ready; cat"),
+    )
+    .expect("spawn");
+    let leader = p.pid();
     let mut out = p.take_stdout().unwrap();
     let mut acc = String::new();
     read_until(&mut *out, &mut acc, "ready\n").await;
-    let members = group_members(pid);
-    assert!(members.len() >= 3, "leader + 2 sleeps, got {members:?}");
-    let fds: Vec<AsyncFd<OwnedFd>> = members
-        .iter()
-        .map(|&m| {
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, m, 0) } as i32;
-            assert!(fd >= 0, "pidfd_open({m})");
-            unsafe { AsyncFd::register_with_interest(OwnedFd::from_raw_fd(fd), tokio::io::Interest::READABLE) }
-                .map_err(|e| e.into_parts().1)
-                .unwrap()
-        })
-        .collect();
-    drop(p);
-    // Bounded: grace (50 ms) + a generous margin; on expiry the test fails
-    // naming the survivors instead of hanging.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    for (fd, m) in fds.iter().zip(&members) {
-        if tokio::time::timeout_at(deadline, fd.readable()).await.is_err() {
-            panic!("pid {m} of group {pid} still alive 2 s after drop; survivors {:?}", group_members(pid));
-        }
-    }
-    assert!(group_members(pid).is_empty(), "group members survive: {:?}", group_members(pid));
-    reaped_within(pid);
+    let (nohup, plain) = (Leftover(pid_of(&acc, "nohup")), Leftover(pid_of(&acc, "plain")));
+    let halves: Vec<Box<dyn std::any::Any>> = vec![Box::new(out), Box::new(p.take_stdin()), Box::new(p.take_stderr())];
+    end_session(p, halves);
+    // stdin closed → cat sees EOF → the shell exits and is reaped.
+    reaped_within(leader);
+    assert!(running(nohup.0), "nohup child {} was killed at session end", nohup.0);
+    assert!(running(plain.0), "background child {} was killed at session end (sshd signals nothing without a pty)", plain.0);
 }
 
 #[tokio::test]
-async fn drop_after_exit_kills_leftovers_and_reaps() {
-    // No zombie and no group member may outlive the SessionProcess.
-    let mut p = spawn(&SessionConfig::default(), &exec("sleep 1000 & echo ready")).expect("spawn");
-    let pid = p.pid();
-    drop(p.take_stdin());
+async fn without_pty_closed_stdin_is_eof_for_the_child() {
+    let f = marker("eof");
+    let mut p = spawn(&SessionConfig::default(), &exec(&format!("cat >/dev/null; echo eof-seen > {}", f.display()))).expect("spawn");
+    let leader = p.pid();
+    let halves: Vec<Box<dyn std::any::Any>> = vec![Box::new(p.take_stdin()), Box::new(p.take_stdout()), Box::new(p.take_stderr())];
+    end_session(p, halves);
+    assert_eq!(file_within(&f), "eof-seen\n");
+    reaped_within(leader);
+}
+
+#[tokio::test]
+async fn pty_session_end_hangs_up_the_terminal_and_nohup_survives() {
+    let leader_hup = marker("leader-hup");
+    let child_hup = marker("child-hup");
+    let script = format!(
+        "trap 'echo leader-hup > {lh}; exit 0' HUP; \
+         nohup sleep 1000 >/dev/null 2>&1 & echo nohup=$!; \
+         sh -c 'trap \"echo child-hup > {ch}; exit 0\" HUP; while :; do sleep 0.01; done' & echo child=$!; \
+         echo ready; while :; do sleep 0.01; done",
+        lh = leader_hup.display(),
+        ch = child_hup.display()
+    );
+    let mut r = exec(&script);
+    r.pty = pty(80, 24, Vec::new());
+    let mut p = spawn(&SessionConfig::default(), &r).expect("spawn");
+    let leader = p.pid();
+    let mut out = p.take_stdout().unwrap();
+    let mut acc = String::new();
+    read_until(&mut *out, &mut acc, "ready\r\n").await;
+    let nohup = Leftover(pid_of(&acc, "nohup"));
+    let child = Leftover(pid_of(&acc, "child"));
+    let halves: Vec<Box<dyn std::any::Any>> = vec![Box::new(out), Box::new(p.take_stdin())];
+    end_session(p, halves); // last reference to the master: hangup
+    assert_eq!(file_within(&leader_hup), "leader-hup\n", "session leader not hung up");
+    assert_eq!(file_within(&child_hup), "child-hup\n", "interactive child {} not hung up", child.0);
+    reaped_within(leader);
+    assert!(running(nohup.0), "nohup child {} did not survive the hangup", nohup.0);
+}
+
+#[tokio::test]
+async fn drop_while_running_does_not_block_and_leader_is_reaped_later() {
+    let mut p = spawn(&SessionConfig::default(), &exec("echo ready; read x")).expect("spawn");
+    let leader = p.pid();
     let mut out = p.take_stdout().unwrap();
     let mut acc = String::new();
     read_until(&mut *out, &mut acc, "ready\n").await;
-    assert_eq!(wait_exit(&mut p).await, Exit::Status(0));
-    let bg: Vec<i32> = group_members(pid);
-    assert_eq!(bg.len(), 1, "the background sleep, leader is a zombie: {bg:?}");
-    let bg_fd = pidfd(bg[0]);
-    drop(p);
-    // The background member was sent SIGKILL by the drop; it is reaped by its
-    // new parent, so check that it exits.
-    exited_within(&bg_fd, bg[0], Duration::from_secs(2)).await;
-    reaped_within(pid);
-}
-
-#[test]
-fn runtime_shutdown_during_grace_still_kills_and_reaps() {
-    let (pid, member_fd, member) = {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let cfg = SessionConfig { drop_grace: Duration::from_secs(3600), ..Default::default() };
-            let mut p = spawn(&cfg, &exec("trap '' HUP; sleep 1000 & echo ready; wait")).expect("spawn");
-            let mut out = p.take_stdout().unwrap();
-            let mut acc = String::new();
-            read_until(&mut *out, &mut acc, "ready\n").await;
-            let pid = p.pid();
-            let member = *group_members(pid).iter().find(|&&m| m as u32 != pid).unwrap();
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, member, 0) } as i32;
-            assert!(fd >= 0);
-            drop(p); // grace task scheduled with a 1 h grace
-            (pid, unsafe { OwnedFd::from_raw_fd(fd) }, member)
-        })
-        // runtime dropped here: the grace task is cancelled
-    };
-    // A pidfd polls readable once the process has exited.
-    let mut pfd = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&member_fd), events: libc::POLLIN, revents: 0 };
-    let n = unsafe { libc::poll(&mut pfd, 1, 2000) };
-    assert_eq!(n, 1, "member {member} still running 2 s after runtime shutdown");
-    reaped_within(pid);
+    let mut stdin = p.take_stdin().unwrap();
+    let t = std::time::Instant::now();
+    drop(p); // leader still blocked in `read`
+    assert!(t.elapsed() < Duration::from_millis(100), "drop blocked for {:?}", t.elapsed());
+    assert!(running(leader as i32), "drop must not signal the leader");
+    stdin.write_all(b"go\n").await.unwrap(); // let it finish on its own
+    reaped_within(leader);
 }
 
 // ---- root path, inside an unprivileged user namespace ----------------------
@@ -489,7 +504,7 @@ fn root_path_in_user_namespace() {
     let script = "mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts \
         && mount --bind /dev/pts/ptmx /dev/ptmx \
         && exec \"$0\" --exact root_path_inner --ignored --nocapture --test-threads=1";
-    let log = std::env::temp_dir().join(format!("ssh3-session-userns-{}.log", std::process::id()));
+    let log = marker("userns.log");
     let mut child = std::process::Command::new("unshare")
         .args(["--map-root-user", "--map-auto", "--mount", "sh", "-c", script])
         .arg(&exe)
