@@ -10,3 +10,11 @@ rust-version = "1.94"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Invariant I2 (SPEC.md §8) requires a panic to be caught at the connection /
+# channel task boundary and to kill only that task. `panic = "abort"` would
+# turn any single malformed peer into a whole-server outage, so it is stated
+# explicitly here rather than left to the default.
+panic = "unwind"
+# Keep line tables in the shipped binary: crashes on oracle are diagnosed from
+# backtraces there, and stripping them has repeatedly cost a rebuild.
+debug = "line-tables-only"
