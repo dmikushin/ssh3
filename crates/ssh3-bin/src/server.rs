@@ -37,12 +37,10 @@ use crate::stats;
 
 const DEFAULT_CONFIG: &str = "/etc/ssh3/ssh3-server.toml";
 
-/// Time given to the QUIC endpoint to put the CONNECTION_CLOSE frames queued
-/// by `Server::shutdown` on the wire before the runtime is dropped. A
-/// workaround: ssh3-core's `Server` exposes no `wait_idle()` (requested on
-/// the project board). Without it clients would learn of the shutdown only
-/// by idle timeout.
-const CLOSE_FLUSH: Duration = Duration::from_millis(100);
+/// Upper bound on waiting for the endpoint to go idle after shutdown (the
+/// CONNECTION_CLOSE frames reach the clients, so they learn of the shutdown
+/// at once instead of by idle timeout).
+const CLOSE_BOUND: Duration = Duration::from_secs(1);
 
 struct Args {
     config: PathBuf,
@@ -129,9 +127,7 @@ fn run(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     rt.block_on(async move {
         let socket = dual_stack_socket(cfg.listen).map_err(|e| format!("listen {}: {e}", cfg.listen))?;
-        // Session channels with sshd defaults until the config file grows
-        // session settings (AcceptEnv, Subsystem, SetEnv).
-        let session = Some(ssh3_core::ServerSessionEnv::new(ssh3_session::SessionConfig::default()));
+        let session = Some(ssh3_core::ServerSessionEnv::new(cfg.session()));
         let server = Server::bind(ServerOptions { tls, authenticator, limits, keys, session }, socket).map_err(|e| e.to_string())?;
         println!("ssh3-server: listening on {}", server.local_addr());
         let _ = std::io::stdout().flush();
@@ -154,14 +150,15 @@ fn run(args: Args) -> Result<(), String> {
             }
         }
         tracing::info!("shutting down");
-        server.shutdown();
+        if !server.shutdown_and_wait(CLOSE_BOUND).await {
+            tracing::warn!("endpoint not idle within {CLOSE_BOUND:?} after shutdown; exiting anyway");
+        }
         if let Some(t) = stats_task {
             t.abort();
         }
         if let Some(p) = &cfg.stats_socket {
             let _ = std::fs::remove_file(p);
         }
-        tokio::time::sleep(CLOSE_FLUSH).await;
         Ok(())
     })
 }

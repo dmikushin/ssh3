@@ -7,3 +7,4 @@ pub mod duration;
 pub mod server;
 pub mod server_config;
 pub mod stats;
+pub mod tty;

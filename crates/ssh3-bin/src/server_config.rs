@@ -15,6 +15,11 @@
 //!                                                  # relative paths are relative to %h
 //! stats_socket = "/run/ssh3/stats.sock"     # optional; one JSON object per connection
 //!
+//! [session]                                 # sshd_config analogues, all optional
+//! accept_env = ["LANG", "LC_*"]             # AcceptEnv
+//! set_env = { EDITOR = "vi" }               # SetEnv
+//! subsystems = { sftp = "/usr/lib/ssh/sftp-server" }
+//!
 //! [limits]                                  # every field of ssh3_core::Limits, optional
 //! idle_timeout = "30s"
 //! linger = "12h"
@@ -42,6 +47,8 @@ pub struct ServerConfig {
     pub authorized_keys: String,
     pub stats_socket: Option<PathBuf>,
     #[serde(default)]
+    pub session: SessionOverrides,
+    #[serde(default)]
     pub limits: LimitsOverrides,
 }
 
@@ -65,6 +72,10 @@ impl ServerConfig {
         self.limits.apply(Limits::default())
     }
 
+    pub fn session(&self) -> ssh3_session::SessionConfig {
+        self.session.apply(ssh3_session::SessionConfig::default())
+    }
+
     /// The authorized_keys path for a user, sshd-style: `%h`, `%u`, `%%`;
     /// a relative result is taken relative to the home directory.
     pub fn authorized_keys_for(&self, user: &str, home: &Path) -> Result<PathBuf, String> {
@@ -85,6 +96,35 @@ impl ServerConfig {
         }
         let p = PathBuf::from(out);
         Ok(if p.is_absolute() { p } else { home.join(p) })
+    }
+}
+
+/// Every field of [`ssh3_session::SessionConfig`], each optional; built
+/// exhaustively like [`LimitsOverrides`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOverrides {
+    accept_env: Option<Vec<String>>,
+    max_client_env: Option<usize>,
+    set_env: Option<std::collections::BTreeMap<String, String>>,
+    subsystems: Option<std::collections::HashMap<String, String>>,
+    default_path: Option<String>,
+    superuser_path: Option<String>,
+    mail_dir: Option<String>,
+}
+
+impl SessionOverrides {
+    pub fn apply(&self, d: ssh3_session::SessionConfig) -> ssh3_session::SessionConfig {
+        let ssh3_session::SessionConfig { accept_env, max_client_env, set_env, subsystems, default_path, superuser_path, mail_dir } = d;
+        ssh3_session::SessionConfig {
+            accept_env: self.accept_env.clone().unwrap_or(accept_env),
+            max_client_env: self.max_client_env.unwrap_or(max_client_env),
+            set_env: self.set_env.as_ref().map_or(set_env, |m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            subsystems: self.subsystems.clone().unwrap_or(subsystems),
+            default_path: self.default_path.clone().unwrap_or(default_path),
+            superuser_path: self.superuser_path.clone().unwrap_or(superuser_path),
+            mail_dir: self.mail_dir.clone().unwrap_or(mail_dir),
+        }
     }
 }
 
@@ -248,6 +288,15 @@ mod tests {
         assert_eq!(l.linger, Duration::ZERO);
         assert_eq!(l.probe_interval, None);
         assert_eq!(l.max_channels, 7);
+    }
+
+    #[test]
+    fn session_section() {
+        let c = ServerConfig::parse(&format!("{MIN}[session]\naccept_env = [\"LANG\", \"LC_*\"]\nset_env = {{ EDITOR = \"vi\" }}\nsubsystems = {{ sftp = \"/usr/lib/ssh/sftp-server\" }}\n")).unwrap();
+        let s = c.session();
+        assert!(s.accepts_env("LC_ALL") && !s.accepts_env("PATH"));
+        assert_eq!(s.set_env, vec![("EDITOR".to_string(), "vi".to_string())]);
+        assert_eq!(s.subsystems["sftp"], "/usr/lib/ssh/sftp-server");
     }
 
     #[test]
