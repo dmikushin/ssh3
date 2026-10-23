@@ -60,7 +60,7 @@ pub fn roundtrip(name: &str, cols: u16, rows: u16, a_bytes: &[u8], b_prefix: &[u
     b.feed(b_prefix);
     b.feed(&r);
     let sa = a.snapshot();
-    if !sa.layout_reproducible() {
+    if sa.irreproducible().is_some() {
         return; // see `Snapshot::layout_reproducible`
     }
     let rep = sa.rep_reproducible();

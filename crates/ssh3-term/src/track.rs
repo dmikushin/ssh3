@@ -247,6 +247,14 @@ impl Handler for Tracked<'_> {
             if cell.zerowidth().is_some_and(|z| z.len() >= MAX_ZEROWIDTH) {
                 return;
             }
+            // On a spacer (a leading spacer, or one a scroll or move put
+            // under the cursor without its wide character) no terminal
+            // draws it, and alacritty would keep it as hidden state that
+            // shows up once the cell stops being a spacer (measured, seed
+            // 401 in tests/history.rs). Not stored.
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                return;
+            }
         }
         if self.term.mode().contains(TermMode::INSERT) {
             let before = self.term.grid().cursor.point.line.0 as usize;

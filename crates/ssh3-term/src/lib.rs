@@ -224,9 +224,7 @@ impl Screen {
     /// seen so far. Never longer than [`max_resync_len`] for the current
     /// size.
     pub fn resync(&self) -> Vec<u8> {
-        let mut out = resync::resync(&self.term, &self.extra);
-        out.extend_from_slice(self.seq.held());
-        out
+        resync::resync(&self.term, &self.extra, self.seq.held())
     }
 
     /// Full comparable state, for verification.

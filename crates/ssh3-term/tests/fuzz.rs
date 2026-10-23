@@ -90,7 +90,7 @@ fn check(cols: u16, rows: u16, a: &Parts, b_prefix: &[u8], suffix: &[u8]) {
     sb.feed(b_prefix);
     sb.feed(&rs);
     let snap = sa.snapshot();
-    if !snap.layout_reproducible() {
+    if snap.irreproducible().is_some() {
         return; // see `Snapshot::layout_reproducible`
     }
     let rep = snap.rep_reproducible();

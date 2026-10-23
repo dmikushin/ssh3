@@ -195,7 +195,7 @@ impl Snapshot {
         ok(&self.cells, &self.cursor)
             && ok(&self.cells, &self.saved_cursor)
             && main_ok
-            && self.cursor_reachable()
+
             && self.saved_wrap_restorable()
             && !self.narrow_bottom_wrap()
     }
@@ -231,8 +231,22 @@ impl Snapshot {
     /// In origin mode the cursor can only be placed inside the scroll region
     /// or above it (`Redraw::goto_in`); a restored saved cursor can leave it
     /// below.
-    fn cursor_reachable(&self) -> bool {
+    pub fn cursor_reachable(&self) -> bool {
         !self.mode.contains(TermMode::ORIGIN) || (self.cursor.point.line.0 as usize) < self.scroll_region.1
+    }
+
+    /// Why no redraw can reproduce this state, if none can: the round-trip
+    /// tests check such states only for a redraw that stays total (no panic,
+    /// within its bound). Partial gaps (a pending wrap, the REP character)
+    /// are left out of [`Self::diff`] instead.
+    pub fn irreproducible(&self) -> Option<&'static str> {
+        if !self.layout_reproducible() {
+            return Some("a wide character without spacer before a wide character or a wrapped end");
+        }
+        if !self.cursor_reachable() {
+            return Some("cursor below the scroll region in origin mode (only DECRC puts it there)");
+        }
+        None
     }
 
     /// Whether the redraw can reproduce every row's layout. Not when a wide

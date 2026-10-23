@@ -84,15 +84,81 @@ pub fn max_resync_len(columns: u16, lines: u16) -> usize {
     cells + rows + fixed
 }
 
-pub(crate) fn resync(term: &T, extra: &Extra) -> Vec<u8> {
-    let full = Redraw::new(true).run(term, extra);
+/// The redraw, followed by `held` (the parser's partial sequence). Never
+/// longer than [`max_resync_len`], and never allocates more than its own
+/// length while being made: a first pass only counts bytes (deciding
+/// whether per-cell hyperlinks fit within the bound), the second writes
+/// into a buffer of exactly that size. A buffer grown by doubling instead
+/// held up to 1.5x the bound during a reallocation (measured: 1.36 MB peak
+/// for an 837 KB bound at 80x24), and building the redraw with links before
+/// checking the bound held 33.7 MB at 120x40.
+pub(crate) fn resync(term: &T, extra: &Extra, held: &[u8]) -> Vec<u8> {
     let max = max_resync_len(term.columns() as u16, term.screen_lines() as u16);
-    if full.len() <= max {
-        return full;
+    let limit = max - crate::seq::MAX_PENDING;
+    let count = |links| {
+        let out = Redraw::new(links, Out::counter(limit)).run(term, extra);
+        (!out.overflow).then_some(out.len)
+    };
+    let (links, len) = match count(true) {
+        Some(n) => (true, n),
+        // Without hyperlinks every part is within the bound by construction;
+        // `None` would mean the bound is wrong.
+        None => (false, count(false).expect("redraw without links within its bound")),
+    };
+    let out = Out::writer(len + held.len());
+    let mut out = Redraw::new(links, out).run(term, extra).buf;
+    debug_assert_eq!(out.len(), len, "both passes write the same bytes");
+    out.extend_from_slice(held);
+    out
+}
+
+/// Output of a redraw pass: counts bytes up to `limit` (a write that would
+/// pass it sets `overflow`), and stores them when made by [`Out::writer`],
+/// whose buffer is allocated once with the exact size.
+struct Out {
+    buf: Vec<u8>,
+    store: bool,
+    len: usize,
+    limit: usize,
+    overflow: bool,
+}
+
+impl Out {
+    fn counter(limit: usize) -> Self {
+        Out { buf: Vec::new(), store: false, len: 0, limit, overflow: false }
     }
-    let plain = Redraw::new(false).run(term, extra);
-    debug_assert!(plain.len() <= max, "resync {} > bound {}", plain.len(), max);
-    plain
+
+    fn writer(capacity: usize) -> Self {
+        Out { buf: Vec::with_capacity(capacity), store: true, len: 0, limit: usize::MAX, overflow: false }
+    }
+
+    fn extend_from_slice(&mut self, b: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        if self.len + b.len() > self.limit {
+            self.overflow = true;
+            return;
+        }
+        self.len += b.len();
+        if self.store {
+            self.buf.extend_from_slice(b);
+        }
+    }
+
+    fn push(&mut self, b: u8) {
+        self.extend_from_slice(&[b]);
+    }
+}
+
+impl Write for Out {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -119,7 +185,7 @@ impl Attrs {
 }
 
 struct Redraw {
-    out: Vec<u8>,
+    out: Out,
     /// End of the scroll region while origin mode positioning is in use.
     region_end: usize,
     attrs: Attrs,
@@ -128,11 +194,11 @@ struct Redraw {
 }
 
 impl Redraw {
-    fn new(cell_links: bool) -> Self {
-        Redraw { out: Vec::new(), region_end: 0, attrs: Attrs::default(), link: None, cell_links }
+    fn new(cell_links: bool, out: Out) -> Self {
+        Redraw { out, region_end: 0, attrs: Attrs::default(), link: None, cell_links }
     }
 
-    fn run(mut self, term: &T, extra: &Extra) -> Vec<u8> {
+    fn run(mut self, term: &T, extra: &Extra) -> Out {
         let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let active = term.grid();
         self.out.extend_from_slice(PROLOGUE);
@@ -262,18 +328,22 @@ impl Redraw {
     /// the region cannot be reached in origin mode (only DECRC puts the
     /// cursor there); see `Snapshot::cursor_reproducible`.
     fn goto_in(&mut self, origin: Option<usize>, line: usize, col: usize) {
-        match origin {
-            None => self.goto(line, col),
-            Some(top) if line >= top && line < self.region_end => self.goto(line - top, col),
-            Some(top) => {
-                // CUP 1 lands on min(top, region end - 1) in an empty
-                // region at the bottom; it is never below `line` here.
-                self.goto(0, col);
-                let p0 = top.min(self.region_end - 1);
-                if p0 != line {
-                    let _ = write!(self.out, "\x1b[{}A", p0 + top - line);
-                }
-            },
+        let Some(top) = origin else {
+            return self.goto(line, col);
+        };
+        // In origin mode `goto` clamps to the region's last line; a line
+        // below it is out of reach (`Snapshot::wrap_reproducible`), the
+        // nearest one is used.
+        let last = self.region_end.max(1) - 1;
+        let line = line.min(last);
+        if line >= top {
+            return self.goto(line - top, col);
+        }
+        // CUP 1 lands on min(top, last); it is never above `line` here.
+        self.goto(0, col);
+        let p0 = top.min(last);
+        if p0 > line {
+            let _ = write!(self.out, "\x1b[{}A", p0 + top - line);
         }
     }
 
@@ -496,8 +566,11 @@ impl Redraw {
                 // Not at the end of a wrapping row (handled above): a
                 // blank left by a resize, drawn as one.
                 self.at(l, c, &mut pos);
-                let mut blank = cell.clone();
+                // Combining characters on a spacer are not kept (snapshot.rs).
+                let mut blank = Cell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags, extra: None };
                 blank.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+                blank.set_underline_color(cell.underline_color());
+                blank.set_hyperlink(cell.hyperlink());
                 self.put(&blank);
                 pos = c + 1;
                 continue;
@@ -702,21 +775,29 @@ impl Redraw {
         }
         let bottom = line + 1 == lines;
         let next = if bottom { line } else { line + 1 };
-        // The cursor is still where the saved one was; the region that keeps
-        // a bottom-row wrap on its row is set without moving it: DECSTBM
-        // moves the cursor, so the region is set first and the cursor
-        // restored from the slot just saved.
+        // The slot holds this cursor (callers save it first), so the cursor
+        // may move and come back with DECRC: the cells the extra character
+        // lands on are erased first (writing over a wide character in
+        // columns 0..2 would drop a leading spacer above, term/mod.rs:
+        // 1004-1008), and for the bottom row the region that keeps the wrap
+        // on its row is set (DECSTBM moves the cursor too).
+        let row = &g[Line(next as i32)];
+        let width = erase_width(row, keep_end(row));
         if bottom {
-            let _ = write!(self.out, "\x1b[{};{}r\x1b8", lines + 1, lines + 2);
+            let _ = write!(self.out, "\x1b[{};{}r", lines + 1, lines + 2);
         }
+        self.goto(next, 0);
+        let _ = write!(self.out, "\x1b[{width}X\x1b8");
+        // DECRC brought back the cursor's renditions and charsets.
+        self.attrs = Attrs::of(&cur.template);
+        self.link = cur.template.hyperlink();
         self.out.push(b' ');
         if bottom {
             self.out.extend_from_slice(b"\x1b[r");
         }
-        let limit = keep_end(&g[Line(next as i32)]);
+        self.charsets_ascii();
+        self.out.push(0x0f);
         self.goto(next, 0);
-        let row = &g[Line(next as i32)];
-        let width = erase_width(row, limit);
         let _ = write!(self.out, "\x1b[{width}X");
         self.draw_span(row, next, g.columns(), 0, width, false, 0, false);
     }
@@ -1119,7 +1200,7 @@ fn is_blank(cell: &Cell, blank: &Cell) -> bool {
     cell == blank
 }
 
-fn color(out: &mut Vec<u8>, c: Color, base: u8, bright: u8, ext: u8) {
+fn color(out: &mut Out, c: Color, base: u8, bright: u8, ext: u8) {
     match c {
         Color::Named(n) => {
             let n = n as usize;
@@ -1142,7 +1223,7 @@ fn color(out: &mut Vec<u8>, c: Color, base: u8, bright: u8, ext: u8) {
     }
 }
 
-fn cursor_style(out: &mut Vec<u8>, style: Option<CursorStyle>) {
+fn cursor_style(out: &mut Out, style: Option<CursorStyle>) {
     let code = match style {
         None => 0,
         Some(CursorStyle { shape, blinking }) => {
