@@ -440,7 +440,16 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   `ProxyJump`, `LocalForward`, `RemoteForward`, `DynamicForward`, `User`,
   `Port`, `ServerAliveInterval`, `StrictHostKeyChecking`).
 - `-D` implements SOCKS5 CONNECT and UDP ASSOCIATE (over `direct-udp`).
-- Server binary `ssh3-server`; static musl build for deployment.
+- Server binary `ssh3-server`; static musl build for deployment via
+  `scripts/build-release.sh`, which rejects any artifact with an INTERP
+  segment or DT_NEEDED. *(The default musl target produces a static-PIE that
+  still names `/lib/ld-musl-x86_64.so.1` as interpreter and dies with exit
+  127 on oracle; `-C relocation-model=static` is required — verified on
+  oracle by the releaser.)* The server sets jemalloc as global allocator
+  with `malloc_conf = "background_thread:true"` (§1).
+- Every protocol timer (SessionLinger, idle timeout, keep-alive,
+  LoginGraceTime, lane ack interval, scheduler hysteresis) is configurable,
+  so acceptance tests run in milliseconds instead of waiting.
 
 ## 10. Open items (must be resolved by experiment, not assumption)
 
