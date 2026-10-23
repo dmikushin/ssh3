@@ -139,31 +139,37 @@ async fn simultaneous_resumes_exactly_one_stays_attached() {
     let env = env_with(Limits { idle_timeout: Duration::from_secs(10), ..limits() });
     let c = env.client().await;
     let sid = c.session_id();
+    // Each rival reads either Resumed or — if the other one's attach closed
+    // its carrier first — nothing: QUIC discards undelivered stream data on
+    // close, and a superseded carrier is dead either way.
     let attempt = |env_conn: quinn::Connection, key: Arc<TestKey>| async move {
         let (mut s, mut r, m) = raw_auth(&env_conn, &key, Intent::Resume).await;
         assert_eq!(m, Message::AuthOk { session: None });
         frame::write_message(&mut s, &Message::Resume { session_id: sid, lanes: vec![] }).await.unwrap();
-        let m = frame::read_message(&mut r, 65536).await.unwrap();
-        (env_conn, s, r, m)
+        let epoch = match frame::read_message(&mut r, 65536).await {
+            Ok(Some(Message::Resumed { epoch, .. })) => Some(epoch),
+            Ok(other) => panic!("expected Resumed, got {other:?}"),
+            Err(_) => None,
+        };
+        (env_conn, s, r, epoch)
     };
     let (c1, c2) = tokio::join!(raw_conn(&env), raw_conn(&env));
     let (a, b) = tokio::join!(attempt(c1, env.key.clone()), attempt(c2, env.key.clone()));
-    let epoch = |m: &Option<Message>| match m {
-        Some(Message::Resumed { epoch, .. }) => *epoch,
-        other => panic!("expected Resumed, got {other:?}"),
+    let superseded = |c: &quinn::Connection| match c.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(ac)) => ac.error_code.into_inner() == close::SUPERSEDED as u64,
+        _ => false,
     };
-    let (ea, eb) = (epoch(&a.3), epoch(&b.3));
-    assert_ne!(ea, eb);
-    let (loser, winner) = if ea < eb { (&a.0, &b.0) } else { (&b.0, &a.0) };
-    let reason = loser.closed().await;
-    match reason {
-        quinn::ConnectionError::ApplicationClosed(ac) => assert_eq!(ac.error_code.into_inner(), close::SUPERSEDED as u64),
-        other => panic!("loser closed with {other:?}"),
+    // The winner is the one still open once the dust settles.
+    wait_until("one rival superseded", Duration::from_secs(5), || superseded(&a.0) || superseded(&b.0), || format!("{:?} / {:?}", a.0.close_reason(), b.0.close_reason())).await;
+    let (loser, winner) = if superseded(&a.0) { (&a, &b) } else { (&b, &a) };
+    assert!(winner.0.close_reason().is_none(), "winner was closed: {:?}", winner.0.close_reason());
+    let win_epoch = winner.3.expect("the winner received Resumed");
+    if let Some(e) = loser.3 {
+        assert!(e < win_epoch, "loser epoch {e} not older than winner {win_epoch}");
     }
-    assert!(winner.close_reason().is_none(), "winner was closed: {:?}", winner.close_reason());
     let st = env.server.stats();
     assert_eq!((st.attached, st.resumes_accepted), (1, 2), "{st:?}");
-    assert_eq!(env.server.session(&sid).unwrap().epoch(), ea.max(eb));
+    assert_eq!(env.server.session(&sid).unwrap().epoch(), win_epoch);
     // The original client's carrier was superseded too.
     wait_until("original carrier closed", Duration::from_secs(5), || !c.shared.is_attached(), || "still attached".into()).await;
 }
