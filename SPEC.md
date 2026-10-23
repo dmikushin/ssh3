@@ -186,8 +186,16 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     local source, not yet past `accepted`) ≤ `LaneSendBudget` (default
     64 MiB); a lane reads its local source only while it holds peer credit
     and the budget has room.
-  - Additionally, per connection, Σ of lane credit ≤ the connection receive
-    window minus a reserved 64 KiB for the control stream.
+  - No per-connection rule tying Σ lane credit to the connection window:
+    because the receiver drains every stream unconditionally, connection
+    credit is held only transiently (test: 32 stalled lanes whose credit
+    exceeds the connection window do not block another lane, mutation-
+    checked). This holds for conforming peers only; a peer sending beyond
+    `limit` is cut off with a protocol error naming lane and offsets, and
+    the receiver keeps polling QUIC while doing so.
+  - **Per-lane floor** outside the budgets: 1 send chunk + 2 receive chunks
+    (48 KiB) per lane, so the event lane and every lane can always make
+    progress. Bounded by MaxChannels × session caps; reported in stats.
   *(Review: counting ring capacity instead gives 256 MiB per session with
   MaxChannels 256 — 25 GiB for 100 sessions.)*
 - **Budgets are charged on allocations, not on bytes.** Occupied bytes
@@ -276,8 +284,11 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - **Attach is serialized per session.** Each attach increments the session's
   `attach_epoch` under a per-session lock; `Resumed` carries the epoch;
   messages and lane streams from a carrier with an older epoch are rejected.
-  The newer attach closes the older carrier. Two simultaneous resumes cannot
-  both succeed.
+  The newer attach closes the older carrier. A session has **at most one
+  current carrier**: concurrent resumes may each receive `Resumed`, but the
+  later one supersedes (fences) the earlier, whose lanes and events are
+  rejected by epoch. A resume is never refused merely because a carrier is
+  attached — the server cannot know the old carrier is already dead.
 - **Detached `-R` listeners.** While detached, each `-R` listener accepts at
   most `DetachedAcceptMax` (default 8) pending connections, each with a
   bounded lane; further connections are refused (closed immediately) and
@@ -407,8 +418,25 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
    session id || both peer key fingerprints || pair || role || generation ||
    nonce)`, so replayed or cross-session responses are rejected.
    The path socket then switches inner packets to the pair.
-   Because the virtual address hides the change from quinn, quinn will not
-   reset PMTU or congestion state by itself (open item X8).
+   **Path-state reset (X8, measured on loopback, 24 runs):**
+   - Inbound on the direct path is accepted **strictly** from the selected
+     pair only; packets still in flight on the old path are lost and
+     recovered as ordinary loss (no measurable recovery penalty).
+   - The server-side path socket presents a **fresh fd00:: virtual client
+     address per path generation**. quinn then performs a real migration
+     (`migrate()` → `PathData::new` for IPv6): path validation, fresh
+     congestion/RTT, PMTUD from scratch (MTU 1452 regained within
+     0.25–0.5 s).
+   - The client side cannot do the same — quinn drops packets from a new
+     server address (`connection/mod.rs:1131`). quinn-proto has
+     `Connection::path_changed(now)` (`mod.rs:1427`: resets congestion, RTT,
+     pacer, MTUD) but quinn 0.11.12 does not expose it. Required: a minimal
+     quinn patch exposing it, called by `PathManager` on every switch (open
+     item X9). Without it: a smaller new MTU is detected by black-hole
+     detection in ≤ 0.5 s (connection survives); a larger one is not used
+     until the next MTUD interval (600 s default).
+   - The connection survived every switch, including 400 replayed old-path
+     packets and asymmetric 10 ms+1 % loss / 90 ms paths.
 4. Relay stays as fallback; on direct-path loss the path socket falls back to
    relay without breaking the inner connection.
 - Simultaneous inner dial (both peers initiating) resolves deterministically:
@@ -464,10 +492,11 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   behaviour (endpoint-independent vs dependent, port allocation pattern,
   mapping lifetime) via the gateway before choosing techniques beyond
   plain simultaneous open.
-- X8 Path switch under a virtual peer address: how to make quinn re-probe
-  PMTU and reset congestion state (large-PMTU relay → smaller direct path,
-  and direct → relay fallback); test asymmetric loss/delay and replayed
-  responses.
+- X8 resolved on loopback (§7.3 path-state reset); real-path confirmation
+  pending with X4.
+- X9 Client-side path reset needs `quinn::Connection::path_changed()`
+  exposed (patch to quinn 0.11.12); to be implemented and measured, and
+  proposed upstream.
 - X6 resolved (§1 accounting rule). `set_send_window` not yet measured.
 - X7 X2 relay had no bottleneck queue and i.i.d. loss; re-measure on real
   paths (oracle ↔ gambetta).
