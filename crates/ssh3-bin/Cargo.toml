@@ -1,0 +1,37 @@
+[package]
+name = "ssh3-bin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ssh3-rs command-line programs: the ssh3 client and ssh3-server"
+
+[lib]
+name = "ssh3_bin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ssh3"
+path = "src/bin/ssh3.rs"
+
+[[bin]]
+name = "ssh3-server"
+path = "src/bin/ssh3-server.rs"
+
+[dependencies]
+libc = "0.2"
+quinn = "0.11.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh3-config = { path = "../ssh3-config" }
+ssh3-core = { path = "../ssh3-core" }
+ssh3-keys = { path = "../ssh3-keys" }
+ssh3-session = { path = "../ssh3-session" }
+tikv-jemallocator = "0.7.0"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+sha2 = "0.10"

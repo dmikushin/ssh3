@@ -163,6 +163,28 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     raises `limit` by ≥ 1/4 of the granted credit, even if no new network
     bytes arrived; otherwise a lane whose limit was reached would deadlock
     once its sink drains.
+  - **Credit retraction (fenced).** `limit` is monotone *within a fence
+    epoch*. To reclaim credit a lane is not using (idle lane holding a large
+    earlier grant — measured: an idle lane pins its whole earlier grant,
+    review model `idle-credit-model.py`), the receiver sends
+    `Retract{chan_id, lane, seq, new_limit}` with `new_limit ≥ accepted`. The
+    sender, at once and before sending any further byte of that lane, stops
+    at `max(sent, new_limit)` and replies `RetractAck{chan_id, lane, seq,
+    sent}` where `sent` = end of bytes it has sent on that lane. The
+    effective limit becomes `max(sent, new_limit)`; only after the ack does
+    the receiver release the reservations above it. Both messages travel on
+    the plain control stream (like LaneAck, never blocked by lane credit).
+    Bytes beyond the effective limit after the ack are a protocol error.
+    A peer that does not acknowledge within `RetractTimeout` (default
+    max(4·RTT, 2 s)) is in violation: the server closes that carrier with a
+    reason; the session detaches (below). While a session is **detached**,
+    the receiver retracts unilaterally: no bytes can be in flight, and Resume
+    carries each lane's new limit (fence = the new attach epoch).
+    Grants beyond the floor are **demand-driven**: the receiver raises a
+    lane's grant only while that lane keeps reaching its limit, and retracts
+    to the floor after `CreditIdle` (default 5 s) without arrivals. So idle
+    lanes hold only their floor (accounted outside the budgets), and the
+    budgets are shared among lanes that actually move data.
   - The receiver **always** drains every QUIC stream into the ring
     immediately (it never receives beyond `limit`; bytes beyond `limit` are a
     protocol error), so reading QUIC never blocks on the local sink.

@@ -1,0 +1,31 @@
+# systemd unit for ssh3-server (ssh3-rs). Install the static binary as
+# /usr/local/bin/ssh3-server and the configuration as
+# /etc/ssh3/ssh3-server.toml (format: crates/ssh3-bin/src/server_config.rs).
+[Unit]
+Description=ssh3 server (secure shell over QUIC)
+Documentation=https://github.com/dmikushin/ssh3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=/usr/local/bin/ssh3-server -t -f /etc/ssh3/ssh3-server.toml
+ExecStart=/usr/local/bin/ssh3-server -f /etc/ssh3/ssh3-server.toml
+# SIGTERM: sessions torn down, -R listeners released at once (SPEC I5).
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=2
+# Persisted endpoint keys (stateless reset after restart, SPEC §1) and the
+# stats socket.
+StateDirectory=ssh3
+RuntimeDirectory=ssh3
+# Runs as root to serve every account; drop to one user with User= to serve
+# only that user (the server refuses all other accounts by name).
+# No ProtectSystem=/NoNewPrivileges=: session processes inherit the
+# service's sandbox, and a user shell must see the system as under sshd.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
