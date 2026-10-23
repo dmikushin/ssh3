@@ -86,36 +86,51 @@ async fn direct_tcp_echo_64_mib() {
     wait_until("channel removed", Duration::from_secs(10), || env.server.stats().channels == 0 && c.shared.channel_count() == 0, || format!("{:?}", env.server.stats())).await;
 }
 
-/// Review D2: a lane whose local sink stalls must not block other lanes or
-/// the acks; its buffering stays within one ring.
+/// Review D2: lanes whose local sinks stall must not block other lanes or
+/// the acks. 32 stalled lanes hold 32 × 16 KiB floor credit = 512 KiB, more
+/// than the 256 KiB connection receive window, so this only passes if the
+/// receiver drains QUIC into its rings regardless of its sinks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stalled_lane_does_not_block_others() {
+async fn stalled_lanes_do_not_block_others() {
     let env = env_with(Limits { idle_timeout: Duration::from_secs(10), ..fast_limits() });
     let c = env.client().await;
     let (stalled, mut accepted) = stalled_server(true).await;
     let fwd_stalled = forward(&c, stalled).await;
-    let mut s = TcpStream::connect(fwd_stalled).await.unwrap();
-    let writer = tokio::spawn(async move {
-        let chunk = vec![7u8; 65536];
-        let mut n = 0usize;
-        while s.write_all(&chunk).await.is_ok() {
-            n += chunk.len();
-        }
-        n
-    });
-    let _held = accepted.recv().await.unwrap();
-    let cap = env.limits.lane_buffer as u64;
-    wait_until("stalled lane full", Duration::from_secs(10), || env.server.stats().recv_ring_bytes > 0, || format!("{:?}", env.server.stats())).await;
+    let n = 32u64;
+    assert!(n * env.limits.lane_floor > env.limits.floor_window);
+    let mut writers = Vec::new();
+    let mut held = Vec::new();
+    for _ in 0..n {
+        let mut s = TcpStream::connect(fwd_stalled).await.unwrap();
+        writers.push(tokio::spawn(async move {
+            let chunk = vec![7u8; 65536];
+            while s.write_all(&chunk).await.is_ok() {}
+        }));
+        held.push(accepted.recv().await.unwrap());
+    }
+    let mut last = 0;
+    let mut stable = 0;
+    wait_until("stalled lanes at their limits", Duration::from_secs(20), || {
+        let b = c.shared.stats.lane_bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+        if b == last { stable += 1 } else { stable = 0; last = b }
+        stable > 40
+    }, || format!("{:?}", env.server.stats())).await;
+    let st = env.server.stats();
+    assert!(st.credit_outstanding > env.limits.floor_window, "stalled lanes hold {} B of credit, not more than the connection window; the test would not discriminate: {st:?}", st.credit_outstanding);
     // Another channel moves 8 MiB meanwhile.
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
     let data = Arc::new(pattern(8 << 20, 2));
-    let out = echo_roundtrip(fwd, data.clone()).await;
+    let out = tokio::time::timeout(Duration::from_secs(30), echo_roundtrip(fwd, data.clone()))
+        .await
+        .unwrap_or_else(|_| panic!("8 MiB echo did not complete beside {n} stalled lanes: {:?}", env.server.stats()));
     assert_eq!(sha(&out), sha(&data));
+    let cap = env.limits.lane_buffer as u64;
     let st = env.server.stats();
-    assert!(st.recv_ring_bytes <= cap, "stalled lane buffered {} > ring {cap}", st.recv_ring_bytes);
-    assert!(c.shared.stats.send_ring_bytes.load(std::sync::atomic::Ordering::Relaxed) <= cap);
-    writer.abort();
+    assert!(st.recv_ring_bytes <= n * cap, "{st:?}");
+    for w in writers {
+        w.abort();
+    }
 }
 
 /// The receive ring never exceeds its capacity and storage stays within the
