@@ -348,8 +348,9 @@ async fn handle(conn: Connection, shared: Arc<ServerShared>, permit: OwnedSemaph
             session.set_authz(authz);
             let ours = session.snapshot_lanes();
             let n = ours.len();
-            let epoch = session.install_carrier(conn, send, recv, move |epoch| Some(Message::Resumed { lanes: ours, epoch }));
+            // Counted before Resumed is sent: Resumed confirms it.
             shared.counters.resumes_accepted.fetch_add(1, Ordering::Relaxed);
+            let epoch = session.install_carrier(conn, send, recv, move |epoch| Some(Message::Resumed { lanes: ours, epoch }));
             tracing::info!(session = %hex(&session_id), lanes = n, epoch, "session resumed");
             Ok(())
         }

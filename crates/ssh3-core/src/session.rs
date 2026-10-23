@@ -1044,7 +1044,12 @@ impl SessionShared {
         }
     }
 
-    async fn control_writer(self: Arc<Self>, mut send: SendStream, mut rx: mpsc::Receiver<Message>, first: Option<Message>) {
+    async fn control_writer(self: Arc<Self>, mut send: SendStream, mut rx: mpsc::Receiver<Message>, first: Option<Message>, installed: oneshot::Receiver<()>) {
+        // `first` (AuthOk/Resumed) confirms the attach: send it only once the
+        // carrier is installed and the session counts as attached.
+        if installed.await.is_err() {
+            return;
+        }
         if let Some(m) = first
             && frame::write_message(&mut send, &m).await.is_err()
         {
@@ -1220,11 +1225,17 @@ impl SessionShared {
 
     /// Server: destroy the session now — carrier closed with SESSION_END,
     /// listeners, channels (processes as on channel close), rings, permits.
+    ///
+    /// The SESSION_END close is the client's confirmation (`end()` returns
+    /// on it), so it is sent only after teardown has removed the session:
+    /// closing first let the client observe "ended" while the server still
+    /// listed the session (attached, or detached by teardown's first step).
     fn end_now(&self) {
-        if let Some((c, _)) = self.conn() {
-            c.close(close::SESSION_END.into(), b"session ended");
+        let carrier = self.carrier.lock().unwrap().take();
+        self.teardown(); // carrier already taken: no SHUTDOWN close here
+        if let Some(c) = carrier {
+            c.conn.close(close::SESSION_END.into(), b"session ended");
         }
-        self.teardown();
     }
 
     fn on_carrier_death(self: &Arc<Self>, epoch: u64) {
@@ -1265,7 +1276,8 @@ impl SessionShared {
         // Pong and RetractAck replies go here without waiting.
         let (tx, rx) = mpsc::channel(256);
         let mut tasks = JoinSet::new();
-        tasks.spawn(self.clone().control_writer(send, rx, first(epoch)));
+        let (installed_tx, installed_rx) = oneshot::channel();
+        tasks.spawn(self.clone().control_writer(send, rx, first(epoch), installed_rx));
         tasks.spawn(self.clone().control_reader(conn.clone(), recv));
         tasks.spawn(self.clone().acceptor(conn.clone()));
         tasks.spawn(self.clone().datagram_rx(conn.clone()));
@@ -1276,6 +1288,7 @@ impl SessionShared {
             old.conn.close(close::SUPERSEDED.into(), b"superseded by a newer carrier");
         }
         self.carrier_state.send_replace(epoch);
+        let _ = installed_tx.send(());
         epoch
     }
 
