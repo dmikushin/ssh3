@@ -198,6 +198,20 @@ fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// Whether a TCP socket on 127.0.0.1:`port` is in LISTEN state, read from
+/// /proc/net/tcp — unlike connecting, this has no effect on the listener.
+fn tcp_listening(port: u16) -> bool {
+    let want = format!("0100007F:{port:04X}");
+    std::fs::read_to_string("/proc/net/tcp")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .any(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 3 && f[1] == want && f[3] == "0A"
+        })
+}
+
 fn connect_within(port: u16, what: &str) -> TcpStream {
     let end = Instant::now() + DEADLINE;
     loop {
@@ -501,6 +515,24 @@ fn pty_session_raw_mode_resize_exit() {
     assert!(same_termios(&before, &termios(&pty.slave)), "terminal settings not restored after exit");
 }
 
+/// The first bytes a pty exec puts on the terminal are the command's own
+/// output: the client injects nothing (no NUL, no stray echo) into the remote
+/// pty. (A `^@` seen under `script -qec ... </dev/null` is script writing
+/// ^D on stdin EOF while the client's pty is still canonical; n_tty keeps
+/// that EOF as a 0x00 marker, which becomes a data byte once raw mode is
+/// entered — reproduced without ssh3. This harness drives its own pty and
+/// sends nothing.)
+#[test]
+fn pty_exec_output_starts_with_the_command_output() {
+    let env = Env::new();
+    let pty = openpty(24, 80);
+    let mut screen = Screen::new(&pty.master);
+    let mut c = spawn_on_pty(env.cmd("user_key", &["-t", "t", "echo first-bytes"]), &pty, "ssh3");
+    assert_eq!(c.wait_exit(DEADLINE).code(), Some(0), "screen: {:?}", screen.text);
+    screen.wait_for("Connection to 127.0.0.1 closed.", DEADLINE);
+    assert!(screen.text.starts_with("first-bytes\r\n"), "first output bytes: {:?}", screen.text);
+}
+
 #[test]
 fn pty_terminal_restored_when_killed() {
     let env = Env::new();
@@ -524,12 +556,19 @@ fn last_contact_line_follows_server_silence() {
     let cfg = env.dir.join("ssh_config.contact");
     std::fs::write(&cfg, format!("{}  ContactWarn 300ms\n", std::fs::read_to_string(env.client_config("user_key")).unwrap())).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
-    cmd.arg("-F").arg(&cfg).args(["-N", "-L", &format!("{}:127.0.0.1:9", free_port()), "t"]);
+    let lport = free_port();
+    cmd.arg("-F").arg(&cfg).args(["-N", "-L", &format!("{lport}:127.0.0.1:9"), "t"]);
     let _c = spawn_on_pty(cmd, &pty, "ssh3");
-    // Wait for the session (stats), then silence the server.
+    // Wait until the CLIENT is in its session, then silence the server. The
+    // server counts the session attached before its reply reaches the
+    // client; a server stopped in that gap leaves the client inside connect,
+    // where no status line exists yet (10/200 failures under 84 busy
+    // threads, every one with the client's -L not yet bound). The client
+    // binds -L only after connect returned, right before it starts the
+    // status watcher, so the bound listener is the client-side signal.
     let end = Instant::now() + DEADLINE;
-    while env.stats()["attached"] != 1 {
-        assert!(Instant::now() < end, "client never attached");
+    while env.stats()["attached"] != 1 || !tcp_listening(lport) {
+        assert!(Instant::now() < end, "client never in its session (attached={}, -L bound={})", env.stats()["attached"], tcp_listening(lport));
         std::thread::sleep(Duration::from_millis(20));
     }
     let pid = env.server.child.id() as i32;
