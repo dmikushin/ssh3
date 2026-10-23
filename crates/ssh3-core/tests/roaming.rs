@@ -120,3 +120,22 @@ async fn last_contact_tracks_the_server() {
     assert_eq!(c.last_contact(), frozen, "contact advanced over a dead path");
     assert!(frozen.elapsed() >= Duration::from_millis(400));
 }
+
+/// Board R6: a resume attempt is bounded by the remaining linger, not by the
+/// QUIC idle timeout — with the network gone for good, the client gives up
+/// about when the server's linger ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_attempts_are_bounded_by_the_linger() {
+    // An unbounded attempt would last the handshake's idle timeout (2.5 s);
+    // bounded, the client gives up when the 1 s linger is over.
+    let env = env_with(roaming(Limits { idle_timeout: Duration::from_millis(2500), linger: Duration::from_secs(1), auto_resume: true, ..fast_limits() }));
+    let net = Arc::new(AtomicBool::new(false));
+    let mut opts = env.opts(&env.key);
+    opts.sockets = network_factory(net.clone());
+    let c = ClientSession::connect(opts.clone(), (opts.sockets)().unwrap()).await.unwrap();
+    net.store(true, Ordering::SeqCst); // for good
+    c.carrier_lost().await;
+    let lost = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(4), c.gave_up()).await.expect("never gave up");
+    assert!(lost.elapsed() < Duration::from_secs(2), "gave up only after {:?}: an attempt outlived the linger", lost.elapsed());
+}

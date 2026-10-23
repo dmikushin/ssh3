@@ -468,8 +468,15 @@ async fn roam(inner: std::sync::Weak<ClientInner>) {
                 return;
             }
             c.roam.resume_attempts.fetch_add(1, Ordering::Relaxed);
+            // Each attempt is bounded by what is left of the linger (board
+            // R6): an unreachable server must not hold one attempt for the
+            // whole QUIC idle timeout past the session's end.
+            let remaining = c.linger.saturating_sub(lost_at.elapsed());
             let r = match (c.opts.sockets)() {
-                Ok(sock) => c.resume(sock).await,
+                Ok(sock) => match tokio::time::timeout(remaining, c.resume(sock)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(Error::Deadline(format!("resume attempt outlived the remaining linger {remaining:?}"))),
+                },
                 Err(e) => Err(Error::Io(e)),
             };
             match r {
