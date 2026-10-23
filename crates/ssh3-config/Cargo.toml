@@ -1,0 +1,13 @@
+[package]
+name = "ssh3-config"
+version = "0.1.0"
+description = "OpenSSH-compatible client command line and ssh_config resolution for ssh3-rs"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glob = "0.3"
+libc = "0.2"
+nix = { version = "0.31", features = ["user", "hostname", "fs"] }
+sha1 = "0.11"
