@@ -241,15 +241,51 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   `LaneAck` (§4) every 16 KiB or 1 s, coalesced, and on delivery per the §4
   liveness rule. When the sender has reached the peer's `limit` or the send
   budget is exhausted, it stops reading its local source (TCP socket, pty) —
-  **backpressure, never growth**. Ring capacity (`LaneBuffer`, default
-  256 KiB per direction, configurable per channel kind) is a cap, not an
-  allocation (§4).
+  **backpressure, never growth** — except for the pty output lane, see
+  "pty lanes" below. Ring capacity (`LaneBuffer`, default 8 MiB per
+  direction, configurable per channel kind) is a cap, not an allocation
+  (§4): rings hold only buffered bytes in budget-owned chunks, so a large cap
+  costs nothing until used, while 256 KiB would cap one forward at
+  256 KiB/RTT (~14 Mbit/s at 150 ms) regardless of the connection window
+  (measured by the core implementation).
+- **pty lanes (hybrid, after mosh).** A program writing to a pty must never
+  block because the client is away or slow — mosh's server always reads the
+  pty (mosh-server.cc:861-878) and keeps O(screen) state. Our pty output lane
+  runs in two modes:
+  1. *Stream mode* (normal): pty bytes go into the send ring and are
+     replayed byte-exact on resume, so the client's terminal sees the
+     original bytes (scrollback, OSC, colours intact).
+  2. *Screen mode*: when the pty output ring is full (peer credit or send
+     budget exhausted, e.g. while detached), the server keeps reading the
+     pty into a server-side terminal emulator instead of blocking the
+     program; bytes not yet in the ring are consumed by the emulator only.
+     On the next resume, after the ring's retained bytes are replayed, the
+     server sends one `ScreenResync{…}` event: a full redraw of the current
+     screen (as an escape-sequence string that brings any VT100-compatible
+     terminal to the emulator's state, plus cursor and modes), then returns
+     to stream mode. Output produced while in screen mode is lost except for
+     its effect on the screen — the same trade mosh makes (scrollback of that
+     period is lost).
+  The emulator is the server's only O(screen) per-pty cost and is allocated
+  lazily on first entry into screen mode. TCP forwards and non-pty exec
+  never use screen mode: they are byte-exact or nothing.
+- **Session lifetime.** Sessions with at least one pty channel default to
+  no linger limit (as mosh: alive until the process exits or an explicit
+  timeout); others use `SessionLinger`. Both configurable.
+- **Client status line (after mosh).** When the server has been silent for
+  more than `ContactWarn` (default 6.5 s, mosh terminaloverlay.h:159), an
+  interactive client shows "Last contact N s ago" on its pty, removed when
+  traffic resumes.
+- **Predictive echo (after mosh).** Later milestone; client-side adaptive
+  local echo with confirmation by epoch, modes adaptive/always/never; needs
+  the client-side terminal emulator from screen mode.
 - **Received offset semantics.** `received_offset` = end of the bytes
   accepted into the receiver's receive ring. Bytes delivered to quinn but not
   yet copied into the ring are *not* counted, so a carrier death between the
   two cannot lose them: the sender still holds them and resends.
 - **Detach.** When the carrier connection dies, the server keeps the session
-  detached for `SessionLinger` (default 12 h, configurable; 0 disables).
+  detached for its lifetime (see "Session lifetime": `SessionLinger`,
+  default 12 h for sessions without a pty; unlimited by default with a pty).
   Local endpoints (pty, accepted TCP sockets, `-R` listeners) stay open and
   simply stop being read once their rings fill.
 - **Resume.** The client opens a new QUIC connection (any address, any
