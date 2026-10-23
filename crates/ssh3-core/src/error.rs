@@ -26,6 +26,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("host key verification failed: {0}")]
     HostKey(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
     #[error("tls configuration: {0}")]
     Tls(String),
     #[error("request refused by peer: {0}")]

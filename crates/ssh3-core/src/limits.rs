@@ -40,8 +40,12 @@ pub struct Limits {
     /// so it defaults to the connection-window ceiling; memory is bounded by
     /// the server-wide budgets, not by this cap.
     pub lane_buffer: usize,
-    /// Credit every lane gets without the budget.
+    /// Credit every lane gets without the budget. Must be a multiple of the
+    /// 16 KiB ring chunk, at most 2 chunks (the storage exempt from budgets).
     pub lane_floor: u64,
+    /// The receiver acks (releasing the sender's ring) after this many newly
+    /// accepted bytes; credit updates follow 1/4 of the grant.
+    pub lane_ack_bytes: u64,
     /// LaneCreditBudget: receive-ring chunk storage, server-wide.
     pub lane_credit_budget: u64,
     /// LaneSendBudget: send-ring chunk storage, server-wide.
@@ -90,6 +94,7 @@ impl Default for Limits {
             detached_accept_max: 8,
             lane_buffer: 8 * 1024 * 1024,
             lane_floor: 16 * 1024,
+            lane_ack_bytes: 16 * 1024,
             lane_credit_budget: 64 * 1024 * 1024,
             lane_send_budget: 64 * 1024 * 1024,
             event_queue: 1024,
@@ -103,5 +108,33 @@ impl Default for Limits {
             max_sessions: 1024,
             tcp_socket_buffer: 64 * 1024,
         }
+    }
+}
+
+impl Limits {
+    /// Reject configurations the protocol engine cannot honour, naming the
+    /// field (QA: a misconfiguration must fail loudly, not be quantised).
+    pub fn validate(&self) -> Result<(), String> {
+        let chunk = crate::ring::CHUNK as u64;
+        if self.lane_floor < chunk || self.lane_floor > 2 * chunk || !self.lane_floor.is_multiple_of(chunk) {
+            return Err(format!(
+                "lane_floor {} must be {chunk} or {}: credit is stored in {chunk}-byte chunks and only two per lane are exempt from the budgets",
+                self.lane_floor,
+                2 * chunk
+            ));
+        }
+        if (self.lane_buffer as u64) < self.lane_floor || !(self.lane_buffer as u64).is_multiple_of(chunk) {
+            return Err(format!("lane_buffer {} must be a multiple of {chunk} and at least lane_floor {}", self.lane_buffer, self.lane_floor));
+        }
+        if self.lane_ack_bytes == 0 {
+            return Err("lane_ack_bytes must be positive".into());
+        }
+        if self.floor_window > self.conn_window_ceiling {
+            return Err(format!("floor_window {} exceeds conn_window_ceiling {}", self.floor_window, self.conn_window_ceiling));
+        }
+        if self.max_auth_tries == 0 {
+            return Err("max_auth_tries must be at least 1".into());
+        }
+        Ok(())
     }
 }

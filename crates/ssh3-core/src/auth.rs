@@ -122,9 +122,12 @@ pub trait Authenticator: Send + Sync {
     fn authorize(&self, user: &str, key: &PublicKey, peer: IpAddr) -> Result<Authz, String>;
 }
 
+/// Maps a user name to its authorized_keys file (None: no such user).
+pub type KeysPathFn = Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
 /// OpenSSH semantics: `~user/.ssh/authorized_keys`, re-read on every attempt.
 pub struct AuthorizedKeysAuthenticator {
-    path_for: Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>,
+    path_for: KeysPathFn,
 }
 
 impl AuthorizedKeysAuthenticator {

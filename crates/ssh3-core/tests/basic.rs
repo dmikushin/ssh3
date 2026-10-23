@@ -454,3 +454,18 @@ async fn accept_new_records_the_host_key() {
     let kh = ssh3_keys::known_hosts::KnownHosts::load(&[fresh]).unwrap();
     assert_eq!(kh.lookup("127.0.0.1", env.server.local_addr().port()).len(), 1);
 }
+
+/// QA: Limits that the engine cannot honour fail loudly, naming the field.
+#[test]
+fn invalid_limits_are_rejected() {
+    for (l, field) in [
+        (Limits { lane_floor: 8 * 1024, ..Limits::default() }, "lane_floor"),
+        (Limits { lane_floor: 64 * 1024, ..Limits::default() }, "lane_floor"),
+        (Limits { lane_buffer: 20_000, ..Limits::default() }, "lane_buffer"),
+        (Limits { lane_ack_bytes: 0, ..Limits::default() }, "lane_ack_bytes"),
+    ] {
+        let e = l.validate().unwrap_err();
+        assert!(e.contains(field), "{e}");
+    }
+    Limits::default().validate().unwrap();
+}

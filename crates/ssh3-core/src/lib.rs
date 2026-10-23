@@ -8,7 +8,7 @@ pub mod frame;
 pub mod lane;
 pub mod limits;
 pub mod msg;
-mod ring;
+pub mod ring;
 pub mod server;
 pub mod session;
 pub mod transport;

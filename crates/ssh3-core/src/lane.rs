@@ -76,6 +76,7 @@ pub struct AckQueue {
 pub(crate) struct LaneEnv {
     pub cap: u64,
     pub floor: u64,
+    pub ack_bytes: u64,
     pub ack_interval: Duration,
     pub stats: Arc<Stats>,
     pub acks: Arc<AckQueue>,
@@ -349,7 +350,7 @@ impl Lane {
     fn ack_need(&self, st: &mut LaneState) -> Option<bool> {
         let limit_up = st.limit - st.last_ack_limit;
         let acc_up = st.received - st.last_ack_accepted;
-        if limit_up >= (st.granted / 4).max(1) || acc_up >= (self.env.cap / 4).max(1) {
+        if limit_up >= (st.granted / 4).max(1) || acc_up >= self.env.ack_bytes {
             if st.queued_urgent {
                 return None;
             }

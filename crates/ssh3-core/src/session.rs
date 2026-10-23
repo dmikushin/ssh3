@@ -62,6 +62,9 @@ impl Budgets {
 
 pub(crate) type Registry = Mutex<HashMap<SessionId, Arc<SessionShared>>>;
 
+/// A -R request in flight: bind host, local target, reply slot.
+type PendingListen = (String, (String, u16), oneshot::Sender<std::result::Result<u16, FailReason>>);
+
 /// A server-side -R listener. Dropping it aborts the accept task, which
 /// drops the socket: the port is released at once (SPEC I5).
 struct Listener {
@@ -130,7 +133,7 @@ pub struct SessionShared {
     listeners: Mutex<HashMap<(String, u16), Listener>>,
     /// Client: -R requests in flight, by req_id → (bind host, target), and
     /// established forwards (bind host, bound port) → target.
-    listen_pending: Mutex<HashMap<u64, (String, (String, u16), oneshot::Sender<std::result::Result<u16, FailReason>>)>>,
+    listen_pending: Mutex<HashMap<u64, PendingListen>>,
     remote_forwards: Mutex<HashMap<(String, u16), (String, u16)>>,
     next_req: AtomicU64,
     pub refused_detached: AtomicU64,
@@ -201,6 +204,7 @@ impl SessionShared {
         LaneEnv {
             cap: self.limits.lane_buffer as u64,
             floor: self.limits.lane_floor,
+            ack_bytes: self.limits.lane_ack_bytes,
             ack_interval: self.limits.ack_interval,
             stats: self.stats.clone(),
             acks: self.acks.clone(),

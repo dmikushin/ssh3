@@ -163,6 +163,7 @@ async fn connect_and_auth(opts: &ClientOptions, socket: Arc<dyn AsyncUdpSocket>,
 
 impl ClientSession {
     pub async fn connect(opts: ClientOptions, socket: Arc<dyn AsyncUdpSocket>) -> Result<Self> {
+        opts.limits.validate().map_err(Error::Config)?;
         let Dialed { ep, conn, send, recv, info, host_key } = connect_and_auth(&opts, socket, Intent::New).await?;
         let info = info.ok_or_else(|| Error::Protocol("AuthOk for a new session carries no session info".into()))?;
         let shared = SessionShared::new(

@@ -86,6 +86,7 @@ pub struct ServerStats {
 
 impl Server {
     pub fn bind(opts: ServerOptions, socket: std::net::UdpSocket) -> Result<Self> {
+        opts.limits.validate().map_err(Error::Config)?;
         let sc = transport::server_config(opts.tls, &opts.limits)?;
         let endpoint = Endpoint::new(transport::endpoint_config(&opts.keys), Some(sc), socket, Arc::new(TokioRuntime))?;
         let shared = Arc::new(ServerShared {
