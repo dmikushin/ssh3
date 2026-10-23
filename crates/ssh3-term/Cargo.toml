@@ -1,0 +1,21 @@
+[package]
+name = "ssh3-term"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ssh3-rs pty screen mode: server-side terminal emulator and full-screen resync (SPEC §5 pty lanes)"
+
+[dependencies]
+# Chosen over vt100 0.18 by measurement against tmux on the recorded corpus
+# (see crate docs): vt100 ignores custom tab stops, DECAWM, DEC line-drawing
+# charsets and DECALN.
+alacritty_terminal = { version = "0.26.0", default-features = false }
+# Same width tables as alacritty_terminal uses for `Term::input`.
+unicode-width = "0.2"
+
+[dev-dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+# Independent second emulator used as an external oracle for resync output.
+vt100 = "0.18.1"
+proptest = "1"

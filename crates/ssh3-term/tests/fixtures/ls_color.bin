@@ -1,0 +1,121 @@
+total 2135260
+drwxr-xr-x 181 root root      4096 Oct 17 21:05 [0m[01;34m.[0m
+drwxr-xr-x  14 root root      4096 Oct 23 19:38 [01;34m..[0m
+drwxr-xr-x   2 root root      4096 Sep 14 20:42 [01;34m7zip[0m
+drwxr-xr-x   2 root root      4096 Sep 30 18:31 [01;34mapparmor[0m
+-rw-r--r--   1 root root     10899 May 17  2025 apr.exp
+drwxr-xr-x   2 root root      4096 Oct  9 23:20 [01;34mapr-util-1[0m
+-rw-r--r--   1 root root      6618 Aug 13 01:21 aprutil.exp
+-rwxr-xr-x   1 root root     88720 Aug  1 23:42 [01;32mat-spi2-registryd[0m
+-rwxr-xr-x   1 root root     26800 Aug  1 23:42 [01;32mat-spi-bus-launcher[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34maudit[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34mavahi[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mawk[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mbash[0m
+drwxr-xr-x   2 root root      4096 Oct  9 23:29 [01;34mbfd-plugins[0m
+drwxr-xr-x   2 root root      4096 Oct  1 13:05 [01;34mbind[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:48 [01;34mbinfmt.d[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:47 [01;34mbpf[0m
+drwxr-xr-x   2 root root      4096 May 18 16:35 [01;34mcairo[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:03 [01;34mcatalyst[0m
+drwxr-xr-x   3 root root      4096 May 13 23:42 [01;34mccache[0m
+drwxr-xr-x   3 root root      4096 Sep 28 19:42 [01;34mcef[0m
+drwxr-xr-x   3 root root      4096 Sep  6 13:05 [01;34mchromium[0m
+drwxr-xr-x   3 root root      4096 Oct  9 23:29 [01;34mclang[0m
+drwxr-xr-x 338 root root      4096 Oct 15 17:15 [01;34mcmake[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:46 [01;34mcompel[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mcoreutils[0m
+drwxr-xr-x   2 root root      4096 Apr 22  2026 [01;34mcredstore[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:46 [01;34mcriu[0m
+drwxr-xr-x   2 root root      4096 May 12 00:22 [01;34mcrosstool-ng[0m
+-rw-r--r--   1 root root      2416 Aug 12 19:58 crt1.o
+-rw-r--r--   1 root root      1240 Aug 12 19:58 crti.o
+-rw-r--r--   1 root root       808 Aug 12 19:58 crtn.o
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mcryptsetup[0m
+drwxr-xr-x   2 root root      4096 May  1 23:37 [01;34mdb5.3[0m
+drwxr-xr-x   3 root root      4096 May  1 17:59 [01;34mdbus-1.0[0m
+---s--x---   1 root dbus     68216 Mar  3  2025 [37;41mdbus-daemon-launch-helper[0m
+-rwxr-xr-x   1 root root     71864 Sep 23  2025 [01;32mdconf-service[0m
+drwxr-xr-x   2 root root      4096 May  1 17:43 [01;34mdepmod.d[0m
+drwxr-xr-x   3 root root      4096 May  2 08:06 [01;34mdocker[0m
+drwxr-xr-x   3 root root      4096 May 21 07:41 [01;34mdpkg[0m
+drwxr-xr-x   4 root root      4096 Oct  6 00:32 [01;34mdracut[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34mdri[0m
+drwxr-xr-x   2 root root      4096 May  1 23:37 [01;34me2fsprogs[0m
+-rwxr-xr-x   1 root root     18536 Mar 12  2026 [01;32me2initrd_helper[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34menchant-2[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mengines-3[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34menvironment.d[0m
+drwxr-xr-x   3 root root      4096 Sep 19 16:35 [01;34mffmpeg4.4[0m
+drwxr-xr-x   3 root root      4096 May  1 19:26 [01;34mfirewalld[0m
+drwxr-xr-x  91 root root      4096 Sep  3 22:47 [01;34mfirmware[0m
+drwxr-xr-x   4 root root      4096 Sep 14 21:44 [01;34mfpc[0m
+drwxr-xr-x   3 root root      4096 Jul 13 19:35 [01;34mfreerdp[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mgawk[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34mgbm[0m
+drwxr-xr-x   6 root root      4096 Jul 15 16:22 [01;34mgcc[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:49 [01;34mgconv[0m
+-rw-r--r--   1 root root      3776 Aug 12 19:58 gcrt1.o
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mgetconf[0m
+drwxr-xr-x   2 root root      4096 May  1 23:37 [01;34mgettext[0m
+drwxr-xr-x   5 root root      4096 Oct  2 22:53 [01;34mghc-9.6.6[0m
+drwxr-xr-x   3 root root      4096 May  1 17:43 [01;34mgio[0m
+-rwxr-xr-x   1 root root     14432 Jul 31 14:50 [01;32mgio-launch-desktop[0m
+drwxr-xr-x   2 root root      4096 Sep  4 09:36 [01;34mgirepository-1.0[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:46 [01;34mgit-core[0m
+drwxr-xr-x   3 root root      4096 May  1 17:43 [01;34mglib-2.0[0m
+-rwxr-xr-x   1 root root     18560 Jan  9  2025 [01;32mglib-pacrunner[0m
+drwxr-xr-x   3 root root      4096 May 18 16:35 [01;34mglycin-loaders[0m
+drwxr-xr-x   3 root root      4096 Jul 11 23:55 [01;34mgnome-settings-daemon-3.0[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mgnupg[0m
+drwxr-xr-x   9 root root      4096 Sep  3 22:46 [01;34mgo[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mgprofng[0m
+drwxr-xr-x   3 root root      4096 Jul 11 23:55 [01;34mgraphene-1.0[0m
+drwxr-xr-x   9 root root      4096 Sep  3 22:46 [01;34mgraphviz[0m
+-rw-r--r--   1 root root      2720 Aug 12 19:58 grcrt1.o
+drwxr-xr-x   5 root root      4096 May  3 14:55 [01;34mgrub[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:46 [01;34mgstreamer-1.0[0m
+drwxr-xr-x   3 root root      4096 Jul 11 23:55 [01;34mgtk-3.0[0m
+drwxr-xr-x   3 root root      4096 May  1 18:51 [01;34mguile[0m
+drwxr-xr-x   2 root root      4096 May 12 00:22 [01;34mhelp2man[0m
+drwxr-xr-x   3 root root      4096 Sep 30 18:31 [01;34mhttpd[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34mhwloc[0m
+drwxr-xr-x   3 root root      4096 Oct  5 11:25 [01;34mhyperfine[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:48 [01;34mibacm[0m
+drwxr-xr-x   3 root root      4096 Sep 28 10:10 [01;34micu[0m
+drwxr-xr-x   4 root root      4096 Sep  4 09:36 [01;34mImageMagick-7.1.2[0m
+drwxr-xr-x   4 root root      4096 Jul 11 23:33 [01;34mimlib2[0m
+drwxr-xr-x   6 root root      4096 Sep  3 22:47 [01;34minitcpio[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:03 [01;34mitcl4.3.2[0m
+drwxr-xr-x   2 root root      4096 May 18 16:35 [01;34mjack[0m
+drwxr-xr-x   4 root root      4096 May  7 17:37 [01;34mjvm[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:45 [01;34mkernel[0m
+drwxr-xr-x   3 root root      4096 Sep  3 22:04 [01;34mkicad[0m
+drwxr-xr-x   3 root root      4096 May  1 17:43 [01;34mkrb5[0m
+lrwxrwxrwx   1 root root        22 Aug 12 19:58 [01;36mld-linux.so.2[0m -> ../lib32/ld-linux.so.2
+-rwxr-xr-x   1 root root    283632 Aug 12 19:58 [01;32mld-linux-x86-64.so.2[0m
+lrwxrwxrwx   1 root root        25 Mar 22  2026 [01;36mld-musl-x86_64.so.1[0m -> /usr/lib/musl/lib/libc.so
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mldscripts[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:46 [01;34mld.so.conf.d[0m
+drwxr-xr-x   2 root root      4096 Sep  3 22:45 [01;34mleancrypto[0m
+-rwxr-xr-x   1 root root     14440 Jun  7 19:45 [01;32mlessecho[0m
+-rwxr-xr-x   1 root root      1067 Jun  7 19:45 [01;32mless-osc8-open[0m
+lrwxrwxrwx   1 root root        43 Sep  1 03:08 [01;36mlibabsl_atomic_hook_test_helper.so[0m -> libabsl_atomic_hook_test_helper.so.2608.0.0
+-rwxr-xr-x   1 root root     14024 Sep  1 03:08 [01;32mlibabsl_atomic_hook_test_helper.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        35 Sep  1 03:08 [01;36mlibabsl_base_cpu_detect.so[0m -> libabsl_base_cpu_detect.so.2608.0.0
+-rwxr-xr-x   1 root root     14224 Sep  1 03:08 [01;32mlibabsl_base_cpu_detect.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        24 Sep  1 03:08 [01;36mlibabsl_base.so[0m -> libabsl_base.so.2608.0.0
+-rwxr-xr-x   1 root root     18496 Sep  1 03:08 [01;32mlibabsl_base.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        24 Sep  1 03:08 [01;36mlibabsl_city.so[0m -> libabsl_city.so.2608.0.0
+-rwxr-xr-x   1 root root     13984 Sep  1 03:08 [01;32mlibabsl_city.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        30 Sep  1 03:08 [01;36mlibabsl_civil_time.so[0m -> libabsl_civil_time.so.2608.0.0
+-rwxr-xr-x   1 root root     26592 Sep  1 03:08 [01;32mlibabsl_civil_time.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        35 Sep  1 03:08 [01;36mlibabsl_clock_interface.so[0m -> libabsl_clock_interface.so.2608.0.0
+-rwxr-xr-x   1 root root     14392 Sep  1 03:08 [01;32mlibabsl_clock_interface.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        33 Sep  1 03:08 [01;36mlibabsl_cord_internal.so[0m -> libabsl_cord_internal.so.2608.0.0
+-rwxr-xr-x   1 root root     55264 Sep  1 03:08 [01;32mlibabsl_cord_internal.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        24 Sep  1 03:08 [01;36mlibabsl_cord.so[0m -> libabsl_cord.so.2608.0.0
+-rwxr-xr-x   1 root root     96224 Sep  1 03:08 [01;32mlibabsl_cord.so.2608.0.0[0m
+lrwxrwxrwx   1 root root        35 Sep  1 03:08 [01;36mlibabsl_cordz_functions.so[0m -> libabsl_cordz_functions.so.2608.0.0
+-rwxr-xr-x   1 root root     14296 Sep  1 03:08 [01;32mlibabsl_cordz_functions.so.2608.0.0[0m
+ls: write error

@@ -1,0 +1,183 @@
+[?1049h[22;0;0t[24;1H[?1h=//! Reliable, resumable lanes with absolute credit limits (SPEC §4, §5).
+//!
+//! One `Lane` is one bidirectional byte conversation. Per direction:
+//!
+//! * **sender**: `sbuf` holds bytes read from the local source that the peer
+//!   has not yet `accepted` (`[sbase, send_end)`). The source is read only
+//!   while the lane holds peer credit (`send_end < peer_limit`) and the
+//!   server-wide send budget has room. Bytes are kept until accepted so a
+//!   resume can resend from the peer's accepted offset.
+//! * **receiver**: `rbuf` holds bytes read from QUIC but not yet delivered
+//!   to the local sink (`[delivered, received)`). The receiver advertises an
+//!   absolute, monotone `limit = delivered + granted` with
+//!   `limit − delivered ≤ ring capacity`, so the ring cannot overflow. QUIC
+//!   streams are read unconditionally (never waiting on the sink); a byte at
+//!   or beyond `limit` is a protocol error. Connection credit is therefore
+//!   never held hostage by a stalled sink (review D2).
+//!
+//! Lane state is session state and survives carrier death. Tasks bound to a
+//! carrier's QUIC streams carry an `epoch`; a resume bumps it under the lock
+//! that snapshots `received`, fencing off stragglers of the old carrier.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+[7mwork/sample.rs[27m[K[Kuse std::time::{Duration, Instant};
+
+use quinn::{Connection, RecvStream, SendStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Notify, mpsc};
+
+use crate::budget::{Budget, Permit};
+use crate::error::{Error, Result, close};
+use crate::frame;
+use crate::msg::{LaneHeader, LanePos, Message};
+use crate::ring::{CHUNK, ChunkPermit, ChunkSlice, Ring, Tail};
+
+/// Chunks a lane may hold beyond the budget: enough to store its floor grant
+/// (16 KiB, which may straddle two chunks) so that budget exhaustion caused
+/// by other sessions never starves a lane's floor (SPEC §4).
+const RECV_FLOOR_CHUNKS: u32 = 2;
+/// One chunk so every lane — in particular the session event lane — can
+/// always make progress on its send side.
+const SEND_FLOOR_CHUNKS: u32 = 1;
+const CH: u64 = CHUNK as u64;
+
+fn round_up(n: u64) -> u64 {
+    n.div_ceil(CH) * CH
+:[K[K}
+
+/// Byte counters (SPEC §8 I6) — the memory-bound tests assert on these.
+#[derive(Default, Debug)]
+pub struct Stats {
+    pub send_ring_bytes: AtomicU64,
+    pub recv_ring_bytes: AtomicU64,
+    /// Σ (limit − delivered) over lanes: credit this side has outstanding.
+    pub credit_outstanding: AtomicU64,
+    pub channels: AtomicU64,
+    pub lane_bytes_sent: AtomicU64,
+    /// Current connection window (§1 scheduler), what is charged for it,
+    /// and how often it was raised / lowered.
+    pub conn_window: AtomicU64,
+    pub conn_window_charged: AtomicU64,
+    pub window_raises: AtomicU64,
+    pub window_lowers: AtomicU64,
+}
+
+/// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
+#[derive(Default)]
+pub struct AckQueue {
+    pub(crate) urgent: Mutex<Vec<Arc<Lane>>>,
+:[K[K/[Kff[Knn[K[1;1H[K}
+[2;1H[K
+[3;1H[K/// Byte counters (SPEC §8 I6) — the memory-bound tests assert on these.
+[4;1H[K#[derive(Default, Debug)]
+[5;1H[Kpub struct Stats {
+[6;1H[K    pub send_ring_bytes: AtomicU64,
+[7;1H[K    pub recv_ring_bytes: AtomicU64,
+[8;1H[K    /// Σ (limit − delivered) over lanes: credit this side has outstanding.
+[9;1H[K    pub credit_outstanding: AtomicU64,
+[10;1H[K    pub channels: AtomicU64,
+[11;1H[K    pub lane_bytes_sent: AtomicU64,
+[12;1H[K    /// Current connection window (§1 scheduler), what is charged for it,
+[13;1H[K    /// and how often it was raised / lowered.
+[14;1H[K    pub conn_window: AtomicU64,
+[15;1H[K    pub conn_window_charged: AtomicU64,
+[16;1H[K    pub window_raises: AtomicU64,
+[17;1H[K    pub window_lowers: AtomicU64,
+[18;1H[K}
+[19;1H[K
+[20;1H[K/// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
+[21;1H[K#[derive(Default)]
+[22;1H[Kpub struct AckQueue {
+[23;1H[K    pub(crate) urgent: Mutex<Vec<Arc<Lane>>>,
+[24;1H[1;1H[K}
+[2;1H[K
+[3;1H[K/// Byte counters (SPEC §8 I6) — the memory-bound tests assert on these.
+[4;1H[K#[derive(Default, Debug)]
+[5;1H[Kpub struct Stats {
+[6;1H[K    pub send_ring_bytes: AtomicU64,
+[7;1H[K    pub recv_ring_bytes: AtomicU64,
+[8;1H[K    /// Σ (limit − delivered) over lanes: credit this side has outstanding.
+[9;1H[K    pub credit_outstanding: AtomicU64,
+[10;1H[K    pub channels: AtomicU64,
+[11;1H[K    pub lane_bytes_sent: AtomicU64,
+[12;1H[K    /// Current connection window (§1 scheduler), what is charged for it,
+[13;1H[K    /// and how often it was raised / lowered.
+[14;1H[K    pub conn_window: AtomicU64,
+[15;1H[K    pub conn_window_charged: AtomicU64,
+[16;1H[K    pub window_raises: AtomicU64,
+[17;1H[K    pub window_lowers: AtomicU64,
+[18;1H[K}
+[19;1H[K
+[20;1H[K/// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
+[21;1H[K#[derive(Default)]
+[22;1H[Kpub struct AckQueue {
+[23;1H[K    pub(crate) urgent: Mutex<Vec<Arc<Lane>>>,
+[24;1H...skipping...
+    [7mfn[27m readable(&self) -> impl std::future::Future<Output = std::io::Result<()>>  + Send;
+}
+
+impl Readable for tokio::net::tcp::OwnedReadHalf {
+    async [7mfn[27m readable(&self) -> std::io::Result<()> {
+        tokio::net::tcp::OwnedReadHalf::readable(self).await
+    }
+}
+
+/// In-memory pipes and boxed process streams cannot report readiness
+/// without a read: treated as ready (one floor chunk per such lane).
+impl Readable for tokio::io::DuplexStream {
+    async [7mfn[27m readable(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Readable for Box<dyn tokio::io::AsyncRead + Send + Unpin> {
+    async [7mfn[27m readable(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+:[K[K[HMpub(crate) trait Readable {
+[HM/// return promptly).
+[HM/// chunk is reserved before the read, so reserve only when a read will
+[HM/// idle source does not pin a budget chunk while it waits (SPEC §4: the
+[HM/// A local source that can say "data is waiting" without a buffer, so an
+[HM
+[HM}
+[HM    pub events: mpsc::Sender<Message>,
+[HM    /// Session event queue (LaneFin is an event, SPEC §5).
+[HM    pub floor_budget: Arc<Budget>,
+[HM    /// Floor chunks: not limited, counted for introspection.
+[HM    pub send_budget: Arc<Budget>,
+[HM    /// Send-ring chunk storage (LaneSendBudget).
+[HM    pub recv_budget: Arc<Budget>,
+[HM    /// Receive-ring chunk storage (LaneCreditBudget).
+[HM    pub acks: Arc<AckQueue>,
+[HM    pub stats: Arc<Stats>,
+[HM    pub ack_interval: Duration,
+[HM    pub ack_bytes: u64,
+[HM    pub floor: u64,
+[HM    pub cap: u64,
+[HMpub(crate) struct LaneEnv {
+[HM#[derive(Clone)]
+[24;1H[K:[K[K...skipping...
+                        Ok(()) => {
+                            c.1 = end;
+                            self.env.stats.lane_bytes_sent.fetch_add(slice.len()  as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::debug!(chan = self.chan_id, lane = self.lan e, "lane write failed ({e}); waiting for a new carrier");
+                            cur = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// QUIC stream → receive ring, reading directly into a reserved chunk.
+    /// Never waits on the sink: credit guarantees storage. One per attach,
+    /// fenced by `epoch`.
+    async [7mfn[27m quic_reader(self: Arc<Self>, mut recv: RecvStream, epoch: u64) -> R esult<()> {
+        loop {
+            let (mut tail, wa
+[7m(END)[27m[K[K[?1l>[?1049l[23;0;0t

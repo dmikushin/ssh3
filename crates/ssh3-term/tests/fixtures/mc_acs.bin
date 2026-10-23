@@ -1,0 +1,57 @@
+^[0[?1049h[22;0;0t[1;30r[4l[30;1H(B[m[37m[40m(B[m[39;49m[K[?1049l[23;0;0t[?1001s[?1002h[?1006h[?2004h[?1049h[22;0;0t[1;30r[4l[?1h=(B[m[39m[49m[1;30r[H[2J[2;99H[1K (0[37m[44mk[2;100H]0;mc [marcusmae@gambetta]:/home/marcusmae/scratch/ssh-udp/term-eval\>]7;file://gambetta/home/marcusmae/scratch/ssh-udp/term-eval\]0;mc [marcusmae@gambetta]:/home/marcusmae/scratch/ssh-udp/term-eval\>]7;file://gambetta/home/marcusmae/scratch/ssh-udp/term-eval\l(B[m(B[37m[44m<(0[37m[44mq(B[m(B[30m[47m ...marcusmae/scratch/ssh-udp/term-eval (0[37m[44mq(B[m(B[37m[44m.[^]>(0[37m[44mk[49C
+x(B[m(B[93m[44m.n          Name           (0[37m[44mx(B[m(B[93m[44m Size  (0[37m[44mx(B[m(B[93m[44mModify time (0[37m[44mx
+x(B[m(B[30m[46m/..                        (0[30m[46mx(B[m(B[30m[46mUP--DIR(0[30m[46mx(B[m(B[30m[46mOct 23 20:52(0[37m[44mx
+x(B[m(B[97m[44m/.git                      (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:50(0[37m[44mx
+x(B[m(B[97m[44m/fixtures                  (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:52(0[37m[44mx
+x(B[m(B[97m[44m/src                       (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:50(0[37m[44mx
+x(B[m(B[97m[44m/work                      (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:52(0[37m[44mx
+x(B[m(B[37m[44m .gitignore                (0[37m[44mx(B[m(B[37m[44m      8(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx
+x(B[m(B[37m[44m Cargo.lock                (0[37m[44mx(B[m(B[37m[44m  13432(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx
+x(B[m(B[37m[44m Cargo.toml                (0[37m[44mx(B[m(B[37m[44m    127(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx
+x(B[m(B[92m[44m*record-all.sh             (0[37m[44mx(B[m(B[92m[44m   1074(0[37m[44mx(B[m(B[92m[44mOct 23 20:52(0[37m[44mx
+x(B[m(B[92m[44m*record.py                 (0[37m[44mx(B[m(B[92m[44m   2852(0[37m[44mx(B[m(B[92m[44mOct 23 20:52(0[37m[44mx
+x(B[m(B[36m[44m synth.py                  (0[37m[44mx(B[m(B[36m[44m   2884(0[37m[44mx(B[m(B[36m[44mOct 23 20:52(0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+x(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx
+tqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqu
+x(B[m(B[37m[44mUP--DIR                                         (0[37m[44mx
+mqqqqqqqqqqqqqqqqqqqqqqqqqqq(B[m(B[37m[44m 557G / 4615G (12%) (0[37m[44mqj
+(B[m(B[39m[49mHint: Tab changes your current panel.[28;100H[1;1H[30m[46m  Left     File     Command     Options     Right[K[2;51H(0[37m[44ml(B[m(B[37m[44m<(0[37m[44mq(B[m(B[37m[44m ...marcusmae/scratch/ssh-udp/term-eval (0[37m[44mq(B[m(B[37m[44m.[^]>[3;51H(0[37m[44mx(B[m(B[93m[44m.n          Name           (0[37m[44mx(B[m(B[93m[44m Size  (0[37m[44mx(B[m(B[93m[44mModify time (0[37m[44mx[4;51Hx(B[m(B[97m[44m/..                        (0[37m[44mx(B[m(B[97m[44mUP--DIR(0[37m[44mx(B[m(B[97m[44mOct 23 20:52(0[37m[44mx[5;51Hx(B[m(B[97m[44m/.git                      (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:50(0[37m[44mx[6;51Hx(B[m(B[97m[44m/fixtures                  (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:52(0[37m[44mx[7;51Hx(B[m(B[97m[44m/src                       (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:50(0[37m[44mx[8;51Hx(B[m(B[97m[44m/work                      (0[37m[44mx(B[m(B[97m[44m   4096(0[37m[44mx(B[m(B[97m[44mOct 23 20:52(0[37m[44mx[9;51Hx(B[m(B[37m[44m .gitignore                (0[37m[44mx(B[m(B[37m[44m      8(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx[10;51Hx(B[m(B[37m[44m Cargo.lock                (0[37m[44mx(B[m(B[37m[44m  13432(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx[11;51Hx(B[m(B[37m[44m Cargo.toml                (0[37m[44mx(B[m(B[37m[44m    127(0[37m[44mx(B[m(B[37m[44mOct 23 20:50(0[37m[44mx[12;51Hx(B[m(B[92m[44m*record-all.sh             (0[37m[44mx(B[m(B[92m[44m   1074(0[37m[44mx(B[m(B[92m[44mOct 23 20:52(0[37m[44mx[13;51Hx(B[m(B[92m[44m*record.py                 (0[37m[44mx(B[m(B[92m[44m   2852(0[37m[44mx(B[m(B[92m[44mOct 23 20:52(0[37m[44mx[14;51Hx(B[m(B[36m[44m synth.py                  (0[37m[44mx(B[m(B[36m[44m   2884(0[37m[44mx(B[m(B[36m[44mOct 23 20:52(0[37m[44mx[15;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[16;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[17;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[18;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[19;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[20;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[21;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[22;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[23;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[24;51Hx(B[m(B[37m[44m                           (0[37m[44mx(B[m(B[37m[44m       (0[37m[44mx(B[m(B[37m[44m            (0[37m[44mx[25;51Htqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqu[26;51Hx(B[m(B[37m[44mUP--DIR                                         (0[37m[44mx[27;51Hmqqqqqqqqqqqqqqqqqqqqqqqqqqq(B[m(B[37m[44m 557G / 4615G (12%) (0[37m[44mqj[29;1H(B[m(B[39m[49m$
+[97m[40m 1[30m[46mHelp    [97m[40m 2[30m[46mMenu    [97m[40m 3[30m[46mView    [97m[40m 4[30m[46mEdit    [97m[40m 5[30m[46mCopy    [97m[40m 6[30m[46mRenMov  [97m[40m 7[30m[46mMkdir   [97m[40m 8[30m[46mDelete  [97m[40m 9[30m[46mPullDn  [97m[40m10[30m[46mQuit[K[29;3H[1;1H[39m[49m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[1;100H[?2004l[?1006l[?1002l[?1001r[?1l>[30;1H(B[m[39;49m[K[?1049l[23;0;0t[39;49m
