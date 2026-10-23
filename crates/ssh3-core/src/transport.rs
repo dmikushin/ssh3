@@ -84,6 +84,33 @@ pub fn endpoint_config(keys: &EndpointKeys) -> EndpointConfig {
     cfg
 }
 
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// TLS 1.3 server config presenting an OpenSSH host key (SPEC §2.1).
+pub fn server_tls(id: &ssh3_keys::host::HostIdentity) -> Result<rustls::ServerConfig> {
+    rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::Tls(e.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(vec![id.cert_der().clone()], id.private_key_der())
+        .map_err(|e| Error::Tls(e.to_string()))
+}
+
+/// TLS 1.3 client config whose only trust decision is `verifier`
+/// (known_hosts, SPEC §2.1). No early data: auth is never 0-RTT.
+pub fn client_tls(verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>) -> Result<rustls::ClientConfig> {
+    let mut c = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    c.enable_early_data = false;
+    Ok(c)
+}
+
 fn with_alpn_server(mut c: rustls::ServerConfig) -> rustls::ServerConfig {
     c.alpn_protocols = vec![ALPN.to_vec()];
     c

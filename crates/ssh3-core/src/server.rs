@@ -9,7 +9,7 @@ use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, TokioRuntime
 use rand::RngCore;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::{Authenticator, Authz, EXPORTER_LABEL, EXPORTER_LEN, auth_blob};
+use crate::auth::{Authenticator, Authz, EXPORTER_LABEL, EXPORTER_LEN, keys_intent, pubkey_blob, verify_auth};
 use crate::error::{Error, Result, close};
 use crate::frame::{self, MAX_FRAME, MAX_FRAME_PRE_AUTH};
 use crate::limits::Limits;
@@ -290,9 +290,16 @@ async fn auth_phase(conn: &Connection, shared: &ServerShared, send: &mut SendStr
         let Message::Auth { user, pubkey, sig, intent } = m else {
             return Err(Error::Protocol(format!("expected Auth, got {m:?}")));
         };
-        let blob = auth_blob(&exporter, &user, &pubkey, intent);
-        match shared.authenticator.verify(&user, &pubkey, &blob, &sig) {
-            Ok(authz) => {
+        // Signature first (ssh3-keys owns the blob), then authorized_keys.
+        let checked = verify_auth(&exporter, &user, &pubkey, keys_intent(intent), &sig)
+            .map_err(|e| e.to_string())
+            .and_then(|key| {
+                let authz = shared.authenticator.authorize(&user, &key, conn.remote_address().ip())?;
+                let blob = pubkey_blob(&key).map_err(|e| e.to_string())?;
+                Ok((blob, authz))
+            });
+        match checked {
+            Ok((pubkey, authz)) => {
                 return match intent {
                     Intent::New => Ok(Authed::New { user, key: pubkey, authz }),
                     Intent::Resume => {

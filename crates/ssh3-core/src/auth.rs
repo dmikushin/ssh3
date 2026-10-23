@@ -1,52 +1,42 @@
-//! Authentication boundary (SPEC §2.2). Key formats, agents and
-//! authorized_keys live in `ssh3-keys`; core only needs these two traits and
-//! the exact signed blob.
+//! Authentication and authorization (SPEC §2.2). The signed blob, key
+//! formats, the agent and authorized_keys parsing are `ssh3-keys`; there is
+//! exactly one implementation of the blob, there. This module adapts it:
+//! the wire `Intent`, the `Authz` policy and the server's authorizer.
+
+use std::net::IpAddr;
+use std::path::PathBuf;
+
+pub use ssh3_keys::PublicKey;
+pub use ssh3_keys::auth::{EXPORTER_LABEL, EXPORTER_LEN, pubkey_blob, sign_auth, verify_auth};
+use ssh3_keys::authorized_keys::{AuthorizedKeys, KeyOptions};
+pub use ssh3_keys::signer::Signer;
 
 use crate::msg::Intent;
 
-/// Exporter label and length (SPEC §2.2).
-pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-ssh3-rs-auth";
-pub const EXPORTER_LEN: usize = 32;
-const AUTH_MAGIC: &[u8] = b"ssh3-rs auth v0";
-
-fn put_str(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    out.extend_from_slice(s);
-}
-
-/// `"ssh3-rs auth v0" || exporter || str(user) || str(pubkey_blob) || str(intent)`.
-pub fn auth_blob(exporter: &[u8; EXPORTER_LEN], user: &str, pubkey_blob: &[u8], intent: Intent) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AUTH_MAGIC.len() + EXPORTER_LEN + 12 + user.len() + pubkey_blob.len() + 6);
-    out.extend_from_slice(AUTH_MAGIC);
-    out.extend_from_slice(exporter);
-    put_str(&mut out, user.as_bytes());
-    put_str(&mut out, pubkey_blob);
-    put_str(&mut out, intent.as_str().as_bytes());
-    out
-}
-
-/// Client side: holds one user key (file or agent).
-pub trait Signer: Send + Sync {
-    /// OpenSSH wire encoding of the public key.
-    fn public_key_blob(&self) -> Vec<u8>;
-    /// Signature over `data` in the key's wire signature encoding.
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+/// The wire intent as ssh3-keys' blob builder names it.
+pub fn keys_intent(i: Intent) -> ssh3_keys::auth::Intent {
+    match i {
+        Intent::New => ssh3_keys::auth::Intent::New,
+        Intent::Resume => ssh3_keys::auth::Intent::Resume,
+    }
 }
 
 /// What an authenticated key may do (from authorized_keys options).
-/// Immutable once built: the session holds it behind an `Arc` and there are
-/// no setters, so a policy cannot change under a running session.
+/// Immutable once built; the session swaps in a fresh value at each attach
+/// (the policy is re-evaluated on resume), never mutates one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authz {
     port_forwarding: bool,
     permit_open: PermitList,
     permit_listen: PermitList,
     pty: bool,
+    agent_forwarding: bool,
     forced_command: Option<String>,
 }
 
 /// `permitopen=` / `permitlisten=` semantics: `Any` when the option is
-/// absent; otherwise only the listed `host:port` pairs (`None` port = `*`).
+/// absent; otherwise only the listed pairs. Host `*` or a `None` port is a
+/// wildcard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermitList {
     Any,
@@ -60,15 +50,53 @@ impl PermitList {
             PermitList::Only(v) => v.iter().any(|(h, p)| (h == "*" || h.eq_ignore_ascii_case(host)) && p.is_none_or(|p| p == port)),
         }
     }
+
+    /// OpenSSH `permitopen="host:port"` values (`[v6]:port`, port `*`).
+    /// For `permitlisten`, a bare `port` means `localhost:port`.
+    fn parse(values: &[String], listen: bool) -> Result<Self, String> {
+        if values.is_empty() {
+            return Ok(PermitList::Any);
+        }
+        let mut out = Vec::new();
+        for list in values {
+            for v in list.split(',') {
+                let v = v.trim();
+                let (host, port) = if let Some(rest) = v.strip_prefix('[') {
+                    let (h, p) = rest.split_once("]:").ok_or_else(|| format!("bad permit entry {v:?}"))?;
+                    (h.to_string(), p)
+                } else if let Some((h, p)) = v.rsplit_once(':') {
+                    (h.to_string(), p)
+                } else if listen {
+                    ("localhost".to_string(), v)
+                } else {
+                    return Err(format!("permit entry {v:?} has no port"));
+                };
+                let port = if port == "*" { None } else { Some(port.parse::<u16>().map_err(|_| format!("bad port in permit entry {v:?}"))?) };
+                out.push((host, port));
+            }
+        }
+        Ok(PermitList::Only(out))
+    }
 }
 
 impl Authz {
-    pub fn new(port_forwarding: bool, permit_open: PermitList, permit_listen: PermitList, pty: bool, forced_command: Option<String>) -> Self {
-        Self { port_forwarding, permit_open, permit_listen, pty, forced_command }
+    pub fn new(port_forwarding: bool, permit_open: PermitList, permit_listen: PermitList, pty: bool, agent_forwarding: bool, forced_command: Option<String>) -> Self {
+        Self { port_forwarding, permit_open, permit_listen, pty, agent_forwarding, forced_command }
     }
     /// No restrictions (a plain authorized_keys line).
     pub fn unrestricted() -> Self {
-        Self::new(true, PermitList::Any, PermitList::Any, true, None)
+        Self::new(true, PermitList::Any, PermitList::Any, true, true, None)
+    }
+    /// From the options of the authorized_keys line that admitted the key.
+    pub fn from_key_options(o: &KeyOptions) -> Result<Self, String> {
+        Ok(Self::new(
+            o.port_forwarding_allowed(),
+            PermitList::parse(&o.permitopen, false)?,
+            PermitList::parse(&o.permitlisten, true)?,
+            o.pty_allowed(),
+            o.agent_forwarding_allowed(),
+            o.command.clone(),
+        ))
     }
     pub fn allows_direct_tcp(&self, host: &str, port: u16) -> bool {
         self.port_forwarding && self.permit_open.allows(host, port)
@@ -79,14 +107,50 @@ impl Authz {
     pub fn allows_pty(&self) -> bool {
         self.pty
     }
+    pub fn allows_agent_forwarding(&self) -> bool {
+        self.agent_forwarding
+    }
     pub fn forced_command(&self) -> Option<&str> {
         self.forced_command.as_deref()
     }
 }
 
-/// Server side: decides whether `pubkey_blob` may log in as `user`, checks
-/// the signature over `blob`, and returns the key's policy. Returns a
-/// human-readable reason on refusal.
+/// Server side: may `key` — whose signature core has already verified with
+/// ssh3-keys — log in as `user` from `peer`? Returns the key's policy or a
+/// human-readable refusal.
 pub trait Authenticator: Send + Sync {
-    fn verify(&self, user: &str, pubkey_blob: &[u8], blob: &[u8], sig: &[u8]) -> Result<Authz, String>;
+    fn authorize(&self, user: &str, key: &PublicKey, peer: IpAddr) -> Result<Authz, String>;
+}
+
+/// OpenSSH semantics: `~user/.ssh/authorized_keys`, re-read on every attempt.
+pub struct AuthorizedKeysAuthenticator {
+    path_for: Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>,
+}
+
+impl AuthorizedKeysAuthenticator {
+    /// `path_for(user)` names the user's authorized_keys file, or None if the
+    /// user does not exist.
+    pub fn new(path_for: impl Fn(&str) -> Option<PathBuf> + Send + Sync + 'static) -> Self {
+        Self { path_for: Box::new(path_for) }
+    }
+
+    /// Home directories from /etc/passwd.
+    pub fn from_passwd() -> Self {
+        Self::new(|user| {
+            let text = std::fs::read_to_string("/etc/passwd").ok()?;
+            text.lines()
+                .map(|l| l.split(':').collect::<Vec<_>>())
+                .find(|f| f.len() >= 6 && f[0] == user)
+                .map(|f| PathBuf::from(f[5]).join(".ssh/authorized_keys"))
+        })
+    }
+}
+
+impl Authenticator for AuthorizedKeysAuthenticator {
+    fn authorize(&self, user: &str, key: &PublicKey, peer: IpAddr) -> Result<Authz, String> {
+        let path = (self.path_for)(user).ok_or_else(|| format!("no such user {user:?}"))?;
+        let ak = AuthorizedKeys::load(&path).map_err(|e| e.to_string())?;
+        let line = ak.authorize(key, peer).map_err(|e| format!("{}: {e}", path.display()))?;
+        Authz::from_key_options(&line.options).map_err(|e| format!("{}: {e}", line.location()))
+    }
 }

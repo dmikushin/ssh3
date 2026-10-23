@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use ssh3_core::auth::Signer as _;
 use ssh3_core::error::close;
 use ssh3_core::msg::{Intent, Message};
 use ssh3_core::transport::dual_stack_socket;
@@ -24,10 +25,10 @@ async fn auth_success_and_failure() {
     let env = env_with(fast_limits());
     let c = env.client().await;
     assert!(c.shared.is_attached());
-    let stranger = TestKey::new(99);
+    let stranger = user_key(99);
     let r = ClientSession::connect(env.opts(&stranger), udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await;
     match r {
-        Err(Error::Auth(m)) => assert!(m.contains("not authorized"), "{m}"),
+        Err(Error::Auth(m)) => assert!(m.contains("key not present in authorized_keys"), "{m}"),
         Err(e) => panic!("expected an auth error, got {e}"),
         Ok(_) => panic!("unauthorized key was accepted"),
     }
@@ -306,10 +307,9 @@ async fn connect_failure_is_reported() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authz_permitopen_is_enforced() {
-    use ssh3_core::auth::{Authz, PermitList};
     let env = env_with(fast_limits());
     let echo = echo_server().await;
-    *env.auth.authz.lock().unwrap() = Some(Authz::new(true, PermitList::Only(vec![("127.0.0.1".into(), Some(1))]), PermitList::Any, true, None));
+    env.authorize_only(&env.key, "permitopen=\"127.0.0.1:1\"");
     let c = env.client().await;
     let s = TcpStream::connect(echo).await.unwrap();
     match c.open_direct_tcp(s, "127.0.0.1", echo.port()).await {
@@ -328,7 +328,7 @@ async fn every_auth_refusal_is_delivered_before_close() {
         let (mut s, mut r) = conn.open_bi().await.unwrap();
         let mut got = 0;
         for _ in 0..n {
-            let bad = Message::Auth { user: "tester".into(), pubkey: ssh3_core::auth::Signer::public_key_blob(&*env.key), sig: vec![0; 64], intent: Intent::New };
+            let bad = Message::Auth { user: "tester".into(), pubkey: ssh3_core::auth::pubkey_blob(env.key.public_key()).unwrap(), sig: vec![0; 64], intent: Intent::New };
             ssh3_core::frame::write_message(&mut s, &bad).await.unwrap();
             match ssh3_core::frame::read_message(&mut r, 65536).await {
                 Ok(Some(Message::AuthFail { .. })) => got += 1,
@@ -388,4 +388,66 @@ async fn over_credit_peer_is_cut_while_others_work() {
     let fwd = forward(&c, echo).await;
     let data = Arc::new(pattern(256 << 10, 21));
     assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
+}
+
+fn host_check_with(env: &Env, files: Vec<std::path::PathBuf>, mode: ssh3_keys::verifier::StrictHostKeyChecking) -> ssh3_core::client::HostCheck {
+    ssh3_core::client::HostCheck { files, mode, ..env.host_check() }
+}
+
+/// SPEC §2.1: a different key of the same type in known_hosts aborts the
+/// connect before anything is signed, naming the file:line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_key_mismatch_aborts_before_auth() {
+    use ssh3_keys::verifier::StrictHostKeyChecking;
+    let env = env_with(fast_limits());
+    let wrong = env.dir.join("known_hosts_wrong");
+    let other = ssh3_keys::host::HostIdentity::from_private_key(&ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[201; 32]))).unwrap();
+    ssh3_keys::known_hosts::append(&wrong, "127.0.0.1", env.server.local_addr().port(), other.public_key(), false).unwrap();
+    let mut opts = env.opts(&env.key);
+    opts.host = host_check_with(&env, vec![wrong.clone()], StrictHostKeyChecking::Yes);
+    match ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await {
+        Err(e) => {
+            let m = e.to_string();
+            assert!(m.contains("HOST KEY MISMATCH") && m.contains(&format!("{}:1", wrong.display())), "{m}");
+        }
+        Ok(_) => panic!("connected despite a host key mismatch"),
+    }
+    let st = env.server.stats();
+    assert_eq!((st.sessions, st.auth_failures), (0, 0), "no Auth may be sent: {st:?}");
+}
+
+/// Integration obligation: a commit I/O error (accept-new cannot write
+/// known_hosts) aborts the dial; nothing is signed or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_hosts_commit_error_aborts_auth() {
+    use ssh3_keys::verifier::StrictHostKeyChecking;
+    let env = env_with(fast_limits());
+    // A read-only directory: append() cannot create the file in it.
+    let ro = env.dir.join("read-only");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let unwritable = ro.join("known_hosts");
+    let mut opts = env.opts(&env.key);
+    opts.host = host_check_with(&env, vec![unwritable], StrictHostKeyChecking::AcceptNew);
+    match ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await {
+        Err(Error::HostKey(m)) => assert!(m.contains("read-only/known_hosts"), "{m}"),
+        Err(e) => panic!("expected a host key error, got {e}"),
+        Ok(_) => panic!("connected although known_hosts could not be written"),
+    }
+    let st = env.server.stats();
+    assert_eq!((st.sessions, st.auth_failures), (0, 0), "{st:?}");
+}
+
+/// accept-new writes the key once the server has proved possession.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_new_records_the_host_key() {
+    use ssh3_keys::verifier::StrictHostKeyChecking;
+    let env = env_with(fast_limits());
+    let fresh = env.dir.join("known_hosts_fresh");
+    let mut opts = env.opts(&env.key);
+    opts.host = host_check_with(&env, vec![fresh.clone()], StrictHostKeyChecking::AcceptNew);
+    let c = ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap();
+    assert!(ssh3_keys::spki::same_key(c.host_key(), env.host.public_key()));
+    let kh = ssh3_keys::known_hosts::KnownHosts::load(&[fresh]).unwrap();
+    assert_eq!(kh.lookup("127.0.0.1", env.server.local_addr().port()).len(), 1);
 }

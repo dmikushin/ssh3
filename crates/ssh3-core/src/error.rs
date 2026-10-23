@@ -24,6 +24,8 @@ pub enum Error {
     Connect(#[from] quinn::ConnectError),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("host key verification failed: {0}")]
+    HostKey(String),
     #[error("tls configuration: {0}")]
     Tls(String),
     #[error("request refused by peer: {0}")]

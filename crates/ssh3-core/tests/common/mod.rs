@@ -3,132 +3,43 @@
 
 pub mod blackhole;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier, VerifyingKey};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
-use ssh3_core::auth::{Authenticator, Authz, Signer};
+use ssh_key::PrivateKey;
+use ssh_key::private::Ed25519Keypair;
+use ssh3_core::auth::{AuthorizedKeysAuthenticator, Signer};
+use ssh3_core::client::HostCheck;
 use ssh3_core::transport::{EndpointKeys, dual_stack_socket};
 use ssh3_core::{ClientOptions, ClientSession, Limits, Server, ServerOptions, udp_socket};
+use ssh3_keys::host::HostIdentity;
+use ssh3_keys::signer::FileSigner;
+use ssh3_keys::verifier::StrictHostKeyChecking;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub fn init() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
 }
 
-// ------------------------------------------------------------------ TLS
-
-pub struct Identity {
-    pub cert: CertificateDer<'static>,
-    pub key: PrivatePkcs8KeyDer<'static>,
-}
-
-pub fn identity() -> Identity {
-    let ck = rcgen::generate_simple_self_signed(vec!["ssh3-test".into()]).unwrap();
-    Identity { cert: ck.cert.der().clone(), key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()) }
-}
-
-/// Accepts exactly one certificate (stand-in for the known_hosts verifier).
-#[derive(Debug)]
-struct Pinned(CertificateDer<'static>);
-
-impl ServerCertVerifier for Pinned {
-    fn verify_server_cert(&self, ee: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-        if ee.as_ref() == self.0.as_ref() {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General("certificate is not the pinned one".into()))
-        }
-    }
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
-    }
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
-    }
-}
-
-pub fn server_tls(id: &Identity) -> rustls::ServerConfig {
-    rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![id.cert.clone()], PrivateKeyDer::Pkcs8(id.key.clone_key()))
-        .unwrap()
-}
-
-pub fn client_tls(id: &Identity) -> rustls::ClientConfig {
-    rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Pinned(id.cert.clone())))
-        .with_no_client_auth()
-}
-
 // ----------------------------------------------------------------- keys
 
-/// Test key: public blob = "ed25519-test" || 32 raw bytes.
-pub struct TestKey(pub SigningKey);
+pub type TestKey = FileSigner;
 
-impl TestKey {
-    pub fn new(seed: u8) -> Arc<Self> {
-        Arc::new(Self(SigningKey::from_bytes(&[seed; 32])))
-    }
+fn ed25519(seed: u8) -> PrivateKey {
+    PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]))
 }
 
-pub fn blob_of(vk: &VerifyingKey) -> Vec<u8> {
-    let mut b = b"ed25519-test".to_vec();
-    b.extend_from_slice(vk.as_bytes());
-    b
-}
-
-impl Signer for TestKey {
-    fn public_key_blob(&self) -> Vec<u8> {
-        blob_of(&self.0.verifying_key())
-    }
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        Ok(self.0.sign(data).to_bytes().to_vec())
-    }
-}
-
-#[derive(Default)]
-pub struct TestAuth {
-    pub allowed: Mutex<HashSet<Vec<u8>>>,
-    pub authz: Mutex<Option<Authz>>,
-}
-
-impl TestAuth {
-    pub fn allowing(keys: &[&Arc<TestKey>]) -> Arc<Self> {
-        let a = Self::default();
-        for k in keys {
-            a.allowed.lock().unwrap().insert(k.public_key_blob());
-        }
-        Arc::new(a)
-    }
-}
-
-impl Authenticator for TestAuth {
-    fn verify(&self, _user: &str, pubkey: &[u8], blob: &[u8], sig: &[u8]) -> Result<Authz, String> {
-        if !self.allowed.lock().unwrap().contains(pubkey) {
-            return Err("key not authorized".into());
-        }
-        let raw: [u8; 32] = pubkey[12..].try_into().map_err(|_| "bad key length")?;
-        let vk = VerifyingKey::from_bytes(&raw).map_err(|e| e.to_string())?;
-        let sig = Signature::from_slice(sig).map_err(|e| e.to_string())?;
-        vk.verify(blob, &sig).map_err(|e| format!("bad signature: {e}"))?;
-        Ok(self.authz.lock().unwrap().clone().unwrap_or_else(Authz::unrestricted))
-    }
+/// A user key (OpenSSH ed25519) from a fixed seed.
+pub fn user_key(seed: u8) -> Arc<TestKey> {
+    Arc::new(FileSigner::from_key(ed25519(seed)))
 }
 
 // --------------------------------------------------------------- setups
@@ -144,25 +55,52 @@ pub fn fast_limits() -> Limits {
     }
 }
 
+/// A server with a real host identity, a real authorized_keys file and a
+/// real known_hosts file, in a private directory under ~/scratch.
 pub struct Env {
-    pub id: Identity,
+    pub dir: PathBuf,
+    pub host: HostIdentity,
     pub key: Arc<TestKey>,
-    pub auth: Arc<TestAuth>,
+    pub authorized_keys: PathBuf,
+    pub known_hosts: PathBuf,
     pub server: Server,
     pub limits: Limits,
 }
 
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+static DIRS: AtomicU64 = AtomicU64::new(0);
+
 pub fn env_with(limits: Limits) -> Env {
     init();
-    let id = identity();
-    let key = TestKey::new(7);
-    let auth = TestAuth::allowing(&[&key]);
+    let dir = PathBuf::from(std::env::var("HOME").unwrap())
+        .join("scratch/ssh-udp/core-tests")
+        .join(format!("{}-{}", std::process::id(), DIRS.fetch_add(1, AtOrd::Relaxed)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let host = HostIdentity::from_private_key(&ed25519(200)).unwrap();
+    let key = user_key(7);
+    let authorized_keys = dir.join("authorized_keys");
+    std::fs::write(&authorized_keys, format!("{}\n", key.public_key().to_openssh().unwrap())).unwrap();
+    let ak = authorized_keys.clone();
     let server = Server::bind(
-        ServerOptions { tls: server_tls(&id), authenticator: auth.clone(), limits: limits.clone(), keys: EndpointKeys::random() },
+        ServerOptions {
+            tls: ssh3_core::transport::server_tls(&host).unwrap(),
+            // Every account uses the same file: one key may serve several
+            // users, which the user-binding test relies on.
+            authenticator: Arc::new(AuthorizedKeysAuthenticator::new(move |_user| Some(ak.clone()))),
+            limits: limits.clone(),
+            keys: EndpointKeys::random(),
+        },
         dual_stack_socket("[::]:0".parse().unwrap()).unwrap(),
     )
     .unwrap();
-    Env { id, key, auth, server, limits }
+    let known_hosts = dir.join("known_hosts");
+    ssh3_keys::known_hosts::append(&known_hosts, "127.0.0.1", server.local_addr().port(), host.public_key(), false).unwrap();
+    Env { dir, host, key, authorized_keys, known_hosts, server, limits }
 }
 
 impl Env {
@@ -171,15 +109,29 @@ impl Env {
     pub fn server_addr(&self) -> SocketAddr {
         SocketAddr::new("127.0.0.1".parse().unwrap(), self.server.local_addr().port())
     }
-    pub fn opts(&self, key: &Arc<TestKey>) -> ClientOptions {
-        ClientOptions {
-            server_addr: self.server_addr(),
-            server_name: "ssh3-test".into(),
-            tls: client_tls(&self.id),
-            signer: key.clone(),
-            user: "tester".into(),
-            limits: self.limits.clone(),
+    pub fn host_check(&self) -> HostCheck {
+        HostCheck {
+            name: "127.0.0.1".into(),
+            port: self.server.local_addr().port(),
+            files: vec![self.known_hosts.clone()],
+            mode: StrictHostKeyChecking::Yes,
+            hash_known_hosts: false,
+            prompt: None,
         }
+    }
+    /// Replace authorized_keys with `key` under `options` (OpenSSH syntax).
+    pub fn authorize_only(&self, key: &TestKey, options: &str) {
+        let sep = if options.is_empty() { "" } else { " " };
+        std::fs::write(&self.authorized_keys, format!("{options}{sep}{}\n", key.public_key().to_openssh().unwrap())).unwrap();
+    }
+    /// Add `key` to authorized_keys.
+    pub fn authorize_also(&self, key: &TestKey) {
+        let mut t = std::fs::read_to_string(&self.authorized_keys).unwrap();
+        t.push_str(&format!("{}\n", key.public_key().to_openssh().unwrap()));
+        std::fs::write(&self.authorized_keys, t).unwrap();
+    }
+    pub fn opts(&self, key: &Arc<TestKey>) -> ClientOptions {
+        ClientOptions { server_addr: self.server_addr(), host: self.host_check(), signer: key.clone(), user: "tester".into(), limits: self.limits.clone() }
     }
     pub async fn client(&self) -> ClientSession {
         ClientSession::connect(self.opts(&self.key), udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap())
@@ -200,11 +152,13 @@ pub fn other_socket() -> Arc<dyn quinn::AsyncUdpSocket> {
     udp_socket(dual_stack_socket("[::ffff:127.0.0.2]:0".parse().unwrap()).unwrap()).unwrap()
 }
 
-/// Raw QUIC connection to the server (for protocol-level tests).
+/// Raw QUIC connection to the server (for protocol-level tests), verified
+/// against the env's known_hosts.
 pub async fn raw_conn(env: &Env) -> quinn::Connection {
     let sock = dual_stack_socket("[::]:0".parse().unwrap()).unwrap();
     let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, Arc::new(quinn::TokioRuntime)).unwrap();
-    ep.set_default_client_config(ssh3_core::transport::client_config(client_tls(&env.id), &env.limits).unwrap());
+    let v = Arc::new(ssh3_keys::verifier::KnownHostsVerifier::new("127.0.0.1", env.server.local_addr().port(), vec![env.known_hosts.clone()], StrictHostKeyChecking::Yes));
+    ep.set_default_client_config(ssh3_core::transport::client_config(ssh3_core::transport::client_tls(v).unwrap(), &env.limits).unwrap());
     ep.connect(ssh3_core::transport::to_v6(env.server_addr()), "ssh3-test").unwrap().await.unwrap()
 }
 
@@ -218,9 +172,8 @@ pub async fn raw_auth_as(conn: &quinn::Connection, key: &Arc<TestKey>, user: &st
     let (mut s, mut r) = conn.open_bi().await.unwrap();
     let mut exp = [0u8; 32];
     conn.export_keying_material(&mut exp, auth::EXPORTER_LABEL, b"").unwrap();
-    let pubkey = Signer::public_key_blob(&**key);
-    let blob = auth::auth_blob(&exp, user, &pubkey, intent);
-    let sig = Signer::sign(&**key, &blob).unwrap();
+    let pubkey = auth::pubkey_blob(key.public_key()).unwrap();
+    let sig = auth::sign_auth(&**key, &exp, user, auth::keys_intent(intent)).unwrap();
     frame::write_message(&mut s, &Message::Auth { user: user.into(), pubkey, sig, intent }).await.unwrap();
     let m = frame::read_message(&mut r, 65536).await.unwrap().unwrap();
     (s, r, m)

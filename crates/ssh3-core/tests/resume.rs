@@ -119,8 +119,8 @@ async fn events_queued_while_detached_are_replayed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_with_another_authorized_key_fails() {
     let env = env_with(limits());
-    let other = TestKey::new(8);
-    env.auth.allowed.lock().unwrap().insert(ssh3_core::auth::Signer::public_key_blob(&*other));
+    let other = user_key(8);
+    env.authorize_also(&other);
     let c = env.client().await;
     let conn = raw_conn(&env).await;
     let (mut s, mut r, m) = raw_auth(&conn, &other, Intent::Resume).await;
