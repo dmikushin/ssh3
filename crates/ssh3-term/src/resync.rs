@@ -148,8 +148,11 @@ impl Redraw {
             self.place(saved, main);
             if wrap_cleared(main, saved) {
                 // The slot 1049h is about to overwrite holds the cursor
-                // while its row's wrap flag is set again.
+                // while its row's wrap flag is set again (drawing with the
+                // ASCII set; DECRC brings the cursor's back).
                 self.out.extend_from_slice(b"\x1b7");
+                self.charsets_ascii();
+                self.out.push(0x0f);
                 self.restore_wrap(saved, main);
                 self.out.extend_from_slice(b"\x1b8");
                 self.attrs = Attrs::of(&saved.template);
@@ -336,193 +339,7 @@ impl Redraw {
             if erase {
                 self.out.extend_from_slice(b"\x1b[2X");
             }
-            let mut leading = false;
-            // Cursor column on this row; usize::MAX once it left the row.
-            let mut pos = 0usize;
-            let mut skip_to = 0;
-            for c in 0..end {
-                let cell = &row[Column(c)];
-                if c > 0 && c <= skip_to {
-                    continue; // made with the run of spacers before it
-                }
-                if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && wraps && c == cols - 1 {
-                    // A wide character that did not fit left this spacer and
-                    // wrapped (alacritty term/mod.rs:1107-1113). Any wide
-                    // character does the same; the one that lands at the
-                    // start of the next row is erased when it is drawn.
-                    self.at(l, c, &mut pos);
-                    self.placeholder(cell);
-                    leading = true;
-                    pos = usize::MAX;
-                    continue;
-                }
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    if c > 0 && row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR) {
-                        continue; // written with its wide character
-                    }
-                    // A spacer without its wide character (left by insert
-                    // mode or by character deletion splitting a pair).
-                    // ECH, ICH and DCH move and clear cells without the
-                    // wide-character fix-ups that writing does
-                    // (term/mod.rs:993-1011), so a placeholder's spacer is
-                    // separated from it with them. When the row wraps from
-                    // this spacer, the wrap must start from it: a cursor
-                    // parked there with a pending wrap is saved first and
-                    // restored after (as for a wide character there, below).
-                    // A run of such spacers is made right to left, each
-                    // placeholder landing on cells already erased.
-                    let mut run_end = c;
-                    if c > 0 {
-                        while run_end + 1 < end && row[Column(run_end + 1)].flags.contains(Flags::WIDE_CHAR_SPACER) {
-                            run_end += 1;
-                        }
-                    }
-                    let park = wraps && run_end == cols - 1;
-                    if park {
-                        self.sgr(&Attrs::default());
-                        self.hyperlink(None);
-                        self.goto(l, c);
-                        self.out.extend_from_slice(b" \x1b7");
-                    }
-                    if c == 0 {
-                        self.at(l, 0, &mut pos);
-                        self.placeholder(cell);
-                        self.goto(l, 0);
-                        // DCH fills the end of the row with the current
-                        // background; that cell is not drawn again if blank.
-                        let mut fill = Attrs::default();
-                        fill.bg = row[Column(cols - 1)].bg;
-                        self.sgr(&fill);
-                        self.out.extend_from_slice(b"\x1b[P");
-                        // Combining characters on it: one written from
-                        // column 1 attaches to column 0, skipping back over
-                        // a spacer stops there (term/mod.rs:1070-1083).
-                        if let Some(z) = cell.zerowidth().filter(|z| !z.is_empty()) {
-                            self.goto(l, 1);
-                            let mut buf = [0u8; 4];
-                            for ch in z {
-                                self.out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                            }
-                        }
-                    } else {
-                        for k in (c..=run_end).rev() {
-                            self.goto(l, k - 1);
-                            self.placeholder(&row[Column(k)]);
-                            self.goto(l, k - 1);
-                            self.out.extend_from_slice(b"\x1b[X");
-                        }
-                        skip_to = run_end;
-                        let prev = &row[Column(c - 1)];
-                        if c >= 2
-                            && prev.flags.contains(Flags::WIDE_CHAR_SPACER)
-                            && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR)
-                        {
-                            self.goto(l, c - 2);
-                            self.put(&row[Column(c - 2)]);
-                        } else {
-                            self.put(prev);
-                        }
-                    }
-                    pos = usize::MAX;
-                    if park {
-                        self.out.extend_from_slice(b"\x1b8");
-                        self.attrs = Attrs::default();
-                        self.link = None;
-                        self.charsets_ascii();
-                    }
-                    continue;
-                }
-                if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-                    // Not at the end of a wrapping row (handled above): a
-                    // blank left by a resize, drawn as one.
-                    self.at(l, c, &mut pos);
-                    let mut blank = cell.clone();
-                    blank.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
-                    self.put(&blank);
-                    pos = c + 1;
-                    continue;
-                }
-                if cell.flags.contains(Flags::WIDE_CHAR) && c == cols - 1 {
-                    // A wide character in the last column, without its
-                    // spacer (insert mode pushed it there, or a resize of
-                    // the alternate screen cut its spacer off). Written one
-                    // column left, then pushed right by ICH, which moves
-                    // cells without fix-ups; the cell it covered is drawn
-                    // again. If the row wraps, the wrap must start from
-                    // this cell, which can never be written in place: a
-                    // cursor parked there with a pending wrap is saved
-                    // first and restored after (DECSC/DECRC; the saved
-                    // cursors are set after drawing).
-                    if wraps {
-                        self.sgr(&Attrs::default());
-                        self.hyperlink(None);
-                        self.goto(l, c);
-                        self.out.extend_from_slice(b" \x1b7");
-                    }
-                    // The cells it is written over are erased first, so
-                    // writing it does not split a wide pair there (which
-                    // would also drop a leading spacer above,
-                    // term/mod.rs:993-1011).
-                    let pair = c >= 2
-                        && row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR_SPACER)
-                        && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR);
-                    if pair {
-                        self.goto(l, c - 2);
-                        self.out.extend_from_slice(b"\x1b[2X");
-                    } else {
-                        self.goto(l, c - 1);
-                        self.out.extend_from_slice(b"\x1b[X");
-                    }
-                    self.goto(l, c - 1);
-                    self.put(cell);
-                    self.goto(l, c - 1);
-                    self.out.extend_from_slice(b"\x1b[@");
-                    let prev = &row[Column(c - 1)];
-                    if c >= 2
-                        && prev.flags.contains(Flags::WIDE_CHAR_SPACER)
-                        && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR)
-                    {
-                        self.goto(l, c - 2);
-                        self.put(&row[Column(c - 2)]);
-                    } else if prev.flags.contains(Flags::WIDE_CHAR_SPACER) && c >= 2 {
-                        // An orphan spacer before it, made again the same
-                        // way as above.
-                        self.goto(l, c - 2);
-                        self.placeholder(prev);
-                        self.goto(l, c - 2);
-                        self.out.extend_from_slice(b"\x1b[X");
-                        self.put(&row[Column(c - 2)]);
-                    } else if !prev.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                        self.put(prev);
-                    }
-                    pos = usize::MAX;
-                    if wraps {
-                        self.out.extend_from_slice(b"\x1b8");
-                        self.attrs = Attrs::default();
-                        self.link = None;
-                        self.charsets_ascii();
-                    }
-                    continue;
-                }
-                self.at(l, c, &mut pos);
-                self.put(cell);
-                if cell.flags.contains(Flags::WIDE_CHAR) {
-                    pos = c + 2;
-                    if c + 1 < cols && !row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        // A wide character without its spacer: the spacer
-                        // writing it made is erased again.
-                        let next = &row[Column(c + 1)];
-                        let mut a = Attrs::default();
-                        a.bg = next.bg;
-                        self.sgr(&a);
-                        self.goto(l, c + 1);
-                        self.out.extend_from_slice(b"\x1b[X");
-                        pos = c + 1;
-                    }
-                } else {
-                    pos = c + 1;
-                }
-            }
+            let leading = self.draw_span(row, l, cols, 0, end, wraps, 0, true);
             wrapped_in = wraps;
             redo_start = leading;
         }
@@ -543,6 +360,239 @@ impl Redraw {
             self.goto(l, c);
             self.out.push(b'\t');
         }
+    }
+
+    /// Draws columns `start..end` of row `l` (cursor at column `pos0`, or
+    /// `usize::MAX` if unknown); `fresh` when the rest of the row is still
+    /// blank (a first drawing, not a repair after one); returns whether the row ends with a leading
+    /// spacer whose placeholder wide character landed in the next row.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_span(
+        &mut self,
+        row: &alacritty_terminal::grid::Row<Cell>,
+        l: usize,
+        cols: usize,
+        start: usize,
+        end: usize,
+        wraps: bool,
+        pos0: usize,
+        fresh: bool,
+    ) -> bool {
+        let mut leading = false;
+        // Cursor column on this row; usize::MAX once it left the row.
+        let mut pos = pos0;
+        let mut skip_to = 0;
+        for c in start..end {
+            let cell = &row[Column(c)];
+            if c > start && c <= skip_to {
+                continue; // made with the run of spacers before it
+            }
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && wraps && c == cols - 1 {
+                // A wide character that did not fit left this spacer and
+                // wrapped (alacritty term/mod.rs:1107-1113). Any wide
+                // character does the same; the one that lands at the
+                // start of the next row is erased when it is drawn.
+                self.at(l, c, &mut pos);
+                self.placeholder(cell);
+                leading = true;
+                pos = usize::MAX;
+                continue;
+            }
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if c > 0 && row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR) {
+                    continue; // written with its wide character
+                }
+                // A spacer without its wide character (left by insert
+                // mode or by character deletion splitting a pair).
+                // ECH, ICH and DCH move and clear cells without the
+                // wide-character fix-ups that writing does
+                // (term/mod.rs:993-1011), so a placeholder's spacer is
+                // separated from it with them. When the row wraps from
+                // this spacer, the wrap must start from it: a cursor
+                // parked there with a pending wrap is saved first and
+                // restored after (as for a wide character there, below).
+                // A run of such spacers is made right to left, each
+                // placeholder landing on cells already erased.
+                let mut run_end = c;
+                if c > 0 {
+                    while run_end + 1 < end && row[Column(run_end + 1)].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        run_end += 1;
+                    }
+                }
+                let park = wraps && run_end == cols - 1;
+                if park {
+                    self.sgr(&Attrs::default());
+                    self.hyperlink(None);
+                    self.goto(l, c);
+                    self.out.extend_from_slice(b" \x1b7");
+                }
+                if c == 0 && !fresh {
+                    // DCH would shift the rest of a drawn row; not
+                    // reproduced here (`Snapshot::layout_reproducible`).
+                } else if c == 0 {
+                    self.at(l, 0, &mut pos);
+                    self.placeholder(cell);
+                    self.goto(l, 0);
+                    // DCH fills the end of the row with the current
+                    // background; that cell is not drawn again if blank.
+                    let mut fill = Attrs::default();
+                    fill.bg = row[Column(cols - 1)].bg;
+                    self.sgr(&fill);
+                    self.out.extend_from_slice(b"\x1b[P");
+                    // Combining characters on it: one written from
+                    // column 1 attaches to column 0, skipping back over
+                    // a spacer stops there (term/mod.rs:1070-1083).
+                    if let Some(z) = cell.zerowidth().filter(|z| !z.is_empty()) {
+                        self.goto(l, 1);
+                        let mut buf = [0u8; 4];
+                        for ch in z {
+                            self.out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                } else {
+                    for k in (c..=run_end).rev() {
+                        // The placeholder is written over erased cells: over a
+                        // wide pair or spacer it would trigger the fix-ups
+                        // (which also drop a leading spacer above,
+                        // term/mod.rs:993-1011). The pair is drawn again below.
+                        let pair = k == c
+                            && c >= 2
+                            && row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR_SPACER)
+                            && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR);
+                        if pair {
+                            self.goto(l, k - 2);
+                            self.out.extend_from_slice(b"\x1b[2X");
+                        } else {
+                            self.goto(l, k - 1);
+                            self.out.extend_from_slice(b"\x1b[X");
+                        }
+                        self.goto(l, k - 1);
+                        self.placeholder(&row[Column(k)]);
+                        self.goto(l, k - 1);
+                        self.out.extend_from_slice(b"\x1b[X");
+                    }
+                    skip_to = run_end;
+                    let prev = &row[Column(c - 1)];
+                    if c >= 2
+                        && prev.flags.contains(Flags::WIDE_CHAR_SPACER)
+                        && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR)
+                    {
+                        self.goto(l, c - 2);
+                        self.put(&row[Column(c - 2)]);
+                    } else {
+                        self.put(prev);
+                    }
+                }
+                pos = usize::MAX;
+                if park {
+                    self.out.extend_from_slice(b"\x1b8");
+                    self.attrs = Attrs::default();
+                    self.link = None;
+                    self.charsets_ascii();
+                }
+                continue;
+            }
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                // Not at the end of a wrapping row (handled above): a
+                // blank left by a resize, drawn as one.
+                self.at(l, c, &mut pos);
+                let mut blank = cell.clone();
+                blank.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+                self.put(&blank);
+                pos = c + 1;
+                continue;
+            }
+            if cell.flags.contains(Flags::WIDE_CHAR) && c == cols - 1 {
+                // A wide character in the last column, without its
+                // spacer (insert mode pushed it there, or a resize of
+                // the alternate screen cut its spacer off). Written one
+                // column left, then pushed right by ICH, which moves
+                // cells without fix-ups; the cell it covered is drawn
+                // again. If the row wraps, the wrap must start from
+                // this cell, which can never be written in place: a
+                // cursor parked there with a pending wrap is saved
+                // first and restored after (DECSC/DECRC; the saved
+                // cursors are set after drawing).
+                if wraps {
+                    self.sgr(&Attrs::default());
+                    self.hyperlink(None);
+                    self.goto(l, c);
+                    self.out.extend_from_slice(b" \x1b7");
+                }
+                // The cells it is written over are erased first, so
+                // writing it does not split a wide pair there (which
+                // would also drop a leading spacer above,
+                // term/mod.rs:993-1011).
+                let pair = c >= 2
+                    && row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR_SPACER)
+                    && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR);
+                if pair {
+                    self.goto(l, c - 2);
+                    self.out.extend_from_slice(b"\x1b[2X");
+                } else {
+                    self.goto(l, c - 1);
+                    self.out.extend_from_slice(b"\x1b[X");
+                }
+                self.goto(l, c - 1);
+                self.put(cell);
+                self.goto(l, c - 1);
+                self.out.extend_from_slice(b"\x1b[@");
+                let prev = &row[Column(c - 1)];
+                if c >= 2
+                    && prev.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    && row[Column(c - 2)].flags.contains(Flags::WIDE_CHAR)
+                {
+                    self.goto(l, c - 2);
+                    self.put(&row[Column(c - 2)]);
+                } else if prev.flags.contains(Flags::WIDE_CHAR_SPACER) && c >= 2 {
+                    // An orphan spacer before it, made again the same
+                    // way as above.
+                    self.goto(l, c - 2);
+                    self.placeholder(prev);
+                    self.goto(l, c - 2);
+                    self.out.extend_from_slice(b"\x1b[X");
+                    self.put(&row[Column(c - 2)]);
+                } else if !prev.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    self.put(prev);
+                }
+                pos = usize::MAX;
+                if wraps {
+                    self.out.extend_from_slice(b"\x1b8");
+                    self.attrs = Attrs::default();
+                    self.link = None;
+                    self.charsets_ascii();
+                }
+                continue;
+            }
+            self.at(l, c, &mut pos);
+            self.put(cell);
+            if cell.flags.contains(Flags::WIDE_CHAR) {
+                pos = c + 2;
+                if c + 1 < cols && !row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    // A wide character without its spacer: the spacer
+                    // writing it made is erased again.
+                    let next = &row[Column(c + 1)];
+                    let mut a = Attrs::default();
+                    a.bg = next.bg;
+                    self.sgr(&a);
+                    self.goto(l, c + 1);
+                    self.out.extend_from_slice(b"\x1b[X");
+                    pos = c + 1;
+                }
+            } else {
+                pos = c + 1;
+                // A tab mark is set again at once: later passes may draw
+                // this cell again (wrap restoration), which clears it. Not
+                // on a wrapping row's last cell, whose pending wrap the next
+                // row's first character needs; the final pass covers it.
+                if cell.c == '\t' && !(wraps && c + 1 == cols) {
+                    self.goto(l, c);
+                    self.out.push(b'\t');
+                    pos = usize::MAX;
+                }
+            }
+        }
+        leading
     }
 
     /// The bottom row can be marked as wrapped (a wrapped row moved down by
@@ -566,9 +616,23 @@ impl Redraw {
             self.goto(last, cols - 1);
             self.placeholder(cell);
         } else if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            let orphan = !row[Column(cols - 2)].flags.contains(Flags::WIDE_CHAR);
             self.goto(last, cols - 2);
-            self.put(&row[Column(cols - 2)]);
+            if orphan {
+                // A spacer without its wide character: a placeholder's,
+                // whose wide character is erased afterwards.
+                self.placeholder(cell);
+            } else {
+                self.put(&row[Column(cols - 2)]);
+            }
             self.out.push(b' ');
+            if orphan {
+                self.out.extend_from_slice(b"\x1b[r");
+                self.goto(last, cols - 2);
+                self.out.extend_from_slice(b"\x1b[X");
+                self.draw_span(row, last, cols, cols - 2, cols - 1, false, cols - 2, false);
+                let _ = write!(self.out, "\x1b[{};{}r", lines + 1, lines + 2);
+            }
         } else {
             self.goto(last, cols - 1);
             self.put(cell);
@@ -578,37 +642,9 @@ impl Redraw {
         // Columns from here on were written above with the wrap flag.
         let limit = keep_end(row);
         self.goto(last, 0);
-        let _ = write!(self.out, "\x1b[{}X", erase_width(row, limit));
-        self.redraw_start(row, limit);
-    }
-
-    /// Draws columns 0 and 1 of a row again, after they were erased, but
-    /// none at or past `limit` (a last cell carrying a wrap flag).
-    fn redraw_start(&mut self, row: &alacritty_terminal::grid::Row<Cell>, limit: usize) {
-        let c0 = &row[Column(0)];
-        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
-        if limit == 0 {
-            return;
-        }
-        if c0.flags.contains(Flags::WIDE_CHAR) {
-            if limit < 2 {
-                return;
-            }
-            self.put(c0);
-            let c1 = &row[Column(1)];
-            if !c1.flags.contains(Flags::WIDE_CHAR_SPACER) && limit > 2 {
-                self.out.extend_from_slice(b"\x08\x1b[X");
-                self.put(c1);
-            }
-        } else if !c0.flags.intersects(spacer) {
-            self.put(c0);
-            if limit > 1 && erase_width(row, limit) > 1 {
-                let c1 = &row[Column(1)];
-                if !c1.flags.intersects(spacer) {
-                    self.put(c1);
-                }
-            }
-        }
+        let width = erase_width(row, limit);
+        let _ = write!(self.out, "\x1b[{width}X");
+        self.draw_span(row, last, cols, 0, width, false, 0, false);
     }
 
     /// Moves to column `c` of line `l` unless the cursor is already there.
@@ -660,7 +696,7 @@ impl Redraw {
             let next = &g[Line((line + 1).min(lines - 1) as i32)];
             let span = erase_width(next, g.columns());
             let wide = (0..span).any(|c| next[Column(c)].flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
-            if wide && keep_end(next) < span {
+            if (wide && keep_end(next) < span) || next[Column(0)].flags.contains(Flags::WIDE_CHAR_SPACER) {
                 return;
             }
         }
@@ -679,8 +715,10 @@ impl Redraw {
         }
         let limit = keep_end(&g[Line(next as i32)]);
         self.goto(next, 0);
-        let _ = write!(self.out, "\x1b[{}X", erase_width(&g[Line(next as i32)], limit));
-        self.redraw_start(&g[Line(next as i32)], limit);
+        let row = &g[Line(next as i32)];
+        let width = erase_width(row, limit);
+        let _ = write!(self.out, "\x1b[{width}X");
+        self.draw_span(row, next, g.columns(), 0, width, false, 0, false);
     }
 
     fn charsets_ascii(&mut self) {
@@ -1037,6 +1075,10 @@ pub(crate) fn rep_cell<'a>(
             // Nor a cell a tab marked: it is drawn as a blank and marked
             // again by a tab afterwards.
             if c.c == '\t' {
+                continue;
+            }
+            // Nor a wide character whose spacer a tab marked.
+            if c.flags.contains(Flags::WIDE_CHAR) && cell(l, x + 1).c == '\t' {
                 continue;
             }
             // Nor a wide character without its spacer: writing it adds one.

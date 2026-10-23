@@ -440,6 +440,10 @@ impl Handler for Tracked<'_> {
             // completed: every cell becomes a blank with the background in
             // effect (`Cell::reset`, term/cell.rs).
             let g = self.term.grid_mut();
+            // Its saved cursor is the one kept here while it was inactive
+            // (clamped and settled on resizes like the primary's, see
+            // `Screen::resize`); the one `Term` kept was not settled.
+            g.saved_cursor = self.extra.alt_saved.clone();
             let blank = Cell { bg: g.cursor.template.bg, ..Cell::default() };
             for l in 0..g.screen_lines() {
                 for c in 0..g.columns() {

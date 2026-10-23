@@ -90,6 +90,9 @@ fn check(cols: u16, rows: u16, a: &Parts, b_prefix: &[u8], suffix: &[u8]) {
     sb.feed(b_prefix);
     sb.feed(&rs);
     let snap = sa.snapshot();
+    if !snap.layout_reproducible() {
+        return; // see `Snapshot::layout_reproducible`
+    }
     let rep = snap.rep_reproducible();
     let wrap = snap.wrap_reproducible();
     let d = snap.diff(&sb.snapshot());

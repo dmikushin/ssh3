@@ -16,6 +16,15 @@ use crate::track::{Extra, T};
 /// dynamic foreground, background and cursor colours (OSC 10/11/12).
 pub(crate) const SETTABLE_COLORS: usize = 259;
 
+/// Cell flags set by SGR (renditions), as opposed to layout flags.
+const SGR_FLAGS: Flags = Flags::BOLD
+    .union(Flags::DIM)
+    .union(Flags::ITALIC)
+    .union(Flags::ALL_UNDERLINES)
+    .union(Flags::INVERSE)
+    .union(Flags::HIDDEN)
+    .union(Flags::STRIKEOUT);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub columns: usize,
@@ -53,6 +62,35 @@ pub struct Snapshot {
 /// keeps a pending wrap, and the next character then marks the cell the tab
 /// moved to); no terminal reproduces that, and alacritty itself only reads
 /// the flag on the last cell.
+/// Mirror of the check in `Redraw::restore_wrap` (same erase width and kept
+/// end as `erase_width` and `keep_end` there).
+fn restorable(cells: &[Vec<Cell>], cur: &Cursor<Cell>) -> bool {
+    let line = cur.point.line.0 as usize;
+    let row = &cells[line];
+    let cols = row.len();
+    let wrapped = row[cols - 1].flags.contains(Flags::WRAPLINE);
+    if !(cur.input_needs_wrap && cur.point.column.0 + 1 == cols && wrapped) {
+        return true;
+    }
+    let next = &cells[(line + 1).min(cells.len() - 1)];
+    let keep = if !next[cols - 1].flags.contains(Flags::WRAPLINE) {
+        cols
+    } else if next[cols - 1].flags.contains(Flags::WIDE_CHAR_SPACER) {
+        cols.saturating_sub(2)
+    } else {
+        cols - 1
+    };
+    let wide_at_1 = cols > 1 && next[1].flags.contains(Flags::WIDE_CHAR);
+    let span = match (wide_at_1, cols) {
+        (true, 2) => 1,
+        (true, _) => 3,
+        (false, _) => 2,
+    }
+    .min(cols);
+    let wide = next[..span].iter().any(|c| c.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
+    !(next[0].flags.contains(Flags::WIDE_CHAR_SPACER) || (wide && keep < span))
+}
+
 pub(crate) fn rows(g: &Grid<Cell>) -> Vec<Vec<Cell>> {
     let last = g.columns() - 1;
     (0..g.screen_lines())
@@ -183,25 +221,11 @@ impl Snapshot {
     /// there reaches the next row's own wrapped last cell (rows of two or
     /// three columns): drawing it again clears that row's wrap flag.
     fn saved_wrap_restorable(&self) -> bool {
-        let cur = &self.saved_cursor;
-        let line = cur.point.line.0 as usize;
-        let row = &self.cells[line];
-        let cols = row.len();
-        let wrapped = row[cols - 1].flags.contains(Flags::WRAPLINE);
-        if !(cur.input_needs_wrap && cur.point.column.0 + 1 == cols && wrapped) {
-            return true;
-        }
-        let next = &self.cells[(line + 1).min(self.lines - 1)];
-        let keep = if !next[cols - 1].flags.contains(Flags::WRAPLINE) {
-            cols
-        } else if next[cols - 1].flags.contains(Flags::WIDE_CHAR_SPACER) {
-            cols.saturating_sub(2)
-        } else {
-            cols - 1
+        let main = match (&self.main_cells, &self.main_saved_cursor) {
+            (Some(cells), Some(cur)) => restorable(cells, cur),
+            _ => true,
         };
-        let span = if next.len() > 2 && next[1].flags.contains(Flags::WIDE_CHAR) { 3 } else { 2 };
-        let wide = next[..span.min(cols)].iter().any(|c| c.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
-        !wide || keep >= span
+        main && restorable(&self.cells, &self.saved_cursor)
     }
 
     /// In origin mode the cursor can only be placed inside the scroll region
@@ -209,6 +233,53 @@ impl Snapshot {
     /// below.
     fn cursor_reachable(&self) -> bool {
         !self.mode.contains(TermMode::ORIGIN) || (self.cursor.point.line.0 as usize) < self.scroll_region.1
+    }
+
+    /// Whether the redraw can reproduce every row's layout. Not when a wide
+    /// character without its spacer (insert mode, character deletion and
+    /// resizes leave those) is followed directly by another wide character
+    /// or by the wrapped last cell: writing it always writes a spacer over
+    /// the next cell, and moving cells with ICH/DCH moves both. Such rows
+    /// are drawn as close as possible.
+    pub fn layout_reproducible(&self) -> bool {
+        // A wrapped bottom row starting with a spacer without its wide
+        // character: its start is drawn again after the wrap is made, and
+        // that spacer is made by shifting the whole row.
+        let bottom = |cells: &Vec<Vec<Cell>>| {
+            let row = cells.last().expect("cells");
+            !(row[row.len() - 1].flags.contains(Flags::WRAPLINE) && row[0].flags.contains(Flags::WIDE_CHAR_SPACER))
+        };
+        if !bottom(&self.cells) || self.main_cells.as_ref().is_some_and(|m| !bottom(m)) {
+            return false;
+        }
+        let rows = self.cells.iter().chain(self.main_cells.iter().flatten());
+        rows.into_iter().all(|row| {
+            let n = row.len();
+            let wrapped = row[n - 1].flags.contains(Flags::WRAPLINE);
+            row.windows(2).enumerate().all(|(c, w)| {
+                let orphan = w[0].flags.contains(Flags::WIDE_CHAR) && !w[1].flags.contains(Flags::WIDE_CHAR_SPACER);
+                // Two wide characters in a row, the first without spacer.
+                let adjacent = orphan && w[1].flags.contains(Flags::WIDE_CHAR);
+                // One without spacer just before a wrapped last cell: it is
+                // written again after the wrap is made, over that cell.
+                let before_wrap = orphan && wrapped && c + 2 == n;
+                // A spacer whose renditions differ from its wide character's
+                // (cells moved by ICH/DCH): writing the character writes its
+                // own spacer.
+                let foreign = w[0].flags.contains(Flags::WIDE_CHAR)
+                    && w[1].flags.contains(Flags::WIDE_CHAR_SPACER)
+                    && (w[0].fg, w[0].bg, w[0].flags & SGR_FLAGS, w[0].underline_color(), w[0].hyperlink())
+                        != (w[1].fg, w[1].bg, w[1].flags & SGR_FLAGS, w[1].underline_color(), w[1].hyperlink());
+                // A spacer without its wide character in column 0, before a
+                // wide character without spacer in the last column of a
+                // two-column row: placing that one moves column 0.
+                let first_pair = c == 0
+                    && n == 2
+                    && w[0].flags.contains(Flags::WIDE_CHAR_SPACER)
+                    && w[1].flags.contains(Flags::WIDE_CHAR);
+                !(adjacent || before_wrap || foreign || first_pair)
+            })
+        })
     }
 
     /// Whether a resync can make the terminal's REP character equal to
