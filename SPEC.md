@@ -282,9 +282,11 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   most `DetachedAcceptMax` (default 8) pending connections, each with a
   bounded lane; further connections are refused (closed immediately) and
   counted.
-- **Memory bound.** Userspace lane memory server-wide ≤
-  `LaneCreditBudget` + `LaneSendBudget` (§4), regardless of the number of
-  sessions or channels. Plus kernel buffers of local endpoints, capped
+- **Memory bound.** Lane *payload storage* (budget-owned chunks, §4)
+  server-wide ≤ `LaneCreditBudget` + `LaneSendBudget`, regardless of the
+  number of sessions or channels. This is not total userspace memory: fixed
+  per-session/channel metadata, queues, control and QUIC transport state
+  are accounted separately as (per-object size × capped object count). Plus kernel buffers of local endpoints, capped
   explicitly (`SO_RCVBUF`/`SO_SNDBUF` on accepted and dialed sockets,
   default 64 KiB; pty buffers are kernel-fixed) — these scale with the
   number of open local sockets, which is bounded by MaxChannels × the
