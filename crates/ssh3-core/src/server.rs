@@ -108,6 +108,9 @@ pub struct ServerStats {
     /// detached, oversize, malformed), reassembly storage in use and groups
     /// evicted, LRU flow evictions.
     pub udp_flows: u64,
+    /// Datagrams sent and received on live sessions (relay activity, §7.2).
+    pub datagrams_sent: u64,
+    pub datagrams_received: u64,
     pub datagrams_dropped: u64,
     pub reassembly_bytes: u64,
     pub reassembly_evicted: u64,
@@ -203,6 +206,8 @@ impl Server {
             t.window_raises += s.stats.window_raises.load(Ordering::Relaxed);
             t.window_lowers += s.stats.window_lowers.load(Ordering::Relaxed);
             t.udp_flows += s.stats.udp_flows.load(Ordering::Relaxed);
+            t.datagrams_sent += s.stats.dgrams_sent.load(Ordering::Relaxed);
+            t.datagrams_received += s.stats.dgrams_received.load(Ordering::Relaxed);
             t.datagrams_dropped += s.stats.dgrams_dropped.load(Ordering::Relaxed);
             t.reassembly_evicted += s.stats.reasm_evicted.load(Ordering::Relaxed);
             t.udp_evicted += s.stats.udp_evicted.load(Ordering::Relaxed);

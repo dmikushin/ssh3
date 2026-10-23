@@ -5,6 +5,7 @@ pub mod budget;
 pub mod client;
 pub mod error;
 pub mod frame;
+pub mod jump;
 pub mod lane;
 pub mod limits;
 pub mod msg;

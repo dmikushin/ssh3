@@ -787,3 +787,81 @@ fn several_keys_on_one_connection() {
     assert_eq!(st["conns_accepted"], 1, "{st}");
     assert_eq!(st["auth_failures"], 1, "the first key must have been offered and refused");
 }
+
+// ------------------------------------------------------------- ProxyJump
+
+/// One ssh_config with a gateway host `gw` and target hosts reached through
+/// it: `t` by `ProxyJump gw`, `t2` without (for `-J gw`). Each host has its
+/// own identity and its own known_hosts — the inner connection is end to end.
+fn jump_config(gw: &Env, target: &Env, target_known_hosts: &Path) -> PathBuf {
+    let p = target.dir.join("ssh_config.jump");
+    let host = |name: &str, env: &Env, kh: &Path, extra: &str| {
+        format!(
+            "Host {name}\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{extra}",
+            port = env.port,
+            user = me(),
+            d = env.dir.display(),
+            kh = kh.display()
+        )
+    };
+    let text = host("gw", gw, &gw.dir.join("known_hosts"), "") + &host("t", target, target_known_hosts, "  ProxyJump gw\n") + &host("t2", target, target_known_hosts, "");
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+fn jcmd(cfg: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    c.arg("-F").arg(cfg).args(args);
+    c
+}
+
+fn sha(b: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(b))
+}
+
+#[test]
+fn proxyjump_exec_and_bulk_data_end_to_end() {
+    let gw = Env::new();
+    let target = Env::new();
+    let cfg = jump_config(&gw, &target, &target.dir.join("known_hosts"));
+    let o = run(jcmd(&cfg, &["t", "echo via-jump; exit 4"]), b"");
+    assert_eq!(o.code, Some(4), "stderr: {}", o.stderr);
+    assert_eq!(o.stdout, b"via-jump\n");
+    let data: Vec<u8> = (0..4u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let o = run(jcmd(&cfg, &["t", "cat"]), &data);
+    assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
+    assert_eq!(sha(&o.stdout), sha(&data), "4 MiB through the jump differs ({} bytes back)", o.stdout.len());
+    let end = Instant::now() + DEADLINE;
+    while target.stats()["sessions"].as_u64() != Some(0) || gw.stats()["sessions"].as_u64() != Some(0) {
+        assert!(Instant::now() < end, "sessions left: target {} gw {}", target.stats(), gw.stats());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn dash_j_on_the_command_line() {
+    let gw = Env::new();
+    let target = Env::new();
+    let cfg = jump_config(&gw, &target, &target.dir.join("known_hosts"));
+    let o = run(jcmd(&cfg, &["-J", "gw", "t2", "echo dash-j"]), b"");
+    assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
+    assert_eq!(o.stdout, b"dash-j\n");
+}
+
+/// A trusted gateway does not make a wrong TARGET key acceptable: the inner
+/// connection checks the target against its own known_hosts entry.
+#[test]
+fn proxyjump_wrong_target_key_is_refused() {
+    let gw = Env::new();
+    let target = Env::new();
+    // The target's known_hosts names the gateway's key instead.
+    let wrong = target.dir.join("known_hosts.wrong");
+    let gw_pub = std::fs::read_to_string(gw.dir.join("host_key.pub")).unwrap();
+    std::fs::write(&wrong, format!("[127.0.0.1]:{} {gw_pub}", target.port)).unwrap();
+    let cfg = jump_config(&gw, &target, &wrong);
+    let o = run(jcmd(&cfg, &["t", "echo must-not-run"]), b"");
+    assert_eq!(o.code, Some(255), "stderr: {}", o.stderr);
+    assert!(o.stderr.contains("Host key verification failed."), "{}", o.stderr);
+    assert!(o.stdout.is_empty());
+    assert_eq!(target.stats()["sessions"].as_u64(), Some(0));
+}

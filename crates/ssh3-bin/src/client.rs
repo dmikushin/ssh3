@@ -5,7 +5,11 @@
 //! order), verifies the host key against known_hosts with a fresh verifier
 //! per dial, then runs the session (shell, exec, subsystem; pty with raw
 //! local terminal) and the forwards (-L, -R, -D, UDP -U/-u) with roaming and
-//! automatic resume. Exit status: the remote command's, 128+n for a remote
+//! automatic resume. `-J` / ProxyJump (SPEC §7.2): each hop is resolved
+//! through its own ssh_config (as ssh(1) does for its jump hosts), and every
+//! connection — to each hop and to the target — is end to end: it verifies
+//! that host's key against known_hosts and authenticates to that host; a
+//! gateway only relays inner ciphertext. Exit status: the remote command's, 128+n for a remote
 //! signal n, 255 for ssh3's own failures — as ssh(1).
 //!
 //! ssh3 extension in ssh_config: `ContactWarn <duration>` (default 6500ms):
@@ -14,7 +18,7 @@
 //!
 //! What it refuses, by name, instead of silently ignoring (a missing
 //! feature must never look like a working one): -W, Unix-socket forwards,
-//! dynamic -R, ProxyJump (SPEC §7), ProxyCommand, -f, and configuration
+//! dynamic -R, ProxyCommand, -f, and configuration
 //! options whose enforcement the user may rely on for security but which
 //! ssh3 would not apply (`SECURITY_OPTIONS`).
 
@@ -30,7 +34,7 @@ use ssh3_core::{Command, ExitInfo, PtySpec, SessionChannel, SessionSpec};
 
 use crate::tty::{self, RawMode, StatusLine};
 use ssh3_core::auth::{PublicKey, Signer};
-use ssh3_core::client::{HostCheck, dual_stack_factory};
+use ssh3_core::client::{HostCheck, SocketFactory, dual_stack_factory};
 use ssh3_core::{ClientOptions, ClientSession, Error, Limits};
 use ssh3_keys::signer::{AgentClient, AgentSigner, resolve_identity};
 use ssh3_keys::verifier::{StrictHostKeyChecking, UnknownHost};
@@ -79,7 +83,14 @@ pub fn main() -> ExitCode {
         Ok(e) => e,
         Err(e) => return fail(&e),
     };
-    let cfg = match ssh3_config::resolve_args(&argv, &env) {
+    let cl = match ssh3_config::parse_args(&argv, &env) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    // Jump hosts are resolved with the same -F as the destination (ssh(1)
+    // passes -F to its jump connections).
+    let config_file = cl.config_file.clone();
+    let cfg = match ssh3_config::resolve(cl, &env) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -100,7 +111,7 @@ pub fn main() -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&format!("tokio runtime: {e}")),
     };
-    let code = rt.block_on(run(cfg));
+    let code = rt.block_on(run(cfg, Jumps { config_file, env }));
     // The stdin reader is a plain thread blocked in read(2); nothing of the
     // runtime is left that must finish.
     rt.shutdown_background();
@@ -132,9 +143,6 @@ pub fn refusals(c: &ClientConfig) -> Result<(), String> {
     }
     if c.proxy_command.is_some() {
         why.push("ProxyCommand is not supported by ssh3 (it never runs proxy commands)".into());
-    }
-    if !c.proxy_jump.is_empty() {
-        why.push("ProxyJump is not implemented yet (SPEC §7)".into());
     }
     if c.stdio_forward.is_some() {
         why.push("-W is not implemented yet".into());
@@ -303,8 +311,8 @@ fn client_limits(c: &ClientConfig) -> Limits {
     l
 }
 
-async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signers: &[Arc<dyn Signer>]) -> Result<ClientSession, Error> {
-    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: signers.to_vec(), user: c.user.clone(), limits: client_limits(c), sockets: dual_stack_factory() };
+async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signers: &[Arc<dyn Signer>], sockets: SocketFactory) -> Result<ClientSession, Error> {
+    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: signers.to_vec(), user: c.user.clone(), limits: client_limits(c), sockets };
     let sock = (opts.sockets)().map_err(Error::Io)?;
     let fut = ClientSession::connect(opts, sock);
     match c.connect_timeout {
@@ -315,37 +323,142 @@ async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signers: &[A
     }
 }
 
-enum Outcome {
-    Connected(ClientSession),
-    Fatal(String),
+/// What jump hosts are resolved with: the destination's -F and the local
+/// environment.
+pub struct Jumps {
+    pub config_file: Option<String>,
+    pub env: LocalEnv,
 }
 
-/// Try every address until one answers; on it, every key is offered in
-/// order on that one connection (core stops at MaxAuthTries), as ssh(1).
-async fn connect(c: &ClientConfig) -> Outcome {
-    let addrs = match resolve_addrs(c).await {
-        Ok(a) => a,
-        Err(e) => return Outcome::Fatal(e),
-    };
+/// ssh(1) bounds the depth of jump hosts that have jump hosts of their own.
+const MAX_JUMP_DEPTH: usize = 8;
+
+/// The connection chain to the destination. The hops (gateway sessions and
+/// the relay paths through them) must live as long as the destination's
+/// session; they are ended after it, innermost first.
+struct Chain {
+    hops: Vec<(ClientSession, ssh3_core::jump::JumpPath)>,
+    sess: ClientSession,
+}
+
+impl Chain {
+    async fn end(self, gave_up: bool) {
+        // Every way out except a given-up resume is a deliberate end
+        // (SPEC §5): the server destroys the session instead of lingering.
+        if !gave_up {
+            self.sess.end(END_BOUND).await;
+        }
+        drop(self.sess);
+        for (hop, path) in self.hops.into_iter().rev() {
+            hop.end(END_BOUND).await;
+            drop(path);
+        }
+    }
+}
+
+/// The ssh_config of one jump hop: resolved like a destination of its own
+/// (`-l`/`-p` from the hop spec, the same -F), as ssh(1) does.
+fn hop_config(hop: &ssh3_config::Hop, jumps: &Jumps) -> Result<ClientConfig, String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(f) = &jumps.config_file {
+        args.extend(["-F".into(), f.clone()]);
+    }
+    if let Some(u) = &hop.user {
+        args.extend(["-l".into(), u.clone()]);
+    }
+    if let Some(p) = hop.port {
+        args.extend(["-p".into(), p.to_string()]);
+    }
+    args.push(hop.host.clone());
+    let c = ssh3_config::resolve_args(&args, &jumps.env).map_err(|e| format!("jump host {}: {e}", hop.host))?;
+    refusals(&c).map_err(|e| format!("jump host {}: {e}", hop.host))?;
+    Ok(c)
+}
+
+/// The hops before `c`, in connection order: a hop's own ProxyJump comes
+/// before it, recursively (bounded).
+fn hop_configs(c: &ClientConfig, jumps: &Jumps, depth: usize) -> Result<Vec<ClientConfig>, String> {
+    if c.proxy_jump.is_empty() {
+        return Ok(Vec::new());
+    }
+    if depth >= MAX_JUMP_DEPTH {
+        return Err(format!("more than {MAX_JUMP_DEPTH} nested jump hosts"));
+    }
+    let mut out = Vec::new();
+    for (i, h) in c.proxy_jump.iter().enumerate() {
+        let hc = hop_config(h, jumps)?;
+        // Only the first hop's own ProxyJump applies; later hops are reached
+        // through the previous one (ssh -J a,b: b is reached via a).
+        if i == 0 {
+            out.extend(hop_configs(&hc, jumps, depth + 1)?);
+        }
+        out.push(hc);
+    }
+    Ok(out)
+}
+
+/// One authenticated connection to `c` at `addr` over `sockets`, every key
+/// offered in order on it (core stops at MaxAuthTries), with ssh(1)'s
+/// messages for the two refusals the user must be able to tell apart.
+async fn dial_one(c: &ClientConfig, addrs: Vec<SocketAddr>, sockets: SocketFactory) -> Result<ClientSession, String> {
     let host = host_check(c);
     let signers = signers(c);
     let denied = format!("{}@{}: Permission denied (publickey).", c.user, c.hostname);
     if signers.is_empty() {
-        return Outcome::Fatal(denied);
+        return Err(denied);
     }
     let mut last = String::new();
     for addr in addrs {
-        match dial(c, addr, &host, &signers).await {
-            Ok(sess) => return Outcome::Connected(sess),
+        match dial(c, addr, &host, &signers, sockets.clone()).await {
+            Ok(sess) => return Ok(sess),
             Err(Error::Auth(why)) => {
                 tracing::info!("authentication refused: {why}");
-                return Outcome::Fatal(denied);
+                return Err(denied);
             }
-            Err(Error::HostKey(why)) => return Outcome::Fatal(format!("{why}\nHost key verification failed.")),
+            Err(Error::HostKey(why)) => return Err(format!("{why}\nHost key verification failed.")),
             Err(e) => last = format!("ssh3: connect to host {} port {}: {e}", c.hostname, c.port),
         }
     }
-    Outcome::Fatal(last)
+    Err(last)
+}
+
+/// Connect to the destination: directly, or through every jump hop in turn,
+/// each next connection carried end to end over a relay path through the
+/// previous session (SPEC §7.2).
+async fn connect(c: &ClientConfig, jumps: &Jumps) -> Result<Chain, String> {
+    let hops = hop_configs(c, jumps, 0)?;
+    let Some(first) = hops.first() else {
+        let sess = dial_one(c, resolve_addrs(c).await?, dual_stack_factory()).await?;
+        return Ok(Chain { hops: Vec::new(), sess });
+    };
+    let mut prev = dial_one(first, resolve_addrs(first).await?, dual_stack_factory()).await?;
+    let mut chain = Vec::new();
+    for next in hops[1..].iter().chain(std::iter::once(c)) {
+        // The gateway resolves the next host itself (as `ssh -W %h:%p`).
+        let path = match prev.jump(&next.hostname, next.port).await {
+            Ok(p) => p,
+            Err(e) => {
+                let held = Chain { hops: chain, sess: prev };
+                held.end(false).await;
+                return Err(format!("ssh3: jump to {} port {}: {e}", next.hostname, next.port));
+            }
+        };
+        match dial_one(next, vec![path.virt], path.socket_factory()).await {
+            Ok(s) => {
+                chain.push((prev, path));
+                prev = s;
+            }
+            Err(e) => {
+                chain.push((prev, path));
+                let (last, path) = chain.pop().expect("just pushed");
+                drop(path);
+                let held = Chain { hops: chain, sess: last };
+                held.end(false).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(Chain { hops: chain, sess: prev })
 }
 
 /// Where a local listener binds, as ssh(1): loopback unless GatewayPorts or
@@ -443,28 +556,28 @@ async fn start_forwards(c: &ClientConfig, sess: &ClientSession) -> Result<Tasks,
     Ok(tasks)
 }
 
-async fn run(c: ClientConfig) -> ExitCode {
-    let sess = match connect(&c).await {
-        Outcome::Connected(s) => s,
-        Outcome::Fatal(m) => {
+async fn run(c: ClientConfig, jumps: Jumps) -> ExitCode {
+    let chain = match connect(&c, &jumps).await {
+        Ok(ch) => ch,
+        Err(m) => {
             eprintln!("{m}");
             return ExitCode::from(FAIL);
         }
     };
-    let tasks = match start_forwards(&c, &sess).await {
+    let sess = &chain.sess;
+    let tasks = match start_forwards(&c, sess).await {
         Ok(t) => t,
-        Err(e) => return fail(&e),
+        Err(e) => {
+            chain.end(false).await;
+            return fail(&e);
+        }
     };
-    let code = if c.session_type == SessionType::None { forward_only(&c, &sess).await } else { session(&c, &sess).await };
+    let code = if c.session_type == SessionType::None { forward_only(&c, sess).await } else { session(&c, sess).await };
     for t in tasks {
         t.abort();
     }
-    // Every way out of here except a given-up resume is a deliberate end
-    // (command exited, SIGINT/SIGTERM/SIGHUP, -N stopped): tell the server
-    // so it destroys the session instead of lingering (SPEC §5).
-    if !sess.roam_stats().gave_up.load(std::sync::atomic::Ordering::Relaxed) {
-        sess.end(END_BOUND).await;
-    }
+    let gave_up = sess.roam_stats().gave_up.load(std::sync::atomic::Ordering::Relaxed);
+    chain.end(gave_up).await;
     code
 }
 
@@ -722,9 +835,8 @@ mod tests {
     #[test]
     fn unimplemented_features_are_refused_by_name() {
         let e = refusals(&cfg(&["-N", "-J", "j", "-R", "1080", "h"], "")).unwrap_err();
-        for w in ["ProxyJump", "dynamic remote forward"] {
-            assert!(e.contains(w), "{w} missing in {e}");
-        }
+        assert!(e.contains("dynamic remote forward"), "{e}");
+        assert!(!e.contains("ProxyJump"), "ProxyJump is implemented: {e}");
         let e = refusals(&cfg(&["-W", "a:1", "h"], "")).unwrap_err();
         assert!(e.contains("-W"), "{e}");
         let e = refusals(&cfg(&["-N", "h"], "ProxyCommand nc %h %p\n")).unwrap_err();

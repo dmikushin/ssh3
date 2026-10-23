@@ -2155,6 +2155,7 @@ dependencies = [
  "socket2",
  "ssh-key",
  "ssh3-keys",
+ "ssh3-path",
  "ssh3-session",
  "ssh3-term",
  "thiserror",
