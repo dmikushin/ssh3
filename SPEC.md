@@ -190,6 +190,20 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     window minus a reserved 64 KiB for the control stream.
   *(Review: counting ring capacity instead gives 256 MiB per session with
   MaxChannels 256 — 25 GiB for 100 sessions.)*
+- **Budgets are charged on allocations, not on bytes.** Occupied bytes
+  being bounded does not bound memory: a `Vec`/`VecDeque` keeps its
+  capacity after drain. Therefore:
+  - Ring storage consists of fixed-size chunks (16 KiB) allocated from the
+    budget; each chunk owns its budget permit and releases it only when the
+    chunk itself is dropped (RAII), never when its bytes are consumed.
+  - The permit is reserved **before** the allocation and before any read
+    from QUIC or from the local source; read sizes are bounded by the
+    reserved chunk, so concurrent tasks cannot overshoot the budget.
+  - Temporary buffers on the QUIC→ring and source→ring paths are chunks
+    too (the read goes directly into a reserved chunk); no unaccounted
+    intermediate copies.
+  - Credit (`limit − delivered`) and backing allocations are tracked
+    separately; a chunk is charged once, whichever lane state it serves.
 - Channel lifecycle and control (open, ok/fail, pty-req, env, exec, shell,
   subsystem, window-change, signal, exit-status, exit-signal, close) are
   control-stream messages addressed by `chan_id`.
