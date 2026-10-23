@@ -62,7 +62,7 @@ pub(crate) struct UdpExt {
 }
 
 impl UdpExt {
-    fn new(tx: mpsc::Sender<Bytes>, stats: Arc<crate::lane::Stats>) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<Bytes>, stats: Arc<crate::lane::Stats>) -> Self {
         stats.udp_flows.fetch_add(1, Ordering::Relaxed);
         Self { tx, stats }
     }
@@ -72,6 +72,15 @@ impl Drop for UdpExt {
     fn drop(&mut self) {
         self.stats.udp_flows.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// One received fragment.
+struct Fragment {
+    chan: u64,
+    id: u16,
+    idx: u8,
+    count: u8,
+    data: Bytes,
 }
 
 struct Group {
@@ -103,7 +112,8 @@ impl Reassembly {
 
     /// Insert one fragment; returns the whole datagram when complete.
     /// `evicted` counts groups dropped for age or budget.
-    fn insert(&mut self, budget: &Arc<Budget>, max_age: std::time::Duration, chan: u64, id: u16, idx: u8, count: u8, data: Bytes, evicted: &mut u64) -> Option<Vec<u8>> {
+    fn insert(&mut self, budget: &Arc<Budget>, max_age: std::time::Duration, f: Fragment, evicted: &mut u64) -> Option<Vec<u8>> {
+        let Fragment { chan, id, idx, count, data } = f;
         // Age-out first.
         while let Some(k) = self.order.front() {
             match self.groups.get(k) {
@@ -263,7 +273,8 @@ impl SessionShared {
                     let id = u16::from_be_bytes([d[n + 1], d[n + 2]]);
                     let (idx, count) = (d[n + 3], d[n + 4]);
                     let mut evicted = 0;
-                    let whole = self.reasm.lock().unwrap().insert(&self.budgets.reasm, self.limits.reassembly_max_age, chan_id, id, idx, count, d.slice(n + FRAG_HDR..), &mut evicted);
+                    let frag = Fragment { chan: chan_id, id, idx, count, data: d.slice(n + FRAG_HDR..) };
+                    let whole = self.reasm.lock().unwrap().insert(&self.budgets.reasm, self.limits.reassembly_max_age, frag, &mut evicted);
                     self.stats.reasm_evicted.fetch_add(evicted, Ordering::Relaxed);
                     match whole {
                         Some(w) => Bytes::from(w),

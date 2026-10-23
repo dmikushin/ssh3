@@ -249,6 +249,11 @@ impl ClientSession {
         self.shared.run_udp_listener(sock, move |_| crate::msg::ChannelKind::DirectUdp { host: host.clone(), port })
     }
 
+    /// `-D`: SOCKS5 (CONNECT and UDP ASSOCIATE) on `listener`.
+    pub fn forward_dynamic(&self, listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        self.shared.forward_dynamic(listener)
+    }
+
     /// `-L`: accept on `listener`, open a direct-tcp channel per connection.
     pub fn forward_local(&self, listener: TcpListener, host: String, port: u16) -> tokio::task::JoinHandle<()> {
         let shared = Arc::downgrade(&self.shared);

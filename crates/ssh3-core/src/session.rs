@@ -470,7 +470,7 @@ impl SessionShared {
     }
 
     /// Bridge a TCP connection to lane 0 of `ch`.
-    fn start_tcp(self: &Arc<Self>, ch: &Arc<Channel>, tcp: TcpStream) {
+    pub(crate) fn start_tcp(self: &Arc<Self>, ch: &Arc<Channel>, tcp: TcpStream) {
         let sock = socket2::SockRef::from(&tcp);
         let _ = sock.set_recv_buffer_size(self.limits.tcp_socket_buffer);
         let _ = sock.set_send_buffer_size(self.limits.tcp_socket_buffer);

@@ -11,6 +11,7 @@ pub mod msg;
 pub mod ring;
 pub mod server;
 pub mod sesschan;
+mod socks;
 pub mod session;
 pub mod transport;
 pub mod udp;
