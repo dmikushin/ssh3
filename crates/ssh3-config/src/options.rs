@@ -1531,6 +1531,12 @@ impl Options {
     }
 }
 
+/// `GLOB_TILDE`, defined locally because the libc crate exports it only for
+/// glibc targets. Same value in both C libraries this crate is built for:
+/// glibc `/usr/include/glob.h:53` `(1 << 12)` and musl
+/// `/usr/lib/musl/include/glob.h:34` `0x1000`; musl's glob() implements it.
+const GLOB_TILDE: libc::c_int = 0x1000;
+
 /// `glob(pattern, GLOB_TILDE, NULL, &gl)` from the C library, as
 /// readconf.c calls it. Returns the sorted matches; no match is an empty
 /// list (GLOB_NOMATCH).
@@ -1541,7 +1547,7 @@ fn posix_glob_tilde(pattern: &str) -> Result<Vec<String>, String> {
     // gl_pathc entries, and always release it with globfree().
     unsafe {
         let mut gl: libc::glob_t = std::mem::zeroed();
-        let r = libc::glob(cpat.as_ptr(), libc::GLOB_TILDE, None, &mut gl);
+        let r = libc::glob(cpat.as_ptr(), GLOB_TILDE, None, &mut gl);
         let result = match r {
             0 => {
                 let mut v = Vec::with_capacity(gl.gl_pathc);

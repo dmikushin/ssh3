@@ -153,7 +153,12 @@ fn prepare(case: &Case) -> (PathBuf, Vec<String>) {
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_string_lossy().into_owned();
     let cfg = dir.join("config");
-    std::fs::write(&cfg, case.config.replace("@DIR@", &d)).unwrap();
+    let user = std::env::var("USER").unwrap_or_default();
+    std::fs::write(
+        &cfg,
+        case.config.replace("@DIR@", &d).replace("@USER@", &user),
+    )
+    .unwrap();
     for (rel, content) in case.files {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -653,6 +658,22 @@ fn includes() {
         case!("inc-nested", "Include @DIR@/n1\n", files: &[("n1", "Include @DIR@/n2\n"), ("n2", "Port 4006\n")], ["h"]),
         case!("inc-token", "Include @DIR@/inc-%h\n", files: &[("inc-h", "Port 4007\n")], ["h"]),
         case!("inc-env", "Include @DIR@/${SSH3_CFG_T_PORT}.conf\n", files: &[("4022.conf", "Port 4008\n")], ["h"]),
+        // `~` in Include paths: glob(3) GLOB_TILDE, and the ~/.ssh anchor
+        // for relative paths. The fixtures live under the real home
+        // directory (tests/ssh_g.rs writes them into ~/scratch/...).
+        case!("inc-tilde", "Include ~/scratch/ssh-udp/config-test/cases/inc-tilde/t.conf\n", files: &[("t.conf", "Port 4012\n")], ["h"]),
+        case!("inc-tilde-glob", "Include ~/scratch/ssh-udp/config-test/cases/inc-tilde-glob/*.conf\n", files: &[("x.conf", "Port 4013\n")], ["h"]),
+        case!("inc-tilde-user", "Include ~@USER@/scratch/ssh-udp/config-test/cases/inc-tilde-user/u.conf\n", files: &[("u.conf", "Port 4014\n")], ["h"]),
+        case!(
+            "inc-tilde-missing",
+            "Include ~/scratch/ssh-udp/config-test/cases/inc-tilde-missing/none.conf\nPort 4015\n",
+            ["h"]
+        ),
+        case!(
+            "inc-relative-ssh-dir",
+            "Include ssh3-config-test-nonexistent-*.conf\nPort 4016\n",
+            ["h"]
+        ),
         case!("inc-double-star", "Include @DIR@/conf/**/extra.conf\n", files: &[("conf/a/b/extra.conf", "Port 4009\n"), ("conf/a/extra.conf", "User onelevel\n")], ["h"]),
         case!("inc-brace", "Include @DIR@/{a,b}.conf\n", files: &[("a.conf", "Port 4010\n"), ("{a,b}.conf", "User literal\n")], ["h"]),
         case!("inc-bracket-class", "Include @DIR@/c[12].conf\n", files: &[("c2.conf", "Port 4011\n")], ["h"]),
