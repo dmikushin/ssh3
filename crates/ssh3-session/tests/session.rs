@@ -89,6 +89,24 @@ fn reaped_within(pid: u32) {
     }
 }
 
+/// Poll (2 ms) until `pid` is `nohup`'s target, i.e. has exec'd past nohup
+/// (comm no longer "nohup"/"sh") with SIGHUP ignored — nohup sets SIG_IGN
+/// before exec and exec preserves it. Fails after LIMIT naming the state.
+fn nohup_in_place_within(pid: i32) {
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let field = |k: &str| s.lines().find_map(|l| l.strip_prefix(k)).map(|v| v.trim().to_string()).unwrap_or_default();
+        let comm = field("Name:");
+        let hup_ignored = u64::from_str_radix(&field("SigIgn:"), 16).is_ok_and(|m| m & 1 == 1);
+        if hup_ignored && comm != "nohup" && comm != "sh" {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "nohup child {pid} not in place within {LIMIT:?}: comm={comm:?} SIGHUP ignored={hup_ignored}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 async fn run(cfg: &SessionConfig, r: &SessionRequest) -> (String, String, Exit) {
     let mut p = spawn(cfg, r).expect("spawn");
     drop(p.take_stdin());
@@ -450,13 +468,20 @@ async fn without_pty_closed_stdin_is_eof_for_the_child() {
 async fn pty_session_end_hangs_up_the_terminal_and_nohup_survives() {
     let leader_hup = marker("leader-hup");
     let child_hup = marker("child-hup");
+    let child_ready = marker("child-ready");
+    // The leader's "ready" says nothing about its background children: under
+    // load the hangup used to arrive before `nohup` had set SIG_IGN or before
+    // the child had installed its trap (46/300 failures at 84 busy threads,
+    // every failure with a disposition still missing at "ready"). The child
+    // reports its own readiness after `trap`; nohup's is observed below.
     let script = format!(
         "trap 'echo leader-hup > {lh}; exit 0' HUP; \
          nohup sleep 1000 >/dev/null 2>&1 & echo nohup=$!; \
-         sh -c 'trap \"echo child-hup > {ch}; exit 0\" HUP; while :; do sleep 0.01; done' & echo child=$!; \
+         sh -c 'trap \"echo child-hup > {ch}; exit 0\" HUP; echo ok > {cr}; while :; do sleep 0.01; done' & echo child=$!; \
          echo ready; while :; do sleep 0.01; done",
         lh = leader_hup.display(),
-        ch = child_hup.display()
+        ch = child_hup.display(),
+        cr = child_ready.display()
     );
     let mut r = exec(&script);
     r.pty = pty(80, 24, Vec::new());
@@ -467,6 +492,8 @@ async fn pty_session_end_hangs_up_the_terminal_and_nohup_survives() {
     read_until(&mut *out, &mut acc, "ready\r\n").await;
     let nohup = Leftover(pid_of(&acc, "nohup"));
     let child = Leftover(pid_of(&acc, "child"));
+    file_within(&child_ready);
+    nohup_in_place_within(nohup.0);
     let halves: Vec<Box<dyn std::any::Any>> = vec![Box::new(out), Box::new(p.take_stdin())];
     end_session(p, halves); // last reference to the master: hangup
     assert_eq!(file_within(&leader_hup), "leader-hup\n", "session leader not hung up");
