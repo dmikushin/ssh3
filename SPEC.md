@@ -277,20 +277,34 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   1. *Stream mode* (normal): pty bytes go into the send ring and are
      replayed byte-exact on resume, so the client's terminal sees the
      original bytes (scrollback, OSC, colours intact).
-  2. *Screen mode*: when the pty output ring is full (peer credit or send
-     budget exhausted, e.g. while detached), the server keeps reading the
-     pty into a server-side terminal emulator instead of blocking the
-     program; bytes not yet in the ring are consumed by the emulator only.
-     On the next resume, after the ring's retained bytes are replayed, the
-     server sends one `ScreenResync{…}` event: a full redraw of the current
-     screen (as an escape-sequence string that brings any VT100-compatible
-     terminal to the emulator's state, plus cursor and modes), then returns
-     to stream mode. Output produced while in screen mode is lost except for
-     its effect on the screen — the same trade mosh makes (scrollback of that
-     period is lost).
-  The emulator is the server's only O(screen) per-pty cost and is allocated
-  lazily on first entry into screen mode. TCP forwards and non-pty exec
-  never use screen mode: they are byte-exact or nothing.
+  2. *Screen mode*: when the pty output ring has no room (peer credit or
+     send budget exhausted — detached, or attached but slow), the server
+     keeps reading the pty into its terminal emulator instead of blocking
+     the program; those bytes go to the emulator only.
+  - **The emulator parses every pty output byte from the start**, in both
+    modes (review model `pty-resync-model.py`: a lazily created emulator
+    cannot know state set by bytes already delivered — SGR, alternate
+    screen, margins, a partial CSI, charsets). Only its parser+screen state
+    is kept, O(screen); no history.
+  - **Leaving screen mode is in-band.** As soon as the ring has room for a
+    redraw (any cause: resume, credit returning while attached, budget
+    freed), the server appends to the pty output lane — as ordinary lane
+    bytes — the emulator's redraw string: a byte sequence that brings any
+    VT100/xterm-compatible terminal from an unknown state to exactly the
+    emulator's state (reset, modes, alternate screen, every cell with
+    attributes, cursor, title), and then continues with raw pty bytes.
+    Because the redraw is part of the same byte stream, it is ordered after
+    every byte already in the ring and before every later byte: no separate
+    event, epoch or cut offset is needed, and the same rule works attached
+    and detached. The redraw is generated at the moment it is appended, from
+    the emulator state after the last byte the emulator consumed, so raw
+    bytes resumed afterwards continue exactly where it left off. If the
+    redraw is larger than the free ring space, the server waits for room
+    (still consuming pty output into the emulator, regenerating the redraw
+    when it finally appends).
+  - Output produced in screen mode is lost except for its effect on the
+    screen — the same trade mosh makes (that period's scrollback is lost).
+  TCP forwards and non-pty exec never use screen mode: byte-exact or nothing.
 - **Session lifetime.** Sessions with at least one pty channel default to
   no linger limit (as mosh: alive until the process exits or an explicit
   timeout); others use `SessionLinger`. Both configurable.
