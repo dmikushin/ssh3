@@ -141,14 +141,26 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - Each lane is carried by a QUIC bidi stream that starts with
   `LaneHeader{chan_id, lane, offset_out}`. Thereafter the stream carries raw
   bytes. FIN = end of that direction.
-- **Lane windows (application-level flow control, as SSH channel windows).**
-  A sender may send lane bytes only up to `acked_offset + lane_window`, where
-  `acked_offset` and `lane_window` come from the receiver's latest
-  `LaneAck{chan_id, lane, offset, window}`. `offset` = bytes the receiver has
-  accepted into its session-owned lane receive ring (§5). The receiver
-  **always** drains every QUIC stream into the lane ring immediately; the ring
-  is sized ≥ the window it advertised, so reading QUIC never blocks on the
-  local sink.
+- **Lane credit (application-level flow control).** Two distinct
+  quantities, carried in `LaneAck{chan_id, lane, accepted, limit}`:
+  - `accepted` — end of the bytes the receiver has accepted into its
+    session-owned receive ring. Used **only** for replay retention: the
+    sender may discard send-ring bytes below it.
+  - `limit` — an **absolute, monotone non-decreasing** credit limit: the
+    sender may send bytes with offset < `limit`. The receiver sets
+    `limit = delivered + granted`, where `delivered` = bytes flushed to the
+    local sink and `granted` ≤ ring capacity is the credit it currently
+    grants (§1 budget). Invariant: `limit − delivered ≤ ring capacity`, so
+    the ring cannot overflow. *(A relative window added to `accepted` lets a
+    stalled ring overflow: review model `spec-review-model.py`, accepted
+    262144 + window 262144 → 524288 bytes into a 262144-byte ring.)*
+  - **Liveness.** The receiver sends a `LaneAck` whenever local delivery
+    raises `limit` by ≥ 1/4 of the granted credit, even if no new network
+    bytes arrived; otherwise a lane whose limit was reached would deadlock
+    once its sink drains.
+  - The receiver **always** drains every QUIC stream into the ring
+    immediately (it never receives beyond `limit`; bytes beyond `limit` are a
+    protocol error), so reading QUIC never blocks on the local sink.
   *Why:* without this, one lane whose local sink stalls (slow TCP peer,
   suspended terminal) keeps bytes in quinn and exhausts the connection-level
   credit, which then blocks every other lane **and the control stream that
@@ -156,9 +168,23 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   resume-ack deadlock (review D2; the same class as Go ssh3's 4.5 h stall).
   With lane windows, connection credit is only ever consumed transiently and
   the control stream cannot be starved.
-- Lane windows are granted from the global budget (§1); Σ advertised lane
-  windows on a connection ≤ its connection receive window minus a reserved
-  64 KiB for the control stream.
+- **Rings hold bytes, not reservations.** Ring capacity is a cap; memory is
+  allocated only for bytes actually buffered (chunked, returned on drain).
+  Two server-wide budgets bound all lanes of all sessions, **attached and
+  detached**:
+  - *receive-credit budget*: Σ over lanes of outstanding granted credit
+    (`limit − delivered`) ≤ `LaneCreditBudget` (default 64 MiB). Each lane
+    gets a floor grant of 16 KiB; more is granted from the budget to lanes
+    that are actively delivering, and not re-granted to lanes whose sink is
+    stalled.
+  - *send-buffer budget*: Σ over lanes of send-ring bytes (read from the
+    local source, not yet past `accepted`) ≤ `LaneSendBudget` (default
+    64 MiB); a lane reads its local source only while it holds peer credit
+    and the budget has room.
+  - Additionally, per connection, Σ of lane credit ≤ the connection receive
+    window minus a reserved 64 KiB for the control stream.
+  *(Review: counting ring capacity instead gives 256 MiB per session with
+  MaxChannels 256 — 25 GiB for 100 sessions.)*
 - Channel lifecycle and control (open, ok/fail, pty-req, env, exec, shell,
   subsystem, window-change, signal, exit-status, exit-signal, close) are
   control-stream messages addressed by `chan_id`.
@@ -185,10 +211,12 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   holding bytes sent but not yet acked, and on the receiver, a receive ring
   holding bytes accepted but not yet flushed to the local sink. Both rings
   are session state (they survive carrier death). The receiver acks via
-  `LaneAck` (§4) every 16 KiB or 1 s, coalesced. When the send ring is full
-  (unacked = peer window) the sender stops reading its local source (TCP
-  socket, pty) — **backpressure, never growth**. `LaneBuffer` default
-  256 KiB per direction, configurable per channel kind.
+  `LaneAck` (§4) every 16 KiB or 1 s, coalesced, and on delivery per the §4
+  liveness rule. When the sender has reached the peer's `limit` or the send
+  budget is exhausted, it stops reading its local source (TCP socket, pty) —
+  **backpressure, never growth**. Ring capacity (`LaneBuffer`, default
+  256 KiB per direction, configurable per channel kind) is a cap, not an
+  allocation (§4).
 - **Received offset semantics.** `received_offset` = end of the bytes
   accepted into the receiver's receive ring. Bytes delivered to quinn but not
   yet copied into the ring are *not* counted, so a carrier death between the
@@ -206,6 +234,11 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     `Fail`. Lane streams are accepted on the new carrier only **after**
     `Resumed` is sent (extension of I4); a lane stream arriving earlier closes
     the connection.
+  - `Resume` and `Resumed` carry, per lane, both `accepted` and `limit`;
+    each side resumes sending from the peer's `accepted` and never beyond
+    the peer's `limit` (limits are monotone, so the larger of the
+    pre-outage and resumed values is authoritative; a smaller one is a
+    protocol error).
   - Both sides reopen lanes with `LaneHeader{…, offset_out}` resending from
     the peer's received offset. Unacked bytes are guaranteed to be in the send
     ring (a sender never discards unacked data). A received offset outside
@@ -230,12 +263,13 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   most `DetachedAcceptMax` (default 8) pending connections, each with a
   bounded lane; further connections are refused (closed immediately) and
   counted.
-- **Memory bound.** Per lane direction: send ring + receive ring
-  (2 × `LaneBuffer`) in userspace, plus kernel buffers of the local endpoint,
-  which the server caps explicitly (`SO_RCVBUF`/`SO_SNDBUF` on accepted and
-  dialed sockets, default 64 KiB; pty buffers are kernel-fixed). Bound of a
-  session = Σ over lanes of (2 × LaneBuffer + capped kernel buffers) + fixed
-  overhead. The number of sessions (attached + detached) per user and
+- **Memory bound.** Userspace lane memory server-wide ≤
+  `LaneCreditBudget` + `LaneSendBudget` (§4), regardless of the number of
+  sessions or channels. Plus kernel buffers of local endpoints, capped
+  explicitly (`SO_RCVBUF`/`SO_SNDBUF` on accepted and dialed sockets,
+  default 64 KiB; pty buffers are kernel-fixed) — these scale with the
+  number of open local sockets, which is bounded by MaxChannels × the
+  session caps. The number of sessions (attached + detached) per user and
   server-wide is capped.
 - Datagram channels are not replayed (lossy by contract).
 
