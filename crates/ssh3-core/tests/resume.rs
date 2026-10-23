@@ -271,3 +271,28 @@ async fn competing_snapshot_is_fenced_and_loses_no_data() {
     assert_eq!(sha(&out), sha(&data));
     assert_eq!(env.server.session(&sid).unwrap().epoch(), epoch);
 }
+
+/// SPEC §5: lane streams are accepted only after `Resumed`. A resuming peer
+/// that opens one before (here: without ever sending Resume) is closed, and
+/// the session's real carrier is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_stream_before_resumed_closes_the_connection() {
+    use ssh3_core::msg::LaneHeader;
+    let env = env_with(limits());
+    let c = env.client().await;
+    let conn = raw_conn(&env).await;
+    let (_s, _r, m) = raw_auth(&conn, &env.key, Intent::Resume).await;
+    assert_eq!(m, Message::AuthOk { session: None });
+    let (mut lane, _lr) = conn.open_bi().await.unwrap();
+    // A stream is invisible to the server until a byte is written.
+    lane.write_all(&frame::encode(&LaneHeader { chan_id: 0, lane: 0, offset_out: 0 })).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(10), conn.closed()).await.expect("not closed") {
+        quinn::ConnectionError::ApplicationClosed(ac) => {
+            assert_eq!(ac.error_code.into_inner(), close::PROTOCOL as u64);
+            assert!(String::from_utf8_lossy(&ac.reason).contains("stream opened before authentication"), "{ac:?}");
+        }
+        other => panic!("expected a protocol close, got {other:?}"),
+    }
+    assert!(c.shared.is_attached());
+    assert_eq!(env.server.stats().resumes_accepted, 0);
+}
