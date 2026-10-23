@@ -266,7 +266,7 @@ impl SessionShared {
     /// through a bounded queue into an in-memory pipe that is the lane's
     /// local source; the lane's sink is a pipe read by the event dispatcher.
     fn start_event_log(self: &Arc<Self>, mut rx: mpsc::Receiver<Message>) {
-        let ch = self.make_channel(EVENT_CHANNEL, 1);
+        let ch = self.make_channel(EVENT_CHANNEL, 1, None);
         let lane = ch.lanes[0].clone();
         let (mut prod, src) = tokio::io::duplex(4096);
         let (snk, mut cons) = tokio::io::duplex(4096);
@@ -389,9 +389,19 @@ impl SessionShared {
 
     // ------------------------------------------------------------ channels
 
-    fn make_channel(self: &Arc<Self>, chan_id: u64, nlanes: u8) -> Arc<Channel> {
+    fn make_channel(self: &Arc<Self>, chan_id: u64, nlanes: u8, lane0_cap: Option<u64>) -> Arc<Channel> {
         let env = self.lane_env();
-        let lanes = (0..nlanes).map(|i| Lane::new(chan_id, i, env.clone())).collect::<Vec<_>>();
+        let lanes = (0..nlanes)
+            .map(|i| {
+                let mut e = env.clone();
+                if i == 0
+                    && let Some(cap) = lane0_cap
+                {
+                    e.cap = cap;
+                }
+                Lane::new(chan_id, i, e)
+            })
+            .collect::<Vec<_>>();
         let ch = Arc::new(Channel {
             chan_id,
             lanes,
@@ -408,6 +418,11 @@ impl SessionShared {
     }
 
     pub(crate) fn new_channel(self: &Arc<Self>, chan_id: u64, nlanes: u8, completion: Completion) -> std::result::Result<Arc<Channel>, FailReason> {
+        self.new_channel_capped(chan_id, nlanes, completion, None)
+    }
+
+    /// As new_channel, with lane 0's ring cap overridden (pty output lanes).
+    pub(crate) fn new_channel_capped(self: &Arc<Self>, chan_id: u64, nlanes: u8, completion: Completion, lane0_cap: Option<u64>) -> std::result::Result<Arc<Channel>, FailReason> {
         let mut map = self.channels.lock().unwrap();
         if map.len() > self.limits.max_channels {
             return Err(FailReason::ResourceLimit);
@@ -415,7 +430,7 @@ impl SessionShared {
         if map.contains_key(&chan_id) {
             return Err(FailReason::Protocol(format!("channel {chan_id} already exists")));
         }
-        let ch = self.make_channel(chan_id, nlanes);
+        let ch = self.make_channel(chan_id, nlanes, lane0_cap);
         if matches!(completion, Completion::Manual) {
             map.insert(chan_id, ch.clone());
             return Ok(ch);
@@ -485,6 +500,33 @@ impl SessionShared {
 
     /// Bridge a local source and sink to lane `idx` of `ch`. A local I/O
     /// error aborts the channel (ChannelClose to the peer).
+    /// Bridge a pty (SPEC §5 hybrid pty lanes) to lane 0 of `ch`.
+    pub(crate) fn start_pty<R, W>(self: &Arc<Self>, ch: &Arc<Channel>, r: R, w: W, screen: Arc<Mutex<ssh3_term::Screen>>, eof: Arc<AtomicBool>)
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let lane = ch.lanes[0].clone();
+        let chan_id = ch.chan_id;
+        let me = Arc::downgrade(self);
+        let l2 = lane.clone();
+        let me2 = me.clone();
+        ch.spawn(async move {
+            if let Err(e) = l2.pty_source_task(r, screen, eof).await
+                && let Some(s) = me2.upgrade()
+            {
+                s.abort_channel(chan_id, format!("pty read failed: {e}")).await;
+            }
+        });
+        ch.spawn(async move {
+            if let Err(e) = lane.sink_task(w).await
+                && let Some(s) = me.upgrade()
+            {
+                s.abort_channel(chan_id, format!("pty write failed: {e}")).await;
+            }
+        });
+    }
+
     pub(crate) fn start_io<R, W>(self: &Arc<Self>, ch: &Arc<Channel>, idx: usize, r: R, w: W)
     where
         R: tokio::io::AsyncRead + crate::lane::Readable + Unpin + Send + 'static,

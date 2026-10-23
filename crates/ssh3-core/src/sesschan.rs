@@ -13,13 +13,8 @@ use tokio::io::{DuplexStream, unix::AsyncFd};
 use tokio::sync::{Notify, oneshot, watch};
 
 use crate::error::{Error, Result};
-use crate::lane::{BlockingOverflow, PtyOverflow};
 use crate::msg::{ChannelKind, FailReason, Message, SessReq};
 use crate::session::{Completion, SessionShared};
-
-/// Makes the overflow policy of each pty output lane (the terminal crate
-/// supplies screen mode; the default blocks).
-pub type OverflowFactory = Arc<dyn Fn() -> Arc<dyn PtyOverflow> + Send + Sync>;
 
 /// Resolves a user name to its account record (system passwd by default;
 /// an alternative user database — containers, tests — plugs in here).
@@ -28,7 +23,6 @@ pub type UserLookup = Arc<dyn Fn(&str) -> std::result::Result<ssh3_session::User
 /// Server-wide settings for session channels.
 pub struct ServerSessionEnv {
     pub config: ssh3_session::SessionConfig,
-    pub overflow: OverflowFactory,
     pub users: UserLookup,
     /// The server's UDP port (SSH_CONNECTION).
     pub(crate) local_port: u16,
@@ -38,7 +32,6 @@ impl ServerSessionEnv {
     pub fn new(config: ssh3_session::SessionConfig) -> Self {
         Self {
             config,
-            overflow: Arc::new(|| Arc::new(BlockingOverflow) as Arc<dyn PtyOverflow>),
             users: Arc::new(|name| ssh3_session::UserRecord::lookup(name).map_err(|e| e.to_string())),
             local_port: 0,
         }
@@ -83,7 +76,12 @@ pub(crate) struct ServerSess {
     started: AtomicBool,
     process: tokio::sync::Mutex<Option<ssh3_session::SessionProcess>>,
     exited: Arc<ExitFlag>,
+    /// The pty's terminal model (SPEC §5) and whether the pty reached EOF.
+    screen: Mutex<Option<PtyModel>>,
 }
+
+/// A pty's server-side terminal model and its EOF flag.
+type PtyModel = (Arc<Mutex<ssh3_term::Screen>>, Arc<AtomicBool>);
 
 pub(crate) struct ClientSess {
     exit: watch::Sender<Option<ExitInfo>>,
@@ -289,7 +287,8 @@ impl SessionShared {
             return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
         }
         let exited = Arc::new(ExitFlag::default());
-        let ch = match self.new_channel(chan_id, 2, Completion::AfterExit(exited.clone())) {
+        // Lane 0 may become a pty output lane: its ring cap must hold a redraw.
+        let ch = match self.new_channel_capped(chan_id, 2, Completion::AfterExit(exited.clone()), Some(self.limits.pty_lane_buffer as u64)) {
             Ok(ch) => ch,
             Err(FailReason::Protocol(m)) => return Err(Error::Protocol(m)),
             Err(reason) => return self.reply_ev(Message::ChannelFail { chan_id, reason }),
@@ -297,7 +296,14 @@ impl SessionShared {
         for l in &ch.lanes {
             l.set_peer_limit(peer_limit);
         }
-        let st = ServerSess { pty: Mutex::new(None), env: Mutex::new(Vec::new()), started: AtomicBool::new(false), process: tokio::sync::Mutex::new(None), exited };
+        let st = ServerSess {
+            pty: Mutex::new(None),
+            env: Mutex::new(Vec::new()),
+            started: AtomicBool::new(false),
+            process: tokio::sync::Mutex::new(None),
+            exited,
+            screen: Mutex::new(None),
+        };
         *ch.ext.lock().unwrap() = Some(ChanExt::Server(Arc::new(st)));
         let limit = ch.lanes[0].initial_limit();
         self.reply_ev(Message::ChannelOk { chan_id, limit })
@@ -323,7 +329,8 @@ impl SessionShared {
                 } else if sess.started.load(Ordering::Acquire) {
                     Err("pty-req after the session started".into())
                 } else {
-                    *sess.pty.lock().unwrap() = Some(ssh3_session::PtyRequest { term, size: ssh3_session::WindowSize { cols, rows, xpixel, ypixel }, modes });
+                    let size = self.clamp_pty(ssh3_session::WindowSize { cols, rows, xpixel, ypixel });
+                    *sess.pty.lock().unwrap() = Some(ssh3_session::PtyRequest { term, size, modes });
                     Ok(())
                 }
             }
@@ -340,7 +347,10 @@ impl SessionShared {
             SessReq::Exec { command } => self.start_process(&ch, &sess, ssh3_session::Kind::Exec(command)).await,
             SessReq::Subsystem { name } => self.start_process(&ch, &sess, ssh3_session::Kind::Subsystem(name)).await,
             SessReq::WindowChange { cols, rows, xpixel, ypixel } => {
-                let size = ssh3_session::WindowSize { cols, rows, xpixel, ypixel };
+                let size = self.clamp_pty(ssh3_session::WindowSize { cols, rows, xpixel, ypixel });
+                if let Some((screen, _)) = &*sess.screen.lock().unwrap() {
+                    screen.lock().unwrap().resize(size.cols as u16, size.rows as u16);
+                }
                 match &*sess.process.lock().await {
                     Some(p) => p.resize(size).map_err(|e| e.to_string()),
                     None => match &mut *sess.pty.lock().unwrap() {
@@ -359,6 +369,27 @@ impl SessionShared {
             },
         };
         self.reply_ev(reply(result.err()))
+    }
+
+    /// Clamp a pty size to the configured maximum (bounds the redraw).
+    fn clamp_pty(&self, s: ssh3_session::WindowSize) -> ssh3_session::WindowSize {
+        ssh3_session::WindowSize {
+            cols: s.cols.clamp(ssh3_term::MIN_COLUMNS as u32, self.limits.pty_max_cols as u32),
+            rows: s.rows.clamp(ssh3_term::MIN_LINES as u32, self.limits.pty_max_rows as u32),
+            ..s
+        }
+    }
+
+    /// The server's model of a pty channel's terminal, and whether the pty
+    /// has reached EOF (its state is final then). For verification and
+    /// introspection.
+    pub fn pty_screen(&self, chan_id: u64) -> Option<(ssh3_term::Snapshot, bool)> {
+        let ch = self.channel_by_id(chan_id)?;
+        let ext = ch.ext.lock().unwrap();
+        let Some(ChanExt::Server(sess)) = &*ext else { return None };
+        let g = sess.screen.lock().unwrap();
+        let (screen, eof) = g.as_ref()?;
+        Some((screen.lock().unwrap().snapshot(), eof.load(Ordering::Acquire)))
     }
 
     /// auth-agent-req: create the session's agent socket (once).
@@ -461,7 +492,7 @@ impl SessionShared {
             local_port: env.local_port,
         });
         let pty = sess.pty.lock().unwrap().clone();
-        let has_pty = pty.is_some();
+        let pty_size = pty.as_ref().map(|p| p.size);
         let req = ssh3_session::SessionRequest {
             user,
             kind,
@@ -475,11 +506,15 @@ impl SessionShared {
         let stdin = p.take_stdin().ok_or("process has no stdin")?;
         let stdout = p.take_stdout().ok_or("process has no stdout")?;
         let stderr = p.take_stderr();
-        if has_pty {
-            ch.lanes[0].set_overflow((env.overflow)());
+        if let Some(size) = pty_size {
             self.note_pty();
+            let screen = Arc::new(Mutex::new(ssh3_term::Screen::new(size.cols as u16, size.rows as u16)));
+            let eof = Arc::new(AtomicBool::new(false));
+            *sess.screen.lock().unwrap() = Some((screen.clone(), eof.clone()));
+            self.start_pty(ch, stdout, stdin, screen, eof);
+        } else {
+            self.start_io(ch, 0, stdout, stdin);
         }
-        self.start_io(ch, 0, stdout, stdin);
         match stderr {
             Some(e) => self.start_io(ch, 1, e, tokio::io::sink()),
             None => self.start_io(ch, 1, tokio::io::empty(), tokio::io::sink()),

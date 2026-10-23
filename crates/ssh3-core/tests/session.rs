@@ -2,12 +2,10 @@
 //! (also across a resume), pty hangup on close, the PtyOverflow hook.
 mod common;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::*;
-use ssh3_core::{Command, ExitInfo, Limits, PtyOverflow, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec};
+use ssh3_core::{Command, ExitInfo, Limits, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -135,34 +133,6 @@ async fn close_hangs_up_the_pty() {
     ch.close().await;
     wait_until("SIGHUP delivered (pty master closed)", LIMIT, || mark.exists(), || format!("{:?}", env.server.stats())).await;
     wait_until("server channel gone", LIMIT, || env.server.stats().channels == 0, || format!("{:?}", env.server.stats())).await;
-}
-
-#[derive(Default)]
-struct Recording {
-    full: AtomicU64,
-}
-
-impl PtyOverflow for Recording {
-    fn ring_full(&self) -> bool {
-        self.full.fetch_add(1, Ordering::Relaxed);
-        false // stream mode: block, like the stub
-    }
-    fn feed(&self, _bytes: &[u8]) {}
-}
-
-/// SPEC §5 hybrid pty lanes: the overflow hook is invoked once the pty
-/// output lane is full (the client stops reading).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pty_overflow_hook_is_invoked_when_the_lane_is_full() {
-    let rec = Arc::new(Recording::default());
-    let r2 = rec.clone();
-    let mut senv = ServerSessionEnv::new(ssh3_session::SessionConfig::default());
-    senv.overflow = Arc::new(move || r2.clone() as Arc<dyn PtyOverflow>);
-    let env = env_with_session(fast_limits(), senv);
-    let c = client_as_me(&env).await;
-    // Never read: the client pipe, then its ring, then the credit fill up.
-    let _ch = c.open_session(exec_pty("yes", 24, 80)).await.unwrap();
-    wait_until("overflow hook invoked", LIMIT, || rec.full.load(Ordering::Relaxed) > 0, || format!("{:?}", env.server.stats())).await;
 }
 
 /// A real ssh-agent for the test, killed through its own child handle.

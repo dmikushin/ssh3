@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 ssh-key = { version = "0.6.7", default-features = false, features = ["std"] }
 ssh3-keys = { path = "../ssh3-keys" }
 ssh3-session = { path = "../ssh3-session" }
+ssh3-term = { path = "../ssh3-term" }
 socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

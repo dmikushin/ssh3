@@ -2156,6 +2156,7 @@ dependencies = [
  "ssh-key",
  "ssh3-keys",
  "ssh3-session",
+ "ssh3-term",
  "thiserror",
  "tokio",
  "tracing",

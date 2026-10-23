@@ -40,6 +40,13 @@ pub struct Limits {
     /// so it defaults to the connection-window ceiling; memory is bounded by
     /// the server-wide budgets, not by this cap.
     pub lane_buffer: usize,
+    /// Ring cap of pty output lanes (SPEC §5): must hold a full redraw of
+    /// the largest allowed screen (validated).
+    pub pty_lane_buffer: usize,
+    /// pty sizes are clamped to this (pty-req, window-change), which bounds
+    /// the redraw.
+    pub pty_max_cols: u16,
+    pub pty_max_rows: u16,
     /// Credit every lane gets without the budget. Must be a multiple of the
     /// 16 KiB ring chunk, at most 2 chunks (the storage exempt from budgets).
     pub lane_floor: u64,
@@ -111,6 +118,10 @@ impl Default for Limits {
             max_listeners: 64,
             detached_accept_max: 8,
             lane_buffer: 8 * 1024 * 1024,
+            // 320x120: max redraw 13.7 MB (ssh3_term::max_resync_len).
+            pty_lane_buffer: 16 * 1024 * 1024,
+            pty_max_cols: 320,
+            pty_max_rows: 120,
             lane_floor: 16 * 1024,
             lane_ack_bytes: 16 * 1024,
             credit_idle: Duration::from_secs(5),
@@ -151,6 +162,28 @@ impl Limits {
         }
         if (self.lane_buffer as u64) < self.lane_floor || !(self.lane_buffer as u64).is_multiple_of(chunk) {
             return Err(format!("lane_buffer {} must be a multiple of {chunk} and at least lane_floor {}", self.lane_buffer, self.lane_floor));
+        }
+        if self.pty_max_cols < ssh3_term::MIN_COLUMNS
+            || self.pty_max_cols > ssh3_term::MAX_COLUMNS
+            || self.pty_max_rows < ssh3_term::MIN_LINES
+            || self.pty_max_rows > ssh3_term::MAX_LINES
+        {
+            return Err(format!(
+                "pty_max_cols x pty_max_rows {}x{} outside {}..={} x {}..={}",
+                self.pty_max_cols,
+                self.pty_max_rows,
+                ssh3_term::MIN_COLUMNS,
+                ssh3_term::MAX_COLUMNS,
+                ssh3_term::MIN_LINES,
+                ssh3_term::MAX_LINES
+            ));
+        }
+        let redraw = ssh3_term::max_resync_len(self.pty_max_cols, self.pty_max_rows);
+        if self.pty_lane_buffer < redraw || !(self.pty_lane_buffer as u64).is_multiple_of(chunk) {
+            return Err(format!(
+                "pty_lane_buffer {} must be a multiple of {chunk} and hold a full redraw of a {}x{} screen ({redraw} bytes)",
+                self.pty_lane_buffer, self.pty_max_cols, self.pty_max_rows
+            ));
         }
         if self.lane_ack_bytes == 0 {
             return Err("lane_ack_bytes must be positive".into());

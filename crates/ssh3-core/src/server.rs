@@ -116,6 +116,10 @@ pub struct ServerStats {
     /// unilateral while detached) and carriers cut for an unacked Retract.
     pub credit_retractions: u64,
     pub retract_timeouts: u64,
+    /// §5 pty lanes: bytes consumed in screen mode (emulator only — lost
+    /// except for their effect on the screen) and redraws appended.
+    pub pty_screen_bytes: u64,
+    pub pty_redraws: u64,
 }
 
 impl Server {
@@ -204,6 +208,8 @@ impl Server {
             t.udp_evicted += s.stats.udp_evicted.load(Ordering::Relaxed);
             t.credit_retractions += s.stats.credit_retractions.load(Ordering::Relaxed);
             t.retract_timeouts += s.stats.retract_timeouts.load(Ordering::Relaxed);
+            t.pty_screen_bytes += s.stats.pty_screen_bytes.load(Ordering::Relaxed);
+            t.pty_redraws += s.stats.pty_redraws.load(Ordering::Relaxed);
             t.refused_detached += s.refused_detached.load(Ordering::Relaxed);
             t.send_ring_bytes += s.stats.send_ring_bytes.load(Ordering::Relaxed);
             t.recv_ring_bytes += s.stats.recv_ring_bytes.load(Ordering::Relaxed);

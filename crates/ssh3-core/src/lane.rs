@@ -73,6 +73,10 @@ pub struct Stats {
     /// for not acknowledging one in time.
     pub credit_retractions: AtomicU64,
     pub retract_timeouts: AtomicU64,
+    /// §5 pty lanes: bytes consumed in screen mode (emulator only) and
+    /// redraws appended when leaving it.
+    pub pty_screen_bytes: AtomicU64,
+    pub pty_redraws: AtomicU64,
 }
 
 /// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
@@ -142,30 +146,6 @@ impl Readable for tokio::io::Empty {
     fn readable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
         std::future::ready(Ok(()))
     }
-}
-
-/// SPEC §5 "pty lanes": what a pty output lane does when it cannot take
-/// more bytes (no peer credit or no send budget). The terminal-emulator
-/// crate implements screen mode; the default blocks (stream mode).
-pub trait PtyOverflow: Send + Sync {
-    /// The lane is full. `true`: keep reading the pty and pass the bytes to
-    /// [`feed`](Self::feed) until the lane has room again (screen mode);
-    /// `false`: stop reading the pty (backpressure).
-    fn ring_full(&self) -> bool;
-    /// Bytes read from the pty while the lane is full (screen mode only).
-    fn feed(&self, bytes: &[u8]);
-    /// The lane has room again after a full episode.
-    fn ring_has_room(&self) {}
-}
-
-/// Stream mode only: a full lane blocks the pty.
-pub struct BlockingOverflow;
-
-impl PtyOverflow for BlockingOverflow {
-    fn ring_full(&self) -> bool {
-        false
-    }
-    fn feed(&self, _bytes: &[u8]) {}
 }
 
 /// A QUIC send stream that is **reset**, not finished, when dropped without
@@ -272,8 +252,6 @@ pub struct Lane {
     pub(crate) done: Notify,
     attach_tx: mpsc::UnboundedSender<(LaneSend, u64)>,
     attach_rx: Mutex<Option<mpsc::UnboundedReceiver<(LaneSend, u64)>>>,
-    /// Set on pty output lanes (SPEC §5 hybrid pty lanes).
-    overflow: Mutex<Option<Arc<dyn PtyOverflow>>>,
 }
 
 async fn wait_for<T>(n: &Notify, mut f: impl FnMut() -> Option<T>) -> T {
@@ -337,12 +315,7 @@ impl Lane {
             done: Notify::new(),
             attach_tx,
             attach_rx: Mutex::new(Some(attach_rx)),
-            overflow: Mutex::new(None),
         })
-    }
-
-    pub(crate) fn set_overflow(&self, o: Arc<dyn PtyOverflow>) {
-        *self.overflow.lock().unwrap() = Some(o);
     }
 
     /// Our send side is finished (all bytes accepted after EOF, or the peer
@@ -772,7 +745,6 @@ impl Lane {
         loop {
             // Wait for data (or EOF) before reserving storage for it.
             src.readable().await?;
-            let mut full_episode = false;
             let (mut tail, want) = loop {
                 let lane_fut = self.wake_source.notified();
                 let budget_fut = self.env.send_budget.freed.notified();
@@ -798,27 +770,8 @@ impl Lane {
                         };
                         if let Some(t) = tail {
                             let want = want.min(t.space());
-                            if full_episode && let Some(o) = self.overflow.lock().unwrap().clone() {
-                                o.ring_has_room();
-                            }
                             break (t, want);
                         }
-                    }
-                }
-                // The lane is full. A pty output lane asks its overflow
-                // policy whether to keep reading the pty (screen mode).
-                let overflow = self.overflow.lock().unwrap().clone();
-                if let Some(o) = overflow {
-                    full_episode = true;
-                    if o.ring_full() {
-                        let mut scratch = [0u8; 4096];
-                        let n = src.read(&mut scratch).await?;
-                        if n > 0 {
-                            o.feed(&scratch[..n]);
-                            continue;
-                        }
-                        // EOF: wait for room; the normal path then reads the
-                        // EOF again and sends LaneFin.
                     }
                 }
                 tokio::select! {
@@ -858,6 +811,154 @@ impl Lane {
                 let _ = self.env.events.send(Message::LaneFin { chan_id: self.chan_id, lane: self.lane, final_offset }).await;
                 return Ok(());
             }
+        }
+    }
+
+    /// Append `data` to the send ring if the storage for it can be charged
+    /// now (budget chunks, or one floor chunk); all or nothing.
+    fn append_send(&self, st: &mut LaneState, data: &[u8]) -> bool {
+        let need = data.len().saturating_sub(st.sbuf.tail_space());
+        let k = need.div_ceil(CHUNK);
+        let mut chunks = Vec::with_capacity(k);
+        if k > 0 {
+            match Permit::try_new(&self.env.send_budget, k as u64 * CH) {
+                Some(mut p) => {
+                    for _ in 0..k {
+                        chunks.push(Tail::new(ChunkPermit { _permit: p.split(CH), floor: None }));
+                    }
+                }
+                None if k == 1 => match floor_chunk(&self.env.floor_budget, &st.sfloor, SEND_FLOOR_CHUNKS) {
+                    Some(t) => chunks.push(t),
+                    None => return false,
+                },
+                None => return false,
+            }
+        }
+        let mut chunks = chunks.into_iter();
+        let mut off = 0;
+        while off < data.len() {
+            let mut t = match st.sbuf.take_tail() {
+                Some(t) => t,
+                None => chunks.next().expect("chunks reserved for every byte"),
+            };
+            let m = t.space().min(data.len() - off);
+            t.spare(m).copy_from_slice(&data[off..off + m]);
+            st.sbuf.commit(t, m);
+            off += m;
+        }
+        self.env.stats.send_ring_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// pty output → send ring (SPEC §5 hybrid pty lanes). The pty is read
+    /// all the time, whatever the client does: a program never blocks on its
+    /// terminal. Every byte is fed to `screen`. In stream mode the bytes also
+    /// go into the ring, byte-exact — while peer credit and storage allow.
+    /// Otherwise the lane enters screen mode: bytes go to the emulator only.
+    /// Once the sender has caught up with the peer's credit and the ring has
+    /// room for a redraw, the redraw is generated and appended and the lane
+    /// returns to stream mode. Snapshot, append and switch happen under the
+    /// screen lock in this task, so no pty byte falls between them.
+    pub(crate) async fn pty_source_task<R: AsyncReadExt + Unpin>(self: Arc<Self>, mut src: R, screen: Arc<Mutex<ssh3_term::Screen>>, eof_flag: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+        let mut buf = vec![0u8; CHUNK];
+        let mut screen_mode = false;
+        let mut eof = false;
+        loop {
+            let lane_fut = self.wake_source.notified();
+            let budget_fut = self.env.send_budget.freed.notified();
+            tokio::pin!(lane_fut, budget_fut);
+            lane_fut.as_mut().enable();
+            budget_fut.as_mut().enable();
+            if screen_mode {
+                let sc = screen.lock().unwrap();
+                let mut st = self.st.lock().unwrap();
+                if st.closed || st.send_done {
+                    return Ok(());
+                }
+                let send_end = st.sbase + st.sbuf.len() as u64;
+                if send_end <= st.peer_limit {
+                    let redraw = sc.resync();
+                    if self.env.cap - st.sbuf.len() as u64 >= redraw.len() as u64 && self.append_send(&mut st, &redraw) {
+                        screen_mode = false;
+                        self.env.stats.pty_redraws.fetch_add(1, Ordering::Relaxed);
+                        drop(st);
+                        drop(sc);
+                        self.wake_sender.notify_waiters();
+                        continue;
+                    }
+                }
+            }
+            if eof {
+                if screen_mode {
+                    // The final screen must reach the client: wait for room.
+                    tokio::select! {
+                        _ = lane_fut => {}
+                        _ = budget_fut => {}
+                    }
+                    continue;
+                }
+                let final_offset = {
+                    let mut st = self.st.lock().unwrap();
+                    if st.closed {
+                        return Ok(());
+                    }
+                    st.s_eof = true;
+                    if st.sbuf.is_empty() {
+                        st.send_done = true;
+                    }
+                    st.sbase + st.sbuf.len() as u64
+                };
+                self.done.notify_waiters();
+                self.wake_sender.notify_waiters();
+                let _ = self.env.events.send(Message::LaneFin { chan_id: self.chan_id, lane: self.lane, final_offset }).await;
+                return Ok(());
+            }
+            let n = if screen_mode {
+                tokio::select! {
+                    r = src.read(&mut buf) => r?,
+                    _ = lane_fut => continue,
+                    _ = budget_fut => continue,
+                }
+            } else {
+                // Read no more than the credit takes, so stream mode is left
+                // only when there is really no credit (then read a chunk).
+                let want = {
+                    let st = self.st.lock().unwrap();
+                    let send_end = st.sbase + st.sbuf.len() as u64;
+                    let credit = st.peer_limit.saturating_sub(send_end).min(self.env.cap - st.sbuf.len() as u64);
+                    if credit == 0 { CHUNK } else { (credit as usize).min(CHUNK) }
+                };
+                src.read(&mut buf[..want]).await?
+            };
+            if n == 0 {
+                eof = true;
+                eof_flag.store(true, Ordering::Release);
+                continue;
+            }
+            let sc_guard = {
+                let mut sc = screen.lock().unwrap();
+                sc.feed(&buf[..n]);
+                sc
+            };
+            let mut st = self.st.lock().unwrap();
+            if st.closed || st.send_done {
+                return Ok(());
+            }
+            if !screen_mode {
+                let send_end = st.sbase + st.sbuf.len() as u64;
+                let credit = st.peer_limit.saturating_sub(send_end);
+                let room = self.env.cap - st.sbuf.len() as u64;
+                if credit >= n as u64 && room >= n as u64 && self.append_send(&mut st, &buf[..n]) {
+                    drop(st);
+                    drop(sc_guard);
+                    self.wake_sender.notify_waiters();
+                    continue;
+                }
+                screen_mode = true;
+            }
+            drop(st);
+            drop(sc_guard);
+            self.env.stats.pty_screen_bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 

@@ -36,6 +36,8 @@ pub fn to_json(s: &ServerStats) -> Value {
         udp_evicted,
         credit_retractions,
         retract_timeouts,
+        pty_screen_bytes,
+        pty_redraws,
     } = *s;
     json!({
         "conns_accepted": conns_accepted,
@@ -67,5 +69,7 @@ pub fn to_json(s: &ServerStats) -> Value {
         "udp_evicted": udp_evicted,
         "credit_retractions": credit_retractions,
         "retract_timeouts": retract_timeouts,
+        "pty_screen_bytes": pty_screen_bytes,
+        "pty_redraws": pty_redraws,
     })
 }
