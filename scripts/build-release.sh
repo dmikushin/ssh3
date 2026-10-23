@@ -47,6 +47,11 @@ export CC_x86_64_unknown_linux_musl=musl-gcc
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 # Deterministic: no absolute paths from this machine inside the artifact.
 export RUSTFLAGS="-C relocation-model=static --remap-path-prefix=$WS=/ssh3-rs --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+# Cargo does not pass RUSTFLAGS to rustdoc. Without this, the merged doctest
+# harness for the musl target is linked as a static-PIE and SIGSEGVs at
+# startup; rustdoc swallows the signal and reports a bare `error: doctest
+# failed` with no diagnostic. Evidence: ~/scratch/ssh-udp/qa-doctest-musl.log.
+export RUSTDOCFLAGS="-C relocation-model=static"
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(cd "$WS" && git log -1 --format=%ct 2>/dev/null || echo 0)}
 
 build_into() {
@@ -57,6 +62,15 @@ build_into() {
 bins_in() {
     find "$1/$TARGET/release" -maxdepth 1 -type f -executable -printf '%f\n' 2>/dev/null | sort
 }
+
+if [[ ${1:-} == --test ]]; then
+    # Run the whole suite as it will be shipped: musl target, release profile.
+    # A test that only ever ran on the host gnu target proves nothing about the
+    # artifact that goes to oracle.
+    td=${SSH3_RELEASE_TARGET_DIR:-/dev/shm/ssh3-musl-test}
+    (cd "$WS" && cargo test --release --workspace --target "$TARGET" --target-dir "$td")
+    exit $?
+fi
 
 if [[ ${1:-} == --repro ]]; then
     a=$(mktemp -d /dev/shm/ssh3-repro-a.XXXX)
