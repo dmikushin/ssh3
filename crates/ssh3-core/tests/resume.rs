@@ -227,3 +227,47 @@ async fn malformed_resume_does_not_detach_the_session() {
     let data = Arc::new(pattern(64 << 10, 9));
     assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
 }
+
+/// Verdict (a): competing snapshots. While a real client is mid-transfer, a
+/// competing resumer (same user and key) attaches with a stale, empty
+/// snapshot; then the real client resumes again. No byte may be lost or
+/// duplicated (a snapshot never releases unlisted data), and the superseded
+/// carrier is cut by epoch: nothing it sends reaches the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_snapshot_is_fenced_and_loses_no_data() {
+    let env = env_with(limits());
+    let (c, bh) = client_bh(&env).await;
+    let echo = echo_server().await;
+    let fwd = forward(&c, echo).await;
+    let data = Arc::new(pattern(8 << 20, 31));
+    let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
+    wait_until("transfer under way", Duration::from_secs(20), || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed) > 1 << 20, || format!("{:?}", env.server.stats())).await;
+    let sid = c.session_id();
+    // Make the server hold unacked bytes: the client stops hearing it.
+    bh.set_down(true);
+    let srv = env.server.session(&sid).unwrap();
+    wait_until("server holds unacked send bytes", Duration::from_secs(10), || srv.stats.send_ring_bytes.load(Ordering::Relaxed) > 0, || format!("{:?}", env.server.stats())).await;
+    // The competitor.
+    let rival = raw_conn(&env).await;
+    let (mut s, mut r, m) = raw_auth(&rival, &env.key, Intent::Resume).await;
+    assert_eq!(m, Message::AuthOk { session: None });
+    frame::write_message(&mut s, &Message::Resume { session_id: sid, lanes: vec![] }).await.unwrap();
+    let rival_epoch = match frame::read_message(&mut r, 65536).await.unwrap() {
+        Some(Message::Resumed { epoch, .. }) => epoch,
+        other => panic!("expected Resumed, got {other:?}"),
+    };
+    // The real client lost its carrier to the rival and takes it back.
+    c.carrier_lost().await;
+    let epoch = c.resume(other_socket()).await.unwrap();
+    assert!(epoch > rival_epoch);
+    match rival.closed().await {
+        quinn::ConnectionError::ApplicationClosed(ac) => assert_eq!(ac.error_code.into_inner(), close::SUPERSEDED as u64),
+        other => panic!("rival closed with {other:?}"),
+    }
+    // Fenced: the superseded carrier cannot carry anything any more.
+    assert!(rival.open_bi().await.is_err());
+    let out = rt.await.unwrap();
+    assert_eq!(out.len(), data.len());
+    assert_eq!(sha(&out), sha(&data));
+    assert_eq!(env.server.session(&sid).unwrap().epoch(), epoch);
+}

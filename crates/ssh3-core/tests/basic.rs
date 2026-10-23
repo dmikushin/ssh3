@@ -340,3 +340,52 @@ async fn every_auth_refusal_is_delivered_before_close() {
         assert_eq!(code, close::AUTH_FAILED as u64, "MaxAuthTries={n}");
     }
 }
+
+/// Verdict (b): a peer that sends beyond its lane credit is cut — even while
+/// the lane's sink is blocked — and other sessions keep working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn over_credit_peer_is_cut_while_others_work() {
+    use ssh3_core::frame;
+    use ssh3_core::msg::{ChannelKind, LaneHeader};
+    let env = env_with(Limits { idle_timeout: Duration::from_secs(10), ..fast_limits() });
+    let (stalled, mut accepted) = stalled_server(true).await;
+    let conn = raw_conn(&env).await;
+    let (mut ctl, _ctl_r, m) = raw_auth(&conn, &env.key, Intent::New).await;
+    assert!(matches!(m, Message::AuthOk { session: Some(_) }), "{m:?}");
+    // Event lane (channel 0), and credit for the server's events.
+    let (mut ev, mut ev_r) = conn.open_bi().await.unwrap();
+    ev.write_all(&frame::encode(&LaneHeader { chan_id: 0, lane: 0, offset_out: 0 })).await.unwrap();
+    frame::read_frame(&mut ev_r, 64).await.unwrap().unwrap();
+    frame::write_message(&mut ctl, &Message::LaneAck { chan_id: 0, lane: 0, accepted: 0, limit: 1 << 20 }).await.unwrap();
+    let open = Message::ChannelOpen { chan_id: 2, kind: ChannelKind::DirectTcp { host: "127.0.0.1".into(), port: stalled.port() }, limit: 1 << 20 };
+    ev.write_all(&frame::encode(&open)).await.unwrap();
+    let server_limit = loop {
+        match frame::read_message(&mut ev_r, 65536).await.unwrap().unwrap() {
+            Message::ChannelOk { chan_id: 2, limit } => break limit,
+            _ => continue,
+        }
+    };
+    let _held = accepted.recv().await.unwrap(); // the sink: never read
+    let (mut lane, mut lane_r) = conn.open_bi().await.unwrap();
+    lane.write_all(&frame::encode(&LaneHeader { chan_id: 2, lane: 0, offset_out: 0 })).await.unwrap();
+    frame::read_frame(&mut lane_r, 64).await.unwrap().unwrap();
+    // Far beyond the grant.
+    let blast = vec![0x55u8; 2 << 20];
+    assert!(blast.len() as u64 > server_limit * 4);
+    let w = tokio::spawn(async move {
+        let _ = lane.write_all(&blast).await;
+    });
+    let closed = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .unwrap_or_else(|_| panic!("over-credit peer was not cut within 10 s: {:?}", env.server.stats()));
+    w.abort();
+    let (code, reason) = app_close(&closed);
+    assert_eq!(code, close::PROTOCOL as u64, "{reason}");
+    assert!(reason.contains("lane 2/0") && reason.contains("beyond limit"), "{reason}");
+    // The server is fine for everyone else.
+    let c = env.client().await;
+    let echo = echo_server().await;
+    let fwd = forward(&c, echo).await;
+    let data = Arc::new(pattern(256 << 10, 21));
+    assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
+}

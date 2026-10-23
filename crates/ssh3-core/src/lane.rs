@@ -724,8 +724,51 @@ impl Lane {
                 match got {
                     Some(v) => v,
                     None => {
-                        fut.await;
-                        continue;
+                        // No credit left: keep polling QUIC anyway. A
+                        // conforming peer sends nothing now; any byte that
+                        // arrives while we are still at the limit is a
+                        // violation and cuts the connection (bytes left in
+                        // quinn would hold connection credit hostage).
+                        let mut probe = [0u8; 1];
+                        tokio::select! {
+                            _ = fut => continue,
+                            r = recv.read(&mut probe) => {
+                                let n = match r {
+                                    Ok(Some(n)) => n,
+                                    Ok(None) => return Ok(()),
+                                    Err(e) => {
+                                        tracing::debug!(chan = self.chan_id, lane = self.lane, "lane read ended: {e}");
+                                        return Ok(());
+                                    }
+                                };
+                                let mut st = self.st.lock().unwrap();
+                                if st.closed || st.epoch != epoch {
+                                    return Ok(());
+                                }
+                                if st.received + n as u64 > st.limit {
+                                    return Err(Error::Protocol(format!(
+                                        "lane {}/{}: peer sent beyond limit {} (received {}, +{n})",
+                                        self.chan_id, self.lane, st.limit, st.received
+                                    )));
+                                }
+                                // Credit grew meanwhile: a legitimate byte.
+                                let mut tail = match st.rbuf.take_tail() {
+                                    Some(t) => t,
+                                    None => self.recv_chunk(&mut st).ok_or_else(|| {
+                                        Error::Protocol(format!("lane {}/{}: internal: credit granted without storage", self.chan_id, self.lane))
+                                    })?,
+                                };
+                                tail.spare(n).copy_from_slice(&probe[..n]);
+                                st.rbuf.commit(tail, n);
+                                st.received += n as u64;
+                                self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                let u = self.ack_need(&mut st);
+                                drop(st);
+                                self.queue_ack(u);
+                                self.wake_sink.notify_waiters();
+                                continue;
+                            }
+                        }
                     }
                 }
             };
