@@ -276,16 +276,26 @@ pub async fn forward(c: &ClientSession, target: SocketAddr) -> SocketAddr {
     a
 }
 
+/// Test payload: every 8-byte word is a hash of its own index and `seed`,
+/// so any lost, duplicated or misplaced word shows. Generated per word
+/// (a per-byte generator dominated debug-build test time).
 pub fn pattern(n: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    (0..n)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 24) as u8
-        })
-        .collect()
+    let mut v = Vec::with_capacity(n + 8);
+    for i in 0..n.div_ceil(8) as u64 {
+        v.extend_from_slice(&((i ^ seed.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed).to_le_bytes());
+    }
+    v.truncate(n);
+    v
+}
+
+/// Byte-exact comparison that reports where the streams diverge (memcmp
+/// speed; hashing every byte in a debug build was a large part of test time).
+#[track_caller]
+pub fn assert_same(got: &[u8], want: &[u8]) {
+    if got != want {
+        let at = got.iter().zip(want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+        panic!("streams differ: got {} bytes, want {}; first difference at offset {at}", got.len(), want.len());
+    }
 }
 
 pub fn sha(b: &[u8]) -> String {

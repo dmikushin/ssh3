@@ -20,7 +20,7 @@ async fn remote_forward_carries_data() {
     assert_eq!(env.server.stats().listeners, 1);
     let data = Arc::new(pattern(1 << 20, 41));
     let out = echo_roundtrip(format!("127.0.0.1:{port}").parse().unwrap(), data.clone()).await;
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

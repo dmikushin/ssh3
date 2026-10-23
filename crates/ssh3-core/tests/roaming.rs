@@ -29,7 +29,7 @@ async fn lost_probe_rebinds_without_resume() {
     let c = ClientSession::connect(env.opts(&env.key), bh.clone()).await.unwrap();
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(8 << 20, 51));
+    let data = Arc::new(pattern(4 << 20, 51));
     let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
     wait_until("transfer under way", Duration::from_secs(20), || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed) > 1 << 20, || format!("{:?}", env.server.stats())).await;
     bh.set_down(true); // this socket's path is dead from now on
@@ -37,7 +37,7 @@ async fn lost_probe_rebinds_without_resume() {
         .await
         .unwrap_or_else(|_| panic!("transfer did not survive the dead path: {:?}", c.roam_stats()))
         .unwrap();
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     let r = c.roam_stats();
     assert!(r.rebinds.load(Ordering::Relaxed) >= 1, "no rebind happened");
     assert_eq!(r.resumes.load(Ordering::Relaxed), 0);
@@ -60,7 +60,7 @@ async fn long_outage_is_recovered_by_automatic_resume() {
     let c = ClientSession::connect(opts.clone(), (opts.sockets)().unwrap()).await.unwrap();
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(8 << 20, 52));
+    let data = Arc::new(pattern(4 << 20, 52));
     let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
     wait_until("transfer under way", Duration::from_secs(20), || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed) > 1 << 20, || format!("{:?}", env.server.stats())).await;
     net.store(true, Ordering::SeqCst);
@@ -69,7 +69,7 @@ async fn long_outage_is_recovered_by_automatic_resume() {
     let attempts_while_down = c.roam_stats().resume_attempts.load(Ordering::Relaxed);
     net.store(false, Ordering::SeqCst);
     let out = rt.await.unwrap();
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     let r = c.roam_stats();
     assert!(r.resumes.load(Ordering::Relaxed) >= 1);
     assert!(r.resume_attempts.load(Ordering::Relaxed) > attempts_while_down || attempts_while_down >= 1);

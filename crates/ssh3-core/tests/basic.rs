@@ -74,15 +74,16 @@ async fn unknown_message_type_after_auth_closes_naming_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn direct_tcp_echo_64_mib() {
+async fn direct_tcp_echo_16_mib() {
     let env = env_with(Limits { idle_timeout: Duration::from_secs(10), ..fast_limits() });
     let c = env.client().await;
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(64 << 20, 1));
+    // 16 MiB = 64 × the lane ring: many credit rounds and chunk reuses.
+    let data = Arc::new(pattern(16 << 20, 1));
     let out = echo_roundtrip(fwd, data.clone()).await;
     assert_eq!(out.len(), data.len());
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     // Channel completes and is removed on both sides; its chunks are freed.
     wait_until("channel removed", Duration::from_secs(10), || env.server.stats().channels == 0 && c.shared.channel_count() == 0, || format!("{:?}", env.server.stats())).await;
 }
@@ -125,7 +126,7 @@ async fn stalled_lanes_do_not_block_others() {
     let out = tokio::time::timeout(Duration::from_secs(30), echo_roundtrip(fwd, data.clone()))
         .await
         .unwrap_or_else(|_| panic!("8 MiB echo did not complete beside {n} stalled lanes: {:?}", env.server.stats()));
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     let cap = env.limits.lane_buffer as u64;
     let st = env.server.stats();
     assert!(st.recv_ring_bytes <= n * cap, "{st:?}");
@@ -184,11 +185,12 @@ async fn stalled_sinks_never_overflow_and_stay_in_budget() {
 async fn limit_reached_then_sink_drains_no_deadlock() {
     let env = env_with(Limits { idle_timeout: Duration::from_secs(10), ..fast_limits() });
     let c = env.client().await;
-    let (stalled, mut accepted) = stalled_server(false).await;
+    let (stalled, mut accepted) = stalled_server(true).await;
     let fwd = forward(&c, stalled).await;
-    // Larger than every kernel buffer on the path, so the lane does reach
-    // its limit while the sink is stalled.
-    let data = Arc::new(pattern(48 << 20, 3));
+    // The sink's 4 KiB receive buffer makes the lane reach its limit with
+    // little data; it is enlarged before draining (a 4 KiB window drains at
+    // ~40 KB/s on loopback, measured).
+    let data = Arc::new(pattern(4 << 20, 3));
     let mut s = TcpStream::connect(fwd).await.unwrap();
     let d = data.clone();
     let writer = tokio::spawn(async move {
@@ -222,12 +224,13 @@ async fn limit_reached_then_sink_drains_no_deadlock() {
     } else {
         None
     };
+    socket2::SockRef::from(&sink).set_recv_buffer_size(4 << 20).unwrap();
     let mut got = Vec::new();
     sink.read_to_end(&mut got).await.unwrap();
     if let Some(m) = mon {
         m.abort();
     }
-    assert_eq!(sha(&got), sha(&data));
+    assert_same(&got, &data);
     let _ = writer.await.unwrap();
 }
 
@@ -257,7 +260,7 @@ async fn budget_exhaustion_does_not_starve_floor() {
     let fwd2 = forward(&other, echo).await;
     let data = Arc::new(pattern(1 << 20, 4));
     let out = echo_roundtrip(fwd2, data.clone()).await;
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     let st = env.server.stats();
     assert_eq!(st.recv_budget_used, 0, "{st:?}");
     for w in writers {
@@ -387,7 +390,7 @@ async fn over_credit_peer_is_cut_while_others_work() {
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
     let data = Arc::new(pattern(256 << 10, 21));
-    assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
+    assert_same(&echo_roundtrip(fwd, data.clone()).await, &data);
 }
 
 fn host_check_with(env: &Env, files: Vec<std::path::PathBuf>, mode: ssh3_keys::verifier::StrictHostKeyChecking) -> ssh3_core::client::HostCheck {

@@ -26,10 +26,10 @@ async fn resume_mid_transfer_from_new_address() {
     let (c, bh) = client_bh(&env).await;
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(32 << 20, 5));
+    let data = Arc::new(pattern(8 << 20, 5));
     let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
     let sent = || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed);
-    wait_until("8 MiB through before the outage", Duration::from_secs(20), || sent() > 8 << 20, || format!("{:?}", env.server.stats())).await;
+    wait_until("2 MiB through before the outage", Duration::from_secs(20), || sent() > 2 << 20, || format!("{:?}", env.server.stats())).await;
     bh.set_down(true);
     c.carrier_lost().await;
     wait_until("server detached", Duration::from_secs(10), || env.server.stats().detached == 1, || format!("{:?}", env.server.stats())).await;
@@ -39,7 +39,7 @@ async fn resume_mid_transfer_from_new_address() {
     assert_eq!(epoch, 2);
     let out = rt.await.unwrap();
     assert_eq!(out.len(), data.len());
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     let st = env.server.stats();
     assert_eq!((st.resumes_accepted, st.attached, st.detached), (1, 1, 0), "{st:?}");
     let sess = env.server.session(&c.session_id()).unwrap();
@@ -225,7 +225,7 @@ async fn malformed_resume_does_not_detach_the_session() {
     let echo = echo_server().await;
     let fwd = forward(&client, echo).await;
     let data = Arc::new(pattern(64 << 10, 9));
-    assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
+    assert_same(&echo_roundtrip(fwd, data.clone()).await, &data);
 }
 
 /// Verdict (a): competing snapshots. While a real client is mid-transfer, a
@@ -239,7 +239,7 @@ async fn competing_snapshot_is_fenced_and_loses_no_data() {
     let (c, bh) = client_bh(&env).await;
     let echo = echo_server().await;
     let fwd = forward(&c, echo).await;
-    let data = Arc::new(pattern(8 << 20, 31));
+    let data = Arc::new(pattern(4 << 20, 31));
     let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
     wait_until("transfer under way", Duration::from_secs(20), || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed) > 1 << 20, || format!("{:?}", env.server.stats())).await;
     let sid = c.session_id();
@@ -268,7 +268,7 @@ async fn competing_snapshot_is_fenced_and_loses_no_data() {
     assert!(rival.open_bi().await.is_err());
     let out = rt.await.unwrap();
     assert_eq!(out.len(), data.len());
-    assert_eq!(sha(&out), sha(&data));
+    assert_same(&out, &data);
     assert_eq!(env.server.session(&sid).unwrap().epoch(), epoch);
 }
 
