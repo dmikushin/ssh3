@@ -111,10 +111,13 @@ pub enum Message {
     ListenFail { req_id: u64, reason: FailReason },
     /// Stop a listener (as bound).
     ListenCancel { host: String, port: u16 },
+    /// Liveness probe on the control stream (connection-scoped, SPEC §5.1).
+    Ping { n: u64 },
+    Pong { n: u64 },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 17;
+pub const MESSAGE_TYPES: u32 = 19;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

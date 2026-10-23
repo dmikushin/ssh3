@@ -37,6 +37,15 @@ pub struct Limits {
     // §5 sessions
     pub ack_interval: Duration,
     pub linger: Duration,
+    // §5.1 client roaming
+    /// Liveness probe period while attached; None disables probing.
+    pub probe_interval: Option<Duration>,
+    /// A probe is lost if unanswered within max(3·RTT, this).
+    pub probe_timeout_min: Duration,
+    /// Resume automatically after a carrier death.
+    pub auto_resume: bool,
+    pub resume_backoff_initial: Duration,
+    pub resume_backoff_max: Duration,
     pub max_sessions: usize,
     /// SO_RCVBUF / SO_SNDBUF on dialed and accepted TCP sockets (SPEC §5
     /// memory bound).
@@ -66,6 +75,11 @@ impl Default for Limits {
             event_queue: 1024,
             ack_interval: Duration::from_secs(1),
             linger: Duration::from_secs(12 * 3600),
+            probe_interval: Some(Duration::from_secs(1)),
+            probe_timeout_min: Duration::from_secs(1),
+            auto_resume: true,
+            resume_backoff_initial: Duration::from_millis(200),
+            resume_backoff_max: Duration::from_secs(10),
             max_sessions: 1024,
             tcp_socket_buffer: 64 * 1024,
         }

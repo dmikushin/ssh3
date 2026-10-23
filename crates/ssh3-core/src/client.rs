@@ -2,7 +2,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use quinn::{AsyncUdpSocket, Connection, Endpoint, RecvStream, SendStream, TokioRuntime};
 use tokio::net::TcpListener;
@@ -42,6 +44,14 @@ impl HostCheck {
     }
 }
 
+/// Makes a fresh UDP socket for a rebind or a resume.
+pub type SocketFactory = Arc<dyn Fn() -> std::io::Result<Arc<dyn AsyncUdpSocket>> + Send + Sync>;
+
+/// Dual-stack `[::]:0` sockets (SPEC §5.1).
+pub fn dual_stack_factory() -> SocketFactory {
+    Arc::new(|| udp_socket(transport::dual_stack_socket(transport::unspecified_dual()).map_err(std::io::Error::other)?).map_err(std::io::Error::other))
+}
+
 #[derive(Clone)]
 pub struct ClientOptions {
     pub server_addr: SocketAddr,
@@ -49,19 +59,42 @@ pub struct ClientOptions {
     pub signer: Arc<dyn Signer>,
     pub user: String,
     pub limits: Limits,
+    /// Sockets for rebinds and automatic resumes.
+    pub sockets: SocketFactory,
 }
 
-pub struct ClientSession {
-    pub shared: Arc<SessionShared>,
+/// Roaming counters (SPEC §8 I6).
+#[derive(Default, Debug)]
+pub struct RoamStats {
+    pub probes_lost: AtomicU64,
+    pub rebinds: AtomicU64,
+    pub resume_attempts: AtomicU64,
+    pub resumes: AtomicU64,
+    /// Set when automatic resume gave up (session refused or linger over).
+    pub gave_up: AtomicBool,
+}
+
+struct ClientInner {
+    shared: Arc<SessionShared>,
     opts: ClientOptions,
     endpoint: Mutex<Option<Endpoint>>,
     /// The verified host key of the first connect: the session's target
     /// identity. A resume must present the same key.
     host_key: PublicKey,
+    /// The server's SessionLinger: automatic resume stops after it.
+    linger: Duration,
+    roam: RoamStats,
+}
+
+pub struct ClientSession {
+    pub shared: Arc<SessionShared>,
+    inner: Arc<ClientInner>,
+    roamer: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for ClientSession {
     fn drop(&mut self) {
+        self.roamer.abort();
         self.shared.teardown();
     }
 }
@@ -147,7 +180,16 @@ impl ClientSession {
             shared.install_carrier(conn, send, recv, |_| None);
             shared.reopen_lanes().await?;
         }
-        Ok(Self { shared, opts, endpoint: Mutex::new(Some(ep)), host_key })
+        let inner = Arc::new(ClientInner {
+            shared: shared.clone(),
+            opts,
+            endpoint: Mutex::new(Some(ep)),
+            host_key,
+            linger: Duration::from_secs(info.linger_secs),
+            roam: RoamStats::default(),
+        });
+        let roamer = tokio::spawn(roam(Arc::downgrade(&inner)));
+        Ok(Self { shared, inner, roamer })
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -158,42 +200,19 @@ impl ClientSession {
         self.shared.carrier_lost().await
     }
 
+    pub fn roam_stats(&self) -> &RoamStats {
+        &self.inner.roam
+    }
+
     /// Reattach the session over a new connection from `socket` (any local
     /// address or family). SPEC §5 "Resume".
     pub async fn resume(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<u64> {
-        let _g = self.shared.attach_lock.lock().await;
-        self.shared.detach(close::SUPERSEDED, b"client resuming");
-        let ours = self.shared.snapshot_lanes();
-        let Dialed { ep, conn, mut send, mut recv, host_key, .. } = connect_and_auth(&self.opts, socket, Intent::Resume).await?;
-        if !ssh3_keys::spki::same_key(&host_key, &self.host_key) {
-            conn.close(close::SHUTDOWN.into(), b"host key changed");
-            return Err(Error::HostKey(format!(
-                "resume reached a server with key {} but the session belongs to {}",
-                host_key.fingerprint(ssh_key::HashAlg::Sha256),
-                self.host_key.fingerprint(ssh_key::HashAlg::Sha256)
-            )));
-        }
-        frame::write_message(&mut send, &Message::Resume { session_id: self.shared.id, lanes: ours }).await?;
-        let (theirs, epoch) = match frame::read_message(&mut recv, MAX_FRAME).await.map_err(|e| explain(&conn, e))? {
-            Some(Message::Resumed { lanes, epoch }) => (lanes, epoch),
-            Some(Message::Fail { reason }) => {
-                conn.close(close::SHUTDOWN.into(), b"resume refused");
-                return Err(Error::Refused(reason));
-            }
-            Some(m) => return Err(Error::Protocol(format!("expected Resumed, got {m:?}"))),
-            None => return Err(Error::Protocol("server closed the control stream during resume".into())),
-        };
-        self.shared.reconcile(&theirs)?;
-        self.shared.install_carrier(conn, send, recv, |_| None);
-        let old = self.endpoint.lock().unwrap().replace(ep);
-        drop(old);
-        self.shared.reopen_lanes().await?;
-        Ok(epoch)
+        self.inner.resume(socket).await
     }
 
     /// The server's verified host key (the session's target identity).
     pub fn host_key(&self) -> &PublicKey {
-        &self.host_key
+        &self.inner.host_key
     }
 
     pub fn budgets(&self) -> &Budgets {
@@ -226,5 +245,136 @@ impl ClientSession {
                 });
             }
         })
+    }
+}
+
+impl ClientInner {
+    async fn resume(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<u64> {
+        let _g = self.shared.attach_lock.lock().await;
+        self.shared.detach(close::SUPERSEDED, b"client resuming");
+        let ours = self.shared.snapshot_lanes();
+        let Dialed { ep, conn, mut send, mut recv, host_key, .. } = connect_and_auth(&self.opts, socket, Intent::Resume).await?;
+        if !ssh3_keys::spki::same_key(&host_key, &self.host_key) {
+            conn.close(close::SHUTDOWN.into(), b"host key changed");
+            return Err(Error::HostKey(format!(
+                "resume reached a server with key {} but the session belongs to {}",
+                host_key.fingerprint(ssh_key::HashAlg::Sha256),
+                self.host_key.fingerprint(ssh_key::HashAlg::Sha256)
+            )));
+        }
+        frame::write_message(&mut send, &Message::Resume { session_id: self.shared.id, lanes: ours }).await?;
+        let (theirs, epoch) = match frame::read_message(&mut recv, MAX_FRAME).await.map_err(|e| explain(&conn, e))? {
+            Some(Message::Resumed { lanes, epoch }) => (lanes, epoch),
+            Some(Message::Fail { reason }) => {
+                conn.close(close::SHUTDOWN.into(), b"resume refused");
+                return Err(Error::Refused(reason));
+            }
+            Some(m) => return Err(Error::Protocol(format!("expected Resumed, got {m:?}"))),
+            None => return Err(Error::Protocol("server closed the control stream during resume".into())),
+        };
+        self.shared.reconcile(&theirs)?;
+        self.shared.install_carrier(conn, send, recv, |_| None);
+        let old = self.endpoint.lock().unwrap().replace(ep);
+        drop(old);
+        self.shared.reopen_lanes().await?;
+        self.roam.resumes.fetch_add(1, Ordering::Relaxed);
+        Ok(epoch)
+    }
+
+    /// One liveness probe: Ping, then wait for its Pong for
+    /// max(3·RTT, probe_timeout_min). False = lost.
+    async fn probe(&self, n: u64) -> bool {
+        let deadline = (self.shared.rtt().unwrap_or_default() * 3).max(self.shared.limits.probe_timeout_min);
+        let mut rx = self.shared.last_pong.subscribe();
+        if !self.shared.send_ctrl(Message::Ping { n }) {
+            return true; // detached or congested: not a path verdict
+        }
+        tokio::time::timeout(deadline, rx.wait_for(|v| *v >= n)).await.is_ok()
+    }
+
+    /// Move the carrier to a fresh socket (QUIC migration, SPEC §5.1).
+    fn rebind(&self) -> std::io::Result<()> {
+        let sock = (self.opts.sockets)()?;
+        match self.endpoint.lock().unwrap().as_ref() {
+            Some(ep) => ep.rebind_abstract(sock),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Client roaming (SPEC §5.1): probe the path while attached and rebind when
+/// a probe is lost; after a carrier death, resume with exponential backoff
+/// until the server's linger has passed or it refuses the session.
+async fn roam(inner: std::sync::Weak<ClientInner>) {
+    let mut n = 0u64;
+    loop {
+        let Some(c) = inner.upgrade() else { return };
+        let l = c.shared.limits.clone();
+        if c.shared.is_attached() {
+            let Some(period) = l.probe_interval else {
+                drop(c);
+                // No probing: just wait for a carrier death.
+                let Some(c) = inner.upgrade() else { return };
+                let shared = c.shared.clone();
+                drop(c);
+                shared.carrier_lost().await;
+                continue;
+            };
+            drop(c);
+            tokio::time::sleep(period).await;
+            let Some(c) = inner.upgrade() else { return };
+            n += 1;
+            if !c.probe(n).await && c.shared.is_attached() {
+                c.roam.probes_lost.fetch_add(1, Ordering::Relaxed);
+                match c.rebind() {
+                    Ok(()) => {
+                        c.roam.rebinds.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(session = %crate::session::hex(&c.shared.id), "liveness probe lost; rebound to a fresh socket");
+                    }
+                    Err(e) => tracing::warn!("liveness probe lost; rebind failed: {e}"),
+                }
+            }
+            continue;
+        }
+        if !l.auto_resume {
+            let shared = c.shared.clone();
+            drop(c);
+            // Manual resume only: wait until someone attaches again.
+            let mut rx = shared.carrier_state_rx();
+            let _ = rx.wait_for(|g| *g != 0).await;
+            continue;
+        }
+        // Detached: resume with backoff until linger has passed.
+        let lost_at = Instant::now();
+        let mut wait = l.resume_backoff_initial;
+        loop {
+            if lost_at.elapsed() > c.linger {
+                c.roam.gave_up.store(true, Ordering::Relaxed);
+                tracing::warn!("session not resumed within the server's linger {:?}; giving up", c.linger);
+                c.shared.teardown();
+                return;
+            }
+            c.roam.resume_attempts.fetch_add(1, Ordering::Relaxed);
+            let r = match (c.opts.sockets)() {
+                Ok(sock) => c.resume(sock).await,
+                Err(e) => Err(Error::Io(e)),
+            };
+            match r {
+                Ok(epoch) => {
+                    tracing::info!(session = %crate::session::hex(&c.shared.id), epoch, "session resumed automatically");
+                    break;
+                }
+                Err(Error::Refused(reason)) => {
+                    // The server will never take this session back.
+                    c.roam.gave_up.store(true, Ordering::Relaxed);
+                    tracing::warn!("resume refused ({reason}); giving up");
+                    c.shared.teardown();
+                    return;
+                }
+                Err(e) => tracing::debug!("resume attempt failed: {e}; retrying in {wait:?}"),
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(l.resume_backoff_max);
+        }
     }
 }

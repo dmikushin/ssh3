@@ -51,6 +51,10 @@ pub fn fast_limits() -> Limits {
         ack_interval: Duration::from_millis(50),
         login_grace: Duration::from_secs(5),
         linger: Duration::from_secs(30),
+        // Roaming off by default: outage tests need a deterministic carrier
+        // death and resume by hand; roaming tests opt in.
+        probe_interval: None,
+        auto_resume: false,
         ..Limits::default()
     }
 }
@@ -131,7 +135,14 @@ impl Env {
         std::fs::write(&self.authorized_keys, t).unwrap();
     }
     pub fn opts(&self, key: &Arc<TestKey>) -> ClientOptions {
-        ClientOptions { server_addr: self.server_addr(), host: self.host_check(), signer: key.clone(), user: "tester".into(), limits: self.limits.clone() }
+        ClientOptions {
+            server_addr: self.server_addr(),
+            host: self.host_check(),
+            signer: key.clone(),
+            user: "tester".into(),
+            limits: self.limits.clone(),
+            sockets: ssh3_core::client::dual_stack_factory(),
+        }
     }
     pub async fn client(&self) -> ClientSession {
         ClientSession::connect(self.opts(&self.key), udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap())

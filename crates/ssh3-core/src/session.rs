@@ -138,6 +138,8 @@ pub struct SessionShared {
     pub(crate) attach_lock: tokio::sync::Mutex<()>,
     /// Current carrier epoch, 0 while detached.
     carrier_state: watch::Sender<u64>,
+    /// Highest Pong received (client liveness probe).
+    pub(crate) last_pong: watch::Sender<u64>,
     registry: Option<Weak<Registry>>,
 }
 
@@ -176,6 +178,7 @@ impl SessionShared {
             epoch: AtomicU64::new(0),
             attach_lock: tokio::sync::Mutex::new(()),
             carrier_state: watch::channel(0).0,
+            last_pong: watch::channel(0).0,
             registry,
             limits,
         });
@@ -262,6 +265,10 @@ impl SessionShared {
         self.epoch.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn carrier_state_rx(&self) -> watch::Receiver<u64> {
+        self.carrier_state.subscribe()
+    }
+
     /// Resolves when no carrier is attached.
     pub async fn carrier_lost(&self) {
         let mut rx = self.carrier_state.subscribe();
@@ -270,6 +277,17 @@ impl SessionShared {
 
     fn channel(&self, id: u64) -> Option<Arc<Channel>> {
         self.channels.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Send a connection-scoped message on the current carrier's control
+    /// stream; false if detached or the queue is full.
+    pub(crate) fn send_ctrl(&self, m: Message) -> bool {
+        self.carrier.lock().unwrap().as_ref().is_some_and(|c| c._ctrl.try_send(m).is_ok())
+    }
+
+    /// Smoothed RTT of the current carrier.
+    pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
+        self.carrier.lock().unwrap().as_ref().map(|c| c.conn.rtt())
     }
 
     fn conn(&self) -> Option<(Connection, u64)> {
@@ -662,6 +680,22 @@ impl SessionShared {
     /// Control stream after authentication: only LaneAck.
     fn dispatch_control(&self, m: Message) -> Result<()> {
         match m {
+            Message::Ping { n } => {
+                // Best effort: a full queue means the path is congested
+                // anyway, and the prober will try again.
+                let _ = self.send_ctrl(Message::Pong { n });
+                Ok(())
+            }
+            Message::Pong { n } => {
+                self.last_pong.send_if_modified(|v| {
+                    let up = n > *v;
+                    if up {
+                        *v = n;
+                    }
+                    up
+                });
+                Ok(())
+            }
             Message::LaneAck { chan_id, lane, accepted, limit } => {
                 // A channel closed locally may still receive in-flight acks.
                 if let Some(ch) = self.channel(chan_id) {
