@@ -210,8 +210,26 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     the peer's received offset. Unacked bytes are guaranteed to be in the send
     ring (a sender never discards unacked data). A received offset outside
     `[acked, sent]` is a protocol error.
-- A newer attach supersedes an older carrier of the same session (old one is
-  closed).
+- **Reliable session events.** Byte offsets alone do not survive a carrier
+  death: channel open/ok/fail/close, lane FIN (half-close) and reset,
+  exit-status/exit-signal, `-R` accept notifications and window-change
+  would be lost if sent on the dead control stream. Therefore every
+  session-level control message after auth is carried in the **session
+  event log**: a reliable, offset-tracked sequence with the same send-ring /
+  ack / resend rules as a lane (it is lane 0 of a reserved `chan_id` 0).
+  `Resume` carries its received offset; unacked events are replayed in
+  order. Lane FIN is an event `LaneFin{chan_id, lane, final_offset}`, so a
+  half-close is never confused with a carrier death. Connection-scoped
+  messages (Auth, Resume/Resumed, LaneAck) stay on the plain control stream.
+- **Attach is serialized per session.** Each attach increments the session's
+  `attach_epoch` under a per-session lock; `Resumed` carries the epoch;
+  messages and lane streams from a carrier with an older epoch are rejected.
+  The newer attach closes the older carrier. Two simultaneous resumes cannot
+  both succeed.
+- **Detached `-R` listeners.** While detached, each `-R` listener accepts at
+  most `DetachedAcceptMax` (default 8) pending connections, each with a
+  bounded lane; further connections are refused (closed immediately) and
+  counted.
 - **Memory bound.** Per lane direction: send ring + receive ring
   (2 × `LaneBuffer`) in userspace, plus kernel buffers of the local endpoint,
   which the server caps explicitly (`SO_RCVBUF`/`SO_SNDBUF` on accepted and
@@ -222,9 +240,12 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - Datagram channels are not replayed (lossy by contract).
 
 ### 5.1 Short outages: QUIC migration
-- Client binds a fresh socket and `Endpoint::rebind`s on: OS network change
-  (netlink where available), or a liveness probe failure (no ack for a PING
-  within `max(3·RTT, 1 s)`). E2 measured: rebind recovers in 3–6 ms;
+- Client binds a fresh socket and `Endpoint::rebind`s on: a liveness probe
+  failure (no ack for a PING within `max(3·RTT, 1 s)`) — the **primary**
+  trigger, because netlink only sees the process's network namespace and is
+  blind inside containers (the deployed client runs in the `autossh-ssh3`
+  container, where a host Wi-Fi change changes no container interface); and
+  OS network change via netlink as an accelerator where it is visible. E2 measured: rebind recovers in 3–6 ms;
   without rebind 1–3 s (PTO backoff).
 - Server follows passively (E2: NAT rebinding detected, 2.4 ms).
 - **All client sockets are dual-stack `[::]:0` with `IPV6_V6ONLY=0`**, both
@@ -249,8 +270,16 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - `forwarded-udp` (reverse UDP): per-source flow table, bounded count + idle
   expiry + LRU; one channel per flow (Go bug class 4: per-source state
   growth to 1.4 GB).
+- The same caps (count + idle expiry + LRU) apply to every UDP association:
+  `direct-udp` forwards and SOCKS5 UDP ASSOCIATE, not only reverse flows.
+- Reassembly memory is bounded **in aggregate**: a server-wide reassembly
+  byte budget (default 4 MiB) across all flows and sessions; a fragment that
+  would exceed it evicts the oldest group, counted.
 - A slow datagram consumer never blocks the connection reader: datagrams to
   a full channel queue are dropped and counted.
+- Verification of every cap is by internal counters before and after
+  eviction/cancellation (live entries, bytes held), not by RSS — RSS and
+  thread counts proved inadequate evidence in the Go OOM investigation.
 
 ## 7. Jump and NAT traversal (O3)
 
@@ -296,16 +325,35 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
     address) — anything else on the socket is demultiplexed to the carrier
     endpoint or to the punch handler (fixed bit, E3c).
 
+- **One route owner.** A single per-endpoint `PathManager` owns, and is the
+  only writer of: socket rebind (§5.1), the selected direct pair, carrier
+  replacement (resume of the gateway connection) and relay fallback. Every
+  change bumps a `path_epoch`; probe/punch completions carrying an older
+  epoch are discarded. *(Go ssh3: the direct-path wrapper and
+  AddPath/Switch were independent; Switch installed a new transport while
+  the wrapper still referenced the old socket.)* Required tests: rebind
+  during an upgrade; carrier replacement during fallback.
+
 ### 7.3 Direct path upgrade
 1. Over the authenticated inner connection the peers exchange candidates
-   (host addresses, server-reflexive addresses from the gateway).
+   (server-reflexive addresses from the gateway, host addresses of the
+   **sending socket's own namespace**). Addresses of container bridges and
+   other non-routable ranges are not offered as host candidates.
 2. Both send punch packets (fixed bit 0, random nonce, HMAC keyed from the
    inner connection's exporter) to every candidate pair from the socket that
    carries their gateway connection, so the NAT mapping already observed by
    the gateway is reused. The socket demultiplexes by fixed bit (E3c).
-3. First validated punch response in each direction selects the pair; the
-   path socket switches inner packets to the direct pair; the inner QUIC
-   connection treats it as path migration.
+3. **Nomination.** The controlling peer (lower (key, address) tuple, as
+   for simultaneous dial) nominates one validated pair with
+   `Nominate{generation, pair}` over the inner connection; the other peer
+   answers `NominateAck{generation}` only if it has itself validated that
+   pair; both switch on ack. A newer generation supersedes older ones.
+   Punch and response packets carry `HMAC(exporter-derived key,
+   session id || both peer key fingerprints || pair || role || generation ||
+   nonce)`, so replayed or cross-session responses are rejected.
+   The path socket then switches inner packets to the pair.
+   Because the virtual address hides the change from quinn, quinn will not
+   reset PMTU or congestion state by itself (open item X8).
 4. Relay stays as fallback; on direct-path loss the path socket falls back to
    relay without breaking the inner connection.
 - Simultaneous inner dial (both peers initiating) resolves deterministically:
@@ -344,7 +392,14 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - X1 resolved (§5.1). X2 resolved (§1, BBR + budgeted windows). X5 resolved
   (§1 stateless reset; default config ignores stray short-header packets).
 - X3 Residual ~300 MB RSS after drain with jemalloc/mimalloc: source unknown.
-- X4 Hole punching on real NATs (oracle gateway, gambetta, corentin).
+- X4 Hole punching on real NATs (oracle gateway, gambetta, corentin). The
+  only historical success was corentin→gambetta over global IPv6 in the
+  same /64 with a relay on gambetta — not evidence for NAT traversal. NAT
+  mapping/filtering types and oracle IPv6 are unmeasured.
+- X8 Path switch under a virtual peer address: how to make quinn re-probe
+  PMTU and reset congestion state (large-PMTU relay → smaller direct path,
+  and direct → relay fallback); test asymmetric loss/delay and replayed
+  responses.
 - X6 resolved (§1 accounting rule). `set_send_window` not yet measured.
 - X7 X2 relay had no bottleneck queue and i.i.d. loss; re-measure on real
   paths (oracle ↔ gambetta).
