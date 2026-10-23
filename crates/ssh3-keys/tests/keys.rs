@@ -14,7 +14,7 @@ use ssh3_keys::host::HostIdentity;
 use ssh3_keys::known_hosts::{self, KnownHosts};
 use ssh3_keys::signer::{AgentClient, AgentSigner, FileSigner, Signer, read_public_key, resolve_identity};
 use ssh3_keys::spki::public_key_from_cert;
-use ssh3_keys::verifier::{KnownHostsVerifier, StrictHostKeyChecking};
+use ssh3_keys::verifier::{KnownHostsVerifier, StrictHostKeyChecking, VerifiedHostKey};
 use ssh3_keys::{Error, PublicKey};
 
 const ALGS: &[(&str, &[&str])] = &[
@@ -58,9 +58,9 @@ fn kh_line(host: &str, key: &PublicKey) -> String {
     format!("{host} {}\n", k.to_openssh().unwrap())
 }
 
-/// Run a TLS 1.3 handshake fully in memory; Ok on success, the first error
-/// otherwise.
-fn handshake(server_id: &HostIdentity, verifier: Arc<KnownHostsVerifier>) -> Result<(), String> {
+/// Run a TLS 1.3 handshake fully in memory and, like a real caller, commit
+/// the verifier only once the handshake is complete.
+fn handshake(server_id: &HostIdentity, verifier: Arc<KnownHostsVerifier>) -> Result<VerifiedHostKey, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let scfg = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -72,13 +72,17 @@ fn handshake(server_id: &HostIdentity, verifier: Arc<KnownHostsVerifier>) -> Res
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
+        .with_custom_certificate_verifier(verifier.clone())
         .with_no_client_auth();
     let mut c = ClientConnection::new(Arc::new(ccfg), ServerName::try_from("ssh3-target").unwrap()).unwrap();
     let mut s = ServerConnection::new(Arc::new(scfg)).unwrap();
+    drive(&mut c, &mut s, &verifier)
+}
+
+fn drive(c: &mut ClientConnection, s: &mut ServerConnection, verifier: &KnownHostsVerifier) -> Result<VerifiedHostKey, String> {
     for _ in 0..20 {
         if !c.is_handshaking() && !s.is_handshaking() {
-            return Ok(());
+            return verifier.commit();
         }
         let mut buf = Vec::new();
         while c.wants_write() {
@@ -124,8 +128,8 @@ fn tls_handshake_accepts_known_key_and_rejects_others() {
         let kh = d.path().join(format!("kh_ok_{name}"));
         std::fs::write(&kh, kh_line("target.example", &pub_of(&host))).unwrap();
         let v = Arc::new(KnownHostsVerifier::new("target.example", 22, vec![kh], StrictHostKeyChecking::Yes));
-        handshake(&id, v.clone()).unwrap_or_else(|e| panic!("{name}: known key refused: {e}"));
-        assert_eq!(v.verified_key().unwrap().key_data(), pub_of(&host).key_data());
+        let vk = handshake(&id, v.clone()).unwrap_or_else(|e| panic!("{name}: known key refused: {e}"));
+        assert_eq!(vk.key().key_data(), pub_of(&host).key_data());
 
         // Different key of the same type at line 2 → mismatch naming file:line.
         let kh = d.path().join(format!("kh_bad_{name}"));
@@ -433,4 +437,75 @@ fn authorized_keys_unsupported_only_line_is_refused_with_reason() {
     let ak = AuthorizedKeys::load(&f).unwrap();
     let err = ak.authorize(&a, "127.0.0.1".parse().unwrap()).unwrap_err();
     assert!(err.contains("cert-authority,principals") && err.contains(&format!("{}:1", f.display())), "{err}");
+}
+
+#[derive(Debug)]
+struct MismatchedResolver(Arc<rustls::sign::CertifiedKey>);
+impl rustls::server::ResolvesServerCert for MismatchedResolver {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
+/// Regression (architecture review P1): a server presenting a copied
+/// certificate (key A) but signing with another key (B) must not get A
+/// pinned in known_hosts, and the verifier must not hand out A as verified.
+#[test]
+fn failed_proof_of_possession_must_not_poison_known_hosts() {
+    let d = scratch();
+    let a = HostIdentity::load(&keygen(d.path(), "cert_key", &["-t", "ed25519"], "")).unwrap();
+    let b = HostIdentity::load(&keygen(d.path(), "signing_key", &["-t", "ed25519"], "")).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let wrong = rustls::crypto::ring::sign::any_supported_type(&b.private_key_der()).unwrap();
+    let ck = rustls::sign::CertifiedKey::new(vec![a.cert_der().clone()], wrong);
+    let scfg = ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(MismatchedResolver(Arc::new(ck))));
+    let kh = d.path().join("kh_poison");
+    let v = Arc::new(KnownHostsVerifier::new("poison.example", 443, vec![kh.clone()], StrictHostKeyChecking::AcceptNew));
+    let ccfg = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(v.clone())
+        .with_no_client_auth();
+    let mut c = ClientConnection::new(Arc::new(ccfg), ServerName::try_from("poison.example").unwrap()).unwrap();
+    let mut s = ServerConnection::new(Arc::new(scfg)).unwrap();
+    let mut failure = None;
+    for _ in 0..20 {
+        let mut buf = Vec::new();
+        while c.wants_write() {
+            c.write_tls(&mut buf).unwrap();
+        }
+        if !buf.is_empty() {
+            s.read_tls(&mut buf.as_slice()).unwrap();
+            s.process_new_packets().unwrap();
+        }
+        let mut buf = Vec::new();
+        while s.wants_write() {
+            s.write_tls(&mut buf).unwrap();
+        }
+        if !buf.is_empty() {
+            c.read_tls(&mut buf.as_slice()).unwrap();
+            if let Err(e) = c.process_new_packets() {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(failure.is_some(), "mismatched proof accepted");
+    assert!(!kh.exists(), "KnownHostsVerifier persisted unproven key after failed TLS signature");
+    // A caller that commits anyway (ignoring the TLS error) gets nothing.
+    let err = v.commit().expect_err("unproven key committed");
+    assert!(err.contains("did not prove possession"), "{err}");
+    assert!(!kh.exists());
+}
+
+#[test]
+fn commit_without_handshake_is_refused() {
+    let d = scratch();
+    let v = KnownHostsVerifier::new("x.example", 22, vec![d.path().join("kh")], StrictHostKeyChecking::No);
+    assert!(v.commit().unwrap_err().contains("no host key pending"));
 }
