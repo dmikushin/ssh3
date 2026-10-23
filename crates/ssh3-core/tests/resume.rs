@@ -182,3 +182,48 @@ async fn resume_after_linger_is_refused() {
     }
     assert_eq!(env.server.stats().resumes_rejected, 1);
 }
+
+/// Reviewer P1: a key shared by two accounts is legitimate, so a session is
+/// bound to the user AND the exact key; another user with the same key must
+/// not attach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_must_bind_user_as_well_as_key() {
+    let env = env_with(limits());
+    let client = env.client().await;
+    let sid = client.session_id();
+    assert_eq!(env.server.session(&sid).unwrap().user, "tester");
+    let conn = raw_conn(&env).await;
+    let (mut send, mut recv, first) = raw_auth_as(&conn, &env.key, "other-user", Intent::Resume).await;
+    assert!(matches!(first, Message::AuthOk { .. }), "{first:?}");
+    frame::write_message(&mut send, &Message::Resume { session_id: sid, lanes: vec![] }).await.unwrap();
+    let resumed = frame::read_message(&mut recv, 65536).await.unwrap();
+    assert!(matches!(resumed, Some(Message::Fail { .. })), "server attached a different user's session: {resumed:?}");
+    assert!(client.shared.is_attached());
+    assert_eq!(env.server.stats().resumes_accepted, 0);
+}
+
+/// A malformed Resume is rejected before the session is touched: the valid
+/// carrier stays attached and keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_resume_does_not_detach_the_session() {
+    let env = env_with(limits());
+    let client = env.client().await;
+    let sid = client.session_id();
+    let conn = raw_conn(&env).await;
+    let (mut send, _recv, first) = raw_auth(&conn, &env.key, Intent::Resume).await;
+    assert!(matches!(first, Message::AuthOk { .. }), "{first:?}");
+    let bogus = ssh3_core::msg::LanePos { chan_id: 0, lane: 9, accepted: 0, limit: 0 };
+    frame::write_message(&mut send, &Message::Resume { session_id: sid, lanes: vec![bogus] }).await.unwrap();
+    let reason = conn.closed().await;
+    match reason {
+        quinn::ConnectionError::ApplicationClosed(c) => assert_eq!(c.error_code.into_inner(), close::PROTOCOL as u64, "{c:?}"),
+        other => panic!("expected a protocol close, got {other:?}"),
+    }
+    assert!(client.shared.is_attached(), "valid carrier was detached by a malformed Resume");
+    let st = env.server.stats();
+    assert_eq!((st.attached, st.resumes_accepted), (1, 0), "{st:?}");
+    let echo = echo_server().await;
+    let fwd = forward(&client, echo).await;
+    let data = Arc::new(pattern(64 << 10, 9));
+    assert_eq!(sha(&echo_roundtrip(fwd, data.clone()).await), sha(&data));
+}

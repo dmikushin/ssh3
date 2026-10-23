@@ -382,12 +382,16 @@ impl Lane {
         if st.closed {
             return Ok(());
         }
-        if accepted < st.sbase || accepted > st.sent_hi.max(st.sbase) {
+        if accepted > st.sent_hi.max(st.sbase) {
             return Err(Error::Protocol(format!(
-                "lane {}/{}: accepted {accepted} outside [{}, {}]",
-                self.chan_id, self.lane, st.sbase, st.sent_hi
+                "lane {}/{}: peer accepted {accepted} bytes but only {} were ever sent",
+                self.chan_id, self.lane, st.sent_hi
             )));
         }
+        // `accepted < sbase` is a stale ack, not a violation: a ChannelDone
+        // event (event-lane stream) may overtake an earlier LaneAck (control
+        // stream) — QUIC orders bytes within a stream, never across streams.
+        let accepted = accepted.max(st.sbase);
         if limit < st.peer_limit {
             return Err(Error::Protocol(format!(
                 "lane {}/{}: limit went down from {} to {limit}",
@@ -440,9 +444,10 @@ impl Lane {
         LanePos { chan_id: self.chan_id, lane: self.lane, accepted: st.received, limit: st.limit }
     }
 
-    /// Apply the peer's position after a resume.
-    pub(crate) fn on_resume(&self, p: &LanePos) -> Result<()> {
-        let mut st = self.st.lock().unwrap();
+    /// Would the peer's position be acceptable? No mutation (resume is
+    /// validated as a whole before the session is touched).
+    pub(crate) fn check_resume(&self, p: &LanePos) -> Result<()> {
+        let st = self.st.lock().unwrap();
         let send_end = st.sbase + st.sbuf.len() as u64;
         if p.accepted < st.sbase || p.accepted > send_end {
             return Err(Error::Protocol(format!(
@@ -456,6 +461,13 @@ impl Lane {
                 self.chan_id, self.lane, p.limit, st.peer_limit
             )));
         }
+        Ok(())
+    }
+
+    /// Apply the peer's position after a resume.
+    pub(crate) fn on_resume(&self, p: &LanePos) -> Result<()> {
+        self.check_resume(p)?;
+        let mut st = self.st.lock().unwrap();
         self.release_accepted(&mut st, p.accepted);
         st.peer_limit = p.limit;
         st.send_from = p.accepted;
@@ -465,12 +477,12 @@ impl Lane {
         Ok(())
     }
 
-    /// The peer no longer has this channel although it was attached before:
-    /// it completed it (then it holds all our bytes) or aborted it (then its
-    /// ChannelClose event is being replayed and will drop ours).
-    pub(crate) fn peer_forgot(&self) {
+    /// The peer completed this channel (ChannelDone event): it has accepted
+    /// every byte we sent, so our send side is complete even if its final
+    /// ack was lost with a carrier.
+    pub(crate) fn peer_done(&self) {
         let mut st = self.st.lock().unwrap();
-        if !(st.ever_attached && st.s_eof) {
+        if st.closed || !st.s_eof {
             return;
         }
         let end = st.sbase + st.sbuf.len() as u64;

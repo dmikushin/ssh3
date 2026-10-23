@@ -95,10 +95,14 @@ pub enum Message {
     /// End of one lane direction at `final_offset` (half-close), as an event
     /// so it is never confused with a carrier death (SPEC §5).
     LaneFin { chan_id: u64, lane: u8, final_offset: u64 },
+    /// The sender completed the channel (every lane direction finished and
+    /// delivered): it holds all bytes the receiver sent. Lets the receiver
+    /// finish a channel whose final ack died with a carrier.
+    ChannelDone { chan_id: u64 },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 12;
+pub const MESSAGE_TYPES: u32 = 13;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

@@ -208,16 +208,20 @@ pub async fn raw_conn(env: &Env) -> quinn::Connection {
     ep.connect(ssh3_core::transport::to_v6(env.server_addr()), "ssh3-test").unwrap().await.unwrap()
 }
 
-/// Authenticate a raw connection with `key` and `intent`.
+/// Authenticate a raw connection as "tester" with `key` and `intent`.
 pub async fn raw_auth(conn: &quinn::Connection, key: &Arc<TestKey>, intent: ssh3_core::msg::Intent) -> (quinn::SendStream, quinn::RecvStream, ssh3_core::msg::Message) {
+    raw_auth_as(conn, key, "tester", intent).await
+}
+
+pub async fn raw_auth_as(conn: &quinn::Connection, key: &Arc<TestKey>, user: &str, intent: ssh3_core::msg::Intent) -> (quinn::SendStream, quinn::RecvStream, ssh3_core::msg::Message) {
     use ssh3_core::{auth, frame, msg::Message};
     let (mut s, mut r) = conn.open_bi().await.unwrap();
     let mut exp = [0u8; 32];
     conn.export_keying_material(&mut exp, auth::EXPORTER_LABEL, b"").unwrap();
     let pubkey = Signer::public_key_blob(&**key);
-    let blob = auth::auth_blob(&exp, "tester", &pubkey, intent);
+    let blob = auth::auth_blob(&exp, user, &pubkey, intent);
     let sig = Signer::sign(&**key, &blob).unwrap();
-    frame::write_message(&mut s, &Message::Auth { user: "tester".into(), pubkey, sig, intent }).await.unwrap();
+    frame::write_message(&mut s, &Message::Auth { user: user.into(), pubkey, sig, intent }).await.unwrap();
     let m = frame::read_message(&mut r, 65536).await.unwrap().unwrap();
     (s, r, m)
 }

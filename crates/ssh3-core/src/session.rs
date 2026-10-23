@@ -93,7 +93,8 @@ pub struct SessionShared {
     pub user: String,
     /// The exact key that created the session (SPEC §5: resume requires it).
     pub owner_key: Vec<u8>,
-    pub authz: Arc<Authz>,
+    /// Re-evaluated at every attach; each value is immutable.
+    authz: Mutex<Arc<Authz>>,
     pub limits: Limits,
     pub stats: Arc<Stats>,
     pub budgets: Arc<Budgets>,
@@ -129,7 +130,7 @@ impl SessionShared {
             role,
             user,
             owner_key,
-            authz: Arc::new(authz),
+            authz: Mutex::new(Arc::new(authz)),
             stats: Arc::new(Stats::default()),
             budgets,
             acks: Arc::new(AckQueue::default()),
@@ -146,6 +147,14 @@ impl SessionShared {
         });
         s.start_event_log(events_rx);
         s
+    }
+
+    pub fn authz(&self) -> Arc<Authz> {
+        self.authz.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_authz(&self, a: Authz) {
+        *self.authz.lock().unwrap() = Arc::new(a);
     }
 
     fn lane_env(&self) -> LaneEnv {
@@ -290,6 +299,7 @@ impl SessionShared {
             }
             if let Some(s) = me.upgrade() {
                 drop(s.drop_channel(chan_id));
+                let _ = s.send_event(Message::ChannelDone { chan_id }).await;
             }
         });
         map.insert(chan_id, ch.clone());
@@ -411,7 +421,7 @@ impl SessionShared {
             return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
         }
         let ChannelKind::DirectTcp { host, port } = kind;
-        if !self.authz.allows_direct_tcp(&host, port) {
+        if !self.authz().allows_direct_tcp(&host, port) {
             return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
         }
         let ch = match self.new_channel(chan_id, 1) {
@@ -469,6 +479,14 @@ impl SessionShared {
             Message::ChannelClose { chan_id, reason } => {
                 tracing::debug!(chan = chan_id, "peer closed channel: {reason}");
                 drop(self.drop_channel(chan_id));
+                Ok(())
+            }
+            Message::ChannelDone { chan_id } => {
+                if let Some(ch) = self.channel(chan_id) {
+                    for l in &ch.lanes {
+                        l.peer_done();
+                    }
+                }
                 Ok(())
             }
             Message::LaneFin { chan_id, lane, final_offset } => {
@@ -687,26 +705,33 @@ impl SessionShared {
         chans.iter().flat_map(|ch| ch.lanes.iter().map(|l| l.fence())).collect()
     }
 
-    /// Apply the peer's positions. Lanes it lists that we know are rewound
-    /// to its accepted offset; channels it does not list were completed or
-    /// aborted by it (an abort's ChannelClose is in the replayed event log).
-    pub(crate) fn reconcile(&self, peer: &[LanePos]) -> Result<()> {
+    /// Check a peer's resume positions without touching anything: the whole
+    /// Resume is validated before the current carrier is detached.
+    pub(crate) fn validate_resume(&self, peer: &[LanePos]) -> Result<()> {
         if peer.len() > (self.limits.max_channels + 1) * 4 {
             return Err(Error::Protocol(format!("resume lists {} lanes, more than possible", peer.len())));
         }
-        let chans: Vec<_> = self.channels.lock().unwrap().values().cloned().collect();
-        let listed: std::collections::HashSet<u64> = peer.iter().map(|p| p.chan_id).collect();
-        for ch in &chans {
-            if !listed.contains(&ch.chan_id) {
-                for l in &ch.lanes {
-                    l.peer_forgot();
-                }
-            }
-        }
         for p in peer {
             if let Some(ch) = self.channel(p.chan_id) {
-                let l = ch.lanes.get(p.lane as usize).ok_or_else(|| Error::Protocol(format!("resume names lane {} of channel {}", p.lane, p.chan_id)))?;
-                l.on_resume(p)?;
+                let l = ch.lanes.get(p.lane as usize).ok_or_else(|| {
+                    Error::Protocol(format!("resume names lane {} of channel {}, which has {}", p.lane, p.chan_id, ch.lanes.len()))
+                })?;
+                l.check_resume(p)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the peer's positions. Only lanes the peer lists are rewound; a
+    /// snapshot never releases bytes of a lane it does not mention, so a
+    /// stale or competing snapshot cannot discard data. Channels the peer
+    /// completed are finished by its ChannelDone event, channels it aborted
+    /// by its ChannelClose event — both replayed in the event log.
+    pub(crate) fn reconcile(&self, peer: &[LanePos]) -> Result<()> {
+        self.validate_resume(peer)?;
+        for p in peer {
+            if let Some(ch) = self.channel(p.chan_id) {
+                ch.lanes[p.lane as usize].on_resume(p)?;
             }
         }
         Ok(())

@@ -277,9 +277,12 @@ async fn chunks_and_permits_return_to_zero() {
         tasks.push(tokio::spawn(echo_roundtrip(fwd, Arc::new(pattern(2 << 20, 10 + i)))));
     }
     for t in tasks {
-        t.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), t)
+            .await
+            .unwrap_or_else(|_| panic!("echo stuck: server {:?}; client channels {}", env.server.stats(), c.shared.channel_count()))
+            .unwrap();
     }
-    wait_until("channels removed", Duration::from_secs(10), || env.server.stats().channels == 0, || format!("{:?}", env.server.stats())).await;
+    wait_until("channels removed", Duration::from_secs(10), || env.server.stats().channels == 0 && c.shared.channel_count() == 0, || format!("server {:?}; client channels {}", env.server.stats(), c.shared.channel_count())).await;
     drop(c);
     wait_until("session expired", Duration::from_secs(10), || env.server.stats().sessions == 0, || format!("{:?}", env.server.stats())).await;
     let st = env.server.stats();
@@ -312,5 +315,28 @@ async fn authz_permitopen_is_enforced() {
     match c.open_direct_tcp(s, "127.0.0.1", echo.port()).await {
         Err(Error::Refused(ssh3_core::msg::FailReason::Prohibited)) => {}
         other => panic!("expected Prohibited, got {other:?}"),
+    }
+}
+
+/// QA A6: with MaxAuthTries = N the client receives N AuthFail replies —
+/// the last one is delivered before the server closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_auth_refusal_is_delivered_before_close() {
+    for n in [1u32, 3] {
+        let env = env_with(Limits { max_auth_tries: n, ..fast_limits() });
+        let conn = raw_conn(&env).await;
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let mut got = 0;
+        for _ in 0..n {
+            let bad = Message::Auth { user: "tester".into(), pubkey: ssh3_core::auth::Signer::public_key_blob(&*env.key), sig: vec![0; 64], intent: Intent::New };
+            ssh3_core::frame::write_message(&mut s, &bad).await.unwrap();
+            match ssh3_core::frame::read_message(&mut r, 65536).await {
+                Ok(Some(Message::AuthFail { .. })) => got += 1,
+                other => panic!("MaxAuthTries={n}: refusal {} not received: {other:?}", got + 1),
+            }
+        }
+        assert_eq!(got, n);
+        let (code, _) = app_close(&conn.closed().await);
+        assert_eq!(code, close::AUTH_FAILED as u64, "MaxAuthTries={n}");
     }
 }

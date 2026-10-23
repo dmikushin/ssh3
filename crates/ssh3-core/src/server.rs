@@ -158,7 +158,7 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<ServerShared>) {
 
 enum Authed {
     New { user: String, key: Vec<u8>, authz: Authz },
-    Resume { key: Vec<u8>, session_id: SessionId, lanes: Vec<LanePos> },
+    Resume { user: String, key: Vec<u8>, authz: Authz, session_id: SessionId, lanes: Vec<LanePos> },
 }
 
 async fn handle(incoming: Incoming, shared: Arc<ServerShared>, permit: OwnedSemaphorePermit) -> Result<()> {
@@ -209,27 +209,38 @@ async fn handle(incoming: Incoming, shared: Arc<ServerShared>, permit: OwnedSema
             session.install_carrier(conn, send, recv, |_| Some(Message::AuthOk { session: Some(info) }));
             Ok(())
         }
-        Authed::Resume { key, session_id, lanes } => {
+        Authed::Resume { user, key, authz, session_id, lanes } => {
             let session = shared.registry.lock().unwrap().get(&session_id).cloned();
             let Some(session) = session else {
                 shared.counters.resumes_rejected.fetch_add(1, Ordering::Relaxed);
                 return refuse(&conn, send, FailReason::Protocol("unknown or expired session".into()), shared.limits.login_grace).await;
             };
-            if session.owner_key != key {
-                // SPEC §5: only the exact key that created the session.
+            if session.owner_key != key || session.user != user {
+                // SPEC §5: a session belongs to the user AND the exact key
+                // that created it (one key may serve several accounts).
                 shared.counters.resumes_rejected.fetch_add(1, Ordering::Relaxed);
                 return refuse(&conn, send, FailReason::Prohibited, shared.limits.login_grace).await;
             }
             // SPEC §5: attach is serialized per session; the newer attach
-            // closes the older carrier.
+            // closes the older carrier. The whole Resume is validated first,
+            // so a malformed one cannot detach a working carrier.
             let _g = session.attach_lock.lock().await;
+            if let Err(e) = session.validate_resume(&lanes) {
+                shared.counters.resumes_rejected.fetch_add(1, Ordering::Relaxed);
+                shared.counters.protocol_closes.fetch_add(1, Ordering::Relaxed);
+                conn.close(close::PROTOCOL.into(), e.to_string().as_bytes());
+                return Err(e);
+            }
             session.detach(close::SUPERSEDED, b"superseded by resume");
+            // Re-checked after detach: acks of the old carrier may have moved
+            // the send side between validation and detach.
             if let Err(e) = session.reconcile(&lanes) {
                 shared.counters.resumes_rejected.fetch_add(1, Ordering::Relaxed);
                 shared.counters.protocol_closes.fetch_add(1, Ordering::Relaxed);
                 conn.close(close::PROTOCOL.into(), e.to_string().as_bytes());
                 return Err(e);
             }
+            session.set_authz(authz);
             let ours = session.snapshot_lanes();
             let n = ours.len();
             let epoch = session.install_carrier(conn, send, recv, move |epoch| Some(Message::Resumed { lanes: ours, epoch }));
@@ -245,8 +256,7 @@ async fn handle(incoming: Incoming, shared: Arc<ServerShared>, permit: OwnedSema
 /// up the stream) — bounded by LoginGraceTime — before closing.
 async fn refuse(conn: &Connection, mut send: SendStream, reason: FailReason, grace: std::time::Duration) -> Result<()> {
     let _ = frame::write_message(&mut send, &Message::Fail { reason: reason.clone() }).await;
-    let _ = send.finish();
-    let _ = tokio::time::timeout(grace, send.stopped()).await;
+    deliver(&mut send, grace).await;
     conn.close(close::AUTH_FAILED.into(), reason.to_string().as_bytes());
     Err(Error::Refused(reason))
 }
@@ -293,7 +303,7 @@ async fn auth_phase(conn: &Connection, shared: &ServerShared, send: &mut SendStr
                         let Message::Resume { session_id, lanes } = m else {
                             return Err(Error::Protocol(format!("expected Resume, got {m:?}")));
                         };
-                        Ok(Authed::Resume { key: pubkey, session_id, lanes })
+                        Ok(Authed::Resume { user, key: pubkey, authz, session_id, lanes })
                     }
                 };
             }
@@ -304,5 +314,18 @@ async fn auth_phase(conn: &Connection, shared: &ServerShared, send: &mut SendStr
             }
         }
     }
+    // The last AuthFail must reach the client before handle() closes.
+    deliver(send, shared.limits.login_grace).await;
     Err(Error::Auth(format!("{} failed attempts", shared.limits.max_auth_tries)))
+}
+
+/// Every path that sends a final reply and then closes goes through here:
+/// a QUIC close discards stream data not yet delivered, so finish the stream
+/// and wait until the peer has acknowledged all of it (or stopped it), at
+/// most `grace`.
+async fn deliver(send: &mut SendStream, grace: std::time::Duration) {
+    let t = std::time::Instant::now();
+    let f = send.finish();
+    let r = tokio::time::timeout(grace, send.stopped()).await;
+    tracing::debug!("deliver: finish={f:?} stopped={r:?} after {:?}", t.elapsed());
 }
