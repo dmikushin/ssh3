@@ -180,6 +180,8 @@ pub struct SessionShared {
     carrier_state: watch::Sender<u64>,
     /// Highest Pong received (client liveness probe).
     pub(crate) last_pong: watch::Sender<u64>,
+    /// When the peer was last heard on the control stream (acks, pongs).
+    last_contact: Mutex<std::time::Instant>,
     registry: Option<Weak<Registry>>,
 }
 
@@ -228,6 +230,7 @@ impl SessionShared {
             attach_lock: tokio::sync::Mutex::new(()),
             carrier_state: watch::channel(0).0,
             last_pong: watch::channel(0).0,
+            last_contact: Mutex::new(std::time::Instant::now()),
             registry,
             limits,
         });
@@ -868,7 +871,13 @@ impl SessionShared {
     }
 
     /// Control stream after authentication: only LaneAck.
+    /// When the peer was last heard on the control stream.
+    pub fn last_contact(&self) -> std::time::Instant {
+        *self.last_contact.lock().unwrap()
+    }
+
     fn dispatch_control(&self, m: Message) -> Result<()> {
+        *self.last_contact.lock().unwrap() = std::time::Instant::now();
         match m {
             Message::Ping { n } => {
                 // Best effort: a full queue means the path is congested

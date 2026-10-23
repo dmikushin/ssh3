@@ -409,10 +409,9 @@ async fn host_key_mismatch_aborts_before_auth() {
     let mut opts = env.opts(&env.key);
     opts.host = host_check_with(&env, vec![wrong.clone()], StrictHostKeyChecking::Yes);
     match ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await {
-        Err(e) => {
-            let m = e.to_string();
-            assert!(m.contains("HOST KEY MISMATCH") && m.contains(&format!("{}:1", wrong.display())), "{m}");
-        }
+        // R1: a distinct error, so the client can say "Host key verification failed."
+        Err(Error::HostKey(m)) => assert!(m.contains("HOST KEY MISMATCH") && m.contains(&format!("{}:1", wrong.display())), "{m}"),
+        Err(e) => panic!("expected Error::HostKey, got {e:?}"),
         Ok(_) => panic!("connected despite a host key mismatch"),
     }
     let st = env.server.stats();

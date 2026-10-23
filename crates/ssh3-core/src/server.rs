@@ -65,11 +65,20 @@ pub struct ServerStats {
     pub detached: usize,
     /// Channels other than the event log.
     pub channels: u64,
+    /// OCCUPANCY: payload bytes currently held in send / receive rings
+    /// (all lanes, all sessions). Always ≤ the chunk storage below.
     pub send_ring_bytes: u64,
     pub recv_ring_bytes: u64,
+    /// Σ (limit − delivered): receive credit granted and not yet consumed.
     pub credit_outstanding: u64,
-    /// Bytes of chunk storage charged to LaneCreditBudget / LaneSendBudget /
-    /// the floor pool (allocations, not occupancy).
+    /// ALLOCATION: 16 KiB chunks charged to LaneCreditBudget (receive rings
+    /// plus reservations backing granted credit) and to LaneSendBudget —
+    /// EXCLUDING floor chunks, which are charged to the separate, unlimited
+    /// floor pool reported in `floor_chunks_bytes` (≤ 2 receive + 1 send
+    /// chunk per lane). Budget beyond the floor is therefore read directly
+    /// from these two fields; total chunk storage is their sum plus
+    /// `floor_chunks_bytes`. Chunks stay charged until fully drained, so
+    /// allocation ≥ occupancy.
     pub recv_budget_used: u64,
     pub send_budget_used: u64,
     pub floor_chunks_bytes: u64,
@@ -127,6 +136,14 @@ impl Server {
             s.teardown();
         }
         self.endpoint.close(close::SHUTDOWN.into(), b"server shutting down");
+    }
+
+    /// shutdown(), then wait (at most `bound`) until every connection's
+    /// CONNECTION_CLOSE has been sent, so clients learn the reason (board
+    /// request R2). False if `bound` elapsed first.
+    pub async fn shutdown_and_wait(&self, bound: std::time::Duration) -> bool {
+        self.shutdown();
+        tokio::time::timeout(bound, self.endpoint.wait_idle()).await.is_ok()
     }
 
     pub fn local_addr(&self) -> SocketAddr {

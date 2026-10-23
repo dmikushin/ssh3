@@ -52,6 +52,45 @@ pub fn dual_stack_factory() -> SocketFactory {
     Arc::new(|| udp_socket(transport::dual_stack_socket(transport::unspecified_dual()).map_err(std::io::Error::other)?).map_err(std::io::Error::other))
 }
 
+/// Delegates to the known_hosts verifier and remembers why it rejected the
+/// server's key: a rejection inside the handshake otherwise surfaces only as
+/// a generic connection error, and the caller must be able to say "Host key
+/// verification failed" (board request R1).
+#[derive(Debug)]
+struct RecordingVerifier {
+    inner: Arc<KnownHostsVerifier>,
+    rejected: Mutex<Option<String>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let r = self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp, now);
+        if let Err(e) = &r {
+            *self.rejected.lock().unwrap() = Some(match e {
+                rustls::Error::General(m) => m.clone(),
+                other => other.to_string(),
+            });
+        }
+        r
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(m, c, d)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(m, c, d)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientOptions {
     pub server_addr: SocketAddr,
@@ -84,6 +123,8 @@ struct ClientInner {
     /// The server's SessionLinger: automatic resume stops after it.
     linger: Duration,
     roam: RoamStats,
+    /// true once automatic resume gave up.
+    gave_up: tokio::sync::watch::Sender<bool>,
 }
 
 pub struct ClientSession {
@@ -125,10 +166,21 @@ struct Dialed {
 
 async fn connect_and_auth(opts: &ClientOptions, socket: Arc<dyn AsyncUdpSocket>, intent: Intent) -> Result<Dialed> {
     let verifier = opts.host.verifier();
-    let cc = transport::client_config(transport::client_tls(verifier.clone())?, &opts.limits)?;
+    let recording = Arc::new(RecordingVerifier { inner: verifier.clone(), rejected: Mutex::new(None) });
+    let cc = transport::client_config(transport::client_tls(recording.clone())?, &opts.limits)?;
     let mut ep = Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, socket, Arc::new(TokioRuntime))?;
     ep.set_default_client_config(cc);
-    let conn = ep.connect(transport::to_v6(opts.server_addr), "ssh3-rs")?.await?;
+    let conn = match ep.connect(transport::to_v6(opts.server_addr), "ssh3-rs")?.await {
+        Ok(c) => c,
+        Err(e) => {
+            // A handshake that failed because known_hosts refused the key is
+            // a host-key failure, not a network one.
+            if let Some(why) = recording.rejected.lock().unwrap().take() {
+                return Err(Error::HostKey(why));
+            }
+            return Err(e.into());
+        }
+    };
     // The handshake is confirmed (proof of possession done): only now may
     // the host key be committed — and before we sign anything for this host.
     let host_key = match verifier.commit() {
@@ -189,6 +241,7 @@ impl ClientSession {
             host_key,
             linger: Duration::from_secs(info.linger_secs),
             roam: RoamStats::default(),
+            gave_up: tokio::sync::watch::channel(false).0,
         });
         let roamer = tokio::spawn(roam(Arc::downgrade(&inner)));
         Ok(Self { shared, inner, roamer })
@@ -204,6 +257,18 @@ impl ClientSession {
 
     pub fn roam_stats(&self) -> &RoamStats {
         &self.inner.roam
+    }
+
+    /// When the server was last heard (acks, probe replies): drives a
+    /// "Last contact N s ago" indicator (board request R3).
+    pub fn last_contact(&self) -> Instant {
+        self.shared.last_contact()
+    }
+
+    /// Resolves once automatic resume has given up (the session is gone).
+    pub async fn gave_up(&self) {
+        let mut rx = self.inner.gave_up.subscribe();
+        let _ = rx.wait_for(|g| *g).await;
     }
 
     /// Reattach the session over a new connection from `socket` (any local
@@ -374,6 +439,7 @@ async fn roam(inner: std::sync::Weak<ClientInner>) {
         loop {
             if lost_at.elapsed() > c.linger {
                 c.roam.gave_up.store(true, Ordering::Relaxed);
+                c.gave_up.send_replace(true);
                 tracing::warn!("session not resumed within the server's linger {:?}; giving up", c.linger);
                 c.shared.teardown();
                 return;
@@ -391,6 +457,7 @@ async fn roam(inner: std::sync::Weak<ClientInner>) {
                 Err(Error::Refused(reason)) => {
                     // The server will never take this session back.
                     c.roam.gave_up.store(true, Ordering::Relaxed);
+                    c.gave_up.send_replace(true);
                     tracing::warn!("resume refused ({reason}); giving up");
                     c.shared.teardown();
                     return;

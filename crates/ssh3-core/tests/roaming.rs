@@ -90,9 +90,33 @@ async fn automatic_resume_gives_up_when_the_session_is_gone() {
     c.carrier_lost().await;
     wait_until("session expired on the server", Duration::from_secs(10), || env.server.stats().sessions == 0, || format!("{:?}", env.server.stats())).await;
     net.store(false, Ordering::SeqCst);
-    wait_until("client gave up", Duration::from_secs(10), || c.roam_stats().gave_up.load(Ordering::Relaxed), || format!("{:?}", c.roam_stats())).await;
+    // R3: an awaitable notification, no polling.
+    tokio::time::timeout(Duration::from_secs(10), c.gave_up()).await.expect("gave_up() did not resolve");
+    assert!(c.roam_stats().gave_up.load(Ordering::Relaxed));
     let n = c.roam_stats().resume_attempts.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(c.roam_stats().resume_attempts.load(Ordering::Relaxed), n, "kept retrying after giving up");
     assert!(!c.shared.is_attached());
+}
+
+/// R3: last contact advances while the server answers probes and stops
+/// while the path is dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_contact_tracks_the_server() {
+    let env = env_with(roaming(Limits { idle_timeout: Duration::from_secs(5), ..fast_limits() }));
+    let bh = Blackhole::new(dual_stack_socket("[::]:0".parse().unwrap()).unwrap());
+    let mut opts = env.opts(&env.key);
+    // Keep the dead socket dead: rebinds land on blackholed sockets too.
+    let net = Arc::new(AtomicBool::new(false));
+    opts.sockets = network_factory(net.clone());
+    let c = ClientSession::connect(opts, bh.clone()).await.unwrap();
+    let t0 = c.last_contact();
+    wait_until("contact advances", Duration::from_secs(5), || c.last_contact() > t0, || "no contact".into()).await;
+    bh.set_down(true);
+    net.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let frozen = c.last_contact();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(c.last_contact(), frozen, "contact advanced over a dead path");
+    assert!(frozen.elapsed() >= Duration::from_millis(400));
 }

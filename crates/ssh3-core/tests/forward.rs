@@ -47,7 +47,12 @@ async fn listeners_released_on_session_end_and_shutdown() {
     assert!(TcpStream::connect(("127.0.0.1", p1)).await.is_err(), "port {p1} still listening after the session ended");
     let c2 = env.client().await;
     let p2 = c2.forward_remote("127.0.0.1", 0, "127.0.0.1", 9).await.unwrap();
-    env.server.shutdown();
+    // R2: shutdown and wait until the closes are out; the client learns why.
+    assert!(env.server.shutdown_and_wait(Duration::from_secs(5)).await);
+    match tokio::time::timeout(Duration::from_secs(5), c2.carrier_lost()).await {
+        Ok(()) => {}
+        Err(_) => panic!("client not told about the shutdown"),
+    }
     assert!(TcpStream::connect(("127.0.0.1", p2)).await.is_err(), "port {p2} still listening after shutdown");
 }
 
