@@ -48,6 +48,9 @@ pub enum ChannelKind {
     ForwardedTcp { bind_host: String, bind_port: u16, origin_host: String, origin_port: u16 },
     /// Interactive or exec session (lane 0 stdin/stdout, lane 1 stderr).
     Session,
+    /// A connection to the session's forwarded agent socket (server opens;
+    /// the client bridges it to its local agent).
+    AuthAgent,
 }
 
 /// A request on a session channel (RFC 4254 §6, carried as events).
@@ -60,6 +63,8 @@ pub enum SessReq {
     Subsystem { name: String },
     WindowChange { cols: u32, rows: u32, xpixel: u32, ypixel: u32 },
     Signal { name: String },
+    /// Agent forwarding for the session (auth-agent-req@openssh.com).
+    AuthAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

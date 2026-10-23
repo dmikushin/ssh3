@@ -26,11 +26,11 @@ fn sh(script: &str) -> String {
 }
 
 fn exec(script: &str) -> SessionSpec {
-    SessionSpec { pty: None, env: vec![], command: Command::Exec(sh(script)) }
+    SessionSpec { pty: None, env: vec![], command: Command::Exec(sh(script)), forward_agent: None }
 }
 
 fn exec_pty(script: &str, rows: u32, cols: u32) -> SessionSpec {
-    SessionSpec { pty: Some(PtySpec { term: "xterm".into(), cols, rows, ..Default::default() }), env: vec![], command: Command::Exec(sh(script)) }
+    SessionSpec { pty: Some(PtySpec { term: "xterm".into(), cols, rows, ..Default::default() }), env: vec![], command: Command::Exec(sh(script)), forward_agent: None }
 }
 
 async fn read_all(r: &mut tokio::io::DuplexStream) -> String {
@@ -168,4 +168,69 @@ async fn pty_overflow_hook_is_invoked_when_the_lane_is_full() {
     // Never read: the client pipe, then its ring, then the credit fill up.
     let _ch = c.open_session(exec_pty("yes", 24, 80)).await.unwrap();
     wait_until("overflow hook invoked", LIMIT, || rec.full.load(Ordering::Relaxed) > 0, || format!("{:?}", env.server.stats())).await;
+}
+
+/// A real ssh-agent for the test, killed through its own child handle.
+struct Agent {
+    child: std::process::Child,
+    sock: std::path::PathBuf,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn agent_with_key(dir: &std::path::Path) -> Agent {
+    let sock = dir.join("agent.sock");
+    let child = std::process::Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let agent = Agent { child, sock };
+    wait_until("agent socket", LIMIT, || agent.sock.exists(), || "no socket".into()).await;
+    let key = dir.join("agent_key");
+    assert!(std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+    assert!(std::process::Command::new("ssh-add").arg("-q").arg(&key).env("SSH_AUTH_SOCK", &agent.sock).status().unwrap().success());
+    agent
+}
+
+/// Agent forwarding: through the session's forwarded socket, `ssh-add -l`
+/// lists exactly what the local agent holds. The remote command names the
+/// socket explicitly: a login shell's own config may reset SSH_AUTH_SOCK (the
+/// developer's fish config does), which sshd would not prevent either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_forwarding_reaches_the_local_agent() {
+    let env = env_with(Limits { linger: Duration::from_millis(100), idle_timeout: Duration::from_millis(300), ..fast_limits() });
+    let agent = agent_with_key(&env.dir).await;
+    let local = std::process::Command::new("ssh-add").arg("-l").env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+    let local = String::from_utf8(local.stdout).unwrap();
+    assert!(local.contains("ED25519") && local.lines().count() == 1, "{local}");
+    let c = client_as_me(&env).await;
+    // Enable forwarding with a first session, then use its socket.
+    let spec = SessionSpec { forward_agent: Some(agent.sock.clone()), ..exec("true") };
+    let mut first = c.open_session(spec).await.unwrap();
+    assert_eq!(exit_of(&mut first).await, ExitInfo::Status(0));
+    let fwd = env.server.session(&c.session_id()).unwrap().agent_socket().expect("forwarded agent socket");
+    let meta = std::fs::metadata(fwd.parent().unwrap()).unwrap();
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o700);
+    let mut ch = c.open_session(exec(&format!("SSH_AUTH_SOCK={} ssh-add -l", fwd.display()))).await.unwrap();
+    assert_eq!(read_all(&mut ch.stdout).await, local);
+    assert_eq!(exit_of(&mut ch).await, ExitInfo::Status(0));
+    // The socket and its directory live as long as the session.
+    drop(c);
+    wait_until("session expired", LIMIT, || env.server.stats().sessions == 0, || format!("{:?}", env.server.stats())).await;
+    assert!(!fwd.exists() && !fwd.parent().unwrap().exists(), "{} left behind", fwd.display());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_forwarding_refused_by_authorized_keys() {
+    let env = env_with(fast_limits());
+    env.authorize_only(&env.key, "no-agent-forwarding");
+    let agent = agent_with_key(&env.dir).await;
+    let c = client_as_me(&env).await;
+    let spec = SessionSpec { forward_agent: Some(agent.sock.clone()), ..exec("true") };
+    match c.open_session(spec).await {
+        Err(e) => assert!(e.to_string().contains("no-agent-forwarding"), "{e}"),
+        Ok(_) => panic!("agent forwarding was not refused"),
+    }
 }

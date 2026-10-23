@@ -99,6 +99,9 @@ pub(crate) enum Completion {
     /// Server session: the process exited and every output lane was
     /// delivered; stdin is abandoned (as sshd).
     AfterExit(Arc<crate::sesschan::ExitFlag>),
+    /// Client session: every lane finished AND the exit is known — the
+    /// output may end before the exit-status event arrives.
+    AllLanesAndExit(Arc<crate::sesschan::ExitFlag>),
 }
 
 impl Channel {
@@ -152,6 +155,10 @@ pub struct SessionShared {
     next_req: AtomicU64,
     pub refused_detached: AtomicU64,
     has_pty: AtomicBool,
+    /// Server: the forwarded agent socket (SPEC §5: owned by the session).
+    pub(crate) agent: Mutex<Option<crate::sesschan::AgentSocket>>,
+    /// Client: the local agent socket forwarded agent connections go to.
+    pub(crate) local_agent: Mutex<Option<std::path::PathBuf>>,
     /// Server: how session channels run processes.
     pub(crate) server_env: Option<Arc<crate::sesschan::ServerSessionEnv>>,
     /// Client: session requests awaiting SessionReply, by (chan, req).
@@ -200,6 +207,8 @@ impl SessionShared {
             next_req: AtomicU64::new(1),
             refused_detached: AtomicU64::new(0),
             has_pty: AtomicBool::new(false),
+            agent: Mutex::new(None),
+            local_agent: Mutex::new(None),
             server_env,
             session_replies: Mutex::new(HashMap::new()),
             events: events_tx,
@@ -326,8 +335,12 @@ impl SessionShared {
     }
 
     /// The session's forwarded-agent socket, if agent forwarding is on.
+    pub fn agent_socket(&self) -> Option<std::path::PathBuf> {
+        self.agent_socket_path()
+    }
+
     pub(crate) fn agent_socket_path(&self) -> Option<std::path::PathBuf> {
-        None
+        self.agent.lock().unwrap().as_ref().map(|a| a.path.clone())
     }
 
     /// A pty channel exists: the session lingers per `pty_linger`.
@@ -388,7 +401,7 @@ impl SessionShared {
         let me = Arc::downgrade(self);
         let lanes = ch.lanes.clone();
         ch.spawn(async move {
-            if let Completion::AfterExit(flag) = &completion {
+            if let Completion::AfterExit(flag) | Completion::AllLanesAndExit(flag) = &completion {
                 flag.wait().await;
             }
             for l in &lanes {
@@ -397,7 +410,7 @@ impl SessionShared {
                     tokio::pin!(fut);
                     fut.as_mut().enable();
                     let done = match &completion {
-                        Completion::AllLanes => l.is_complete(),
+                        Completion::AllLanes | Completion::AllLanesAndExit(_) => l.is_complete(),
                         Completion::AfterExit(_) => l.send_complete(),
                     };
                     if done {
@@ -568,6 +581,7 @@ impl SessionShared {
                 (host, port)
             }
             (Role::Server, ChannelKind::Session) => return self.accept_session(chan_id, peer_limit),
+            (Role::Client, ChannelKind::AuthAgent) => return self.accept_agent(chan_id, peer_limit),
             (Role::Client, ChannelKind::ForwardedTcp { bind_host, bind_port, .. }) => {
                 match self.remote_forwards.lock().unwrap().get(&(bind_host, bind_port)).cloned() {
                     Some(target) => target,
@@ -1066,6 +1080,7 @@ impl SessionShared {
         self.detach(close::SHUTDOWN, b"session closed");
         let listeners: Vec<_> = self.listeners.lock().unwrap().drain().collect();
         drop(listeners);
+        drop(self.agent.lock().unwrap().take());
         let lp: Vec<_> = self.listen_pending.lock().unwrap().drain().collect();
         drop(lp);
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();

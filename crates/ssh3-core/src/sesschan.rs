@@ -77,6 +77,7 @@ pub(crate) struct ServerSess {
 
 pub(crate) struct ClientSess {
     exit: watch::Sender<Option<ExitInfo>>,
+    exited: Arc<ExitFlag>,
 }
 
 pub(crate) enum ChanExt {
@@ -108,6 +109,40 @@ pub struct SessionSpec {
     pub pty: Option<PtySpec>,
     pub env: Vec<(String, String)>,
     pub command: Command,
+    /// Agent forwarding (`-A`): the local agent socket remote agent
+    /// connections are bridged to.
+    pub forward_agent: Option<std::path::PathBuf>,
+}
+
+/// Server side of agent forwarding: a Unix socket in a private 0700
+/// directory, owned by the session. Dropping it stops accepting and removes
+/// the socket and its directory.
+pub(crate) struct AgentSocket {
+    pub(crate) path: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AgentSocket {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// `mkdtemp` under $TMPDIR (default /tmp), like sshd's /tmp/ssh-XXXXXXXXXX.
+fn private_dir() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let base = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
+    let mut tmpl = std::path::PathBuf::from(base).join("ssh3-XXXXXXXXXX").as_os_str().as_bytes().to_vec();
+    tmpl.push(0);
+    let p = unsafe { libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if p.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    tmpl.pop();
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&tmpl)))
 }
 
 /// Client side of a session channel. The application reads `stdout` /
@@ -167,8 +202,9 @@ impl SessionShared {
     /// Open a session channel and start `spec` on the server.
     pub async fn open_session(self: &Arc<Self>, spec: SessionSpec) -> Result<SessionChannel> {
         let (tx, rx) = watch::channel(None);
-        let ext = ChanExt::Client(Arc::new(ClientSess { exit: tx }));
-        let ch = self.open_channel(ChannelKind::Session, 2, Completion::AllLanes, Some(ext)).await?;
+        let exited = Arc::new(ExitFlag::default());
+        let ext = ChanExt::Client(Arc::new(ClientSess { exit: tx, exited: exited.clone() }));
+        let ch = self.open_channel(ChannelKind::Session, 2, Completion::AllLanesAndExit(exited), Some(ext)).await?;
         let (stdin_app, stdin_lane) = tokio::io::duplex(PIPE);
         let (stdout_lane, stdout_app) = tokio::io::duplex(PIPE);
         let (stderr_lane, stderr_app) = tokio::io::duplex(PIPE);
@@ -185,6 +221,10 @@ impl SessionShared {
         if let Some(p) = spec.pty {
             self.session_request(chan_id, SessReq::Pty { term: p.term, cols: p.cols, rows: p.rows, xpixel: p.xpixel, ypixel: p.ypixel, modes: p.modes })
                 .await?;
+        }
+        if let Some(local) = spec.forward_agent {
+            *self.local_agent.lock().unwrap() = Some(local);
+            self.session_request(chan_id, SessReq::AuthAgent).await?;
         }
         for (name, value) in spec.env {
             // A refused variable is not an error (OpenSSH: want_reply 0).
@@ -226,6 +266,7 @@ impl SessionShared {
             && let Some(ChanExt::Client(c)) = &*ch.ext.lock().unwrap()
         {
             c.exit.send_replace(Some(info));
+            c.exited.set();
         }
     }
 
@@ -300,12 +341,99 @@ impl SessionShared {
                     },
                 }
             }
+            SessReq::AuthAgent => self.enable_agent().await,
             SessReq::Signal { name } => match &*sess.process.lock().await {
                 Some(p) => p.signal(&name).map_err(|e| e.to_string()),
                 None => Err("no process yet".into()),
             },
         };
         self.reply_ev(reply(result.err()))
+    }
+
+    /// auth-agent-req: create the session's agent socket (once).
+    async fn enable_agent(self: &Arc<Self>) -> std::result::Result<(), String> {
+        if !self.authz().allows_agent_forwarding() {
+            return Err("agent forwarding refused by authorized_keys (no-agent-forwarding/restrict)".into());
+        }
+        if self.agent.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let user = ssh3_session::UserRecord::lookup(&self.user).map_err(|e| e.to_string())?;
+        let dir = private_dir().map_err(|e| format!("agent socket directory: {e}"))?;
+        let path = dir.join(format!("agent.{}", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Running as root: the user must own the directory and socket.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&dir, Some(user.uid), Some(user.gid)).map_err(|e| e.to_string())?;
+            std::os::unix::fs::chown(&path, Some(user.uid), Some(user.gid)).map_err(|e| e.to_string())?;
+        }
+        let me = Arc::downgrade(self);
+        let max = self.limits.detached_accept_max as u64;
+        let waiting = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Some(s) = me.upgrade() else { return };
+                if !s.is_attached() && waiting.load(Ordering::Acquire) >= max {
+                    s.refused_detached.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                waiting.fetch_add(1, Ordering::AcqRel);
+                let waiting = waiting.clone();
+                tokio::spawn(async move {
+                    let r = async {
+                        let ch = s.open_channel(ChannelKind::AuthAgent, 1, Completion::AllLanes, None).await?;
+                        let (r, w) = stream.into_split();
+                        s.start_io(&ch, 0, r, w);
+                        Ok::<_, Error>(())
+                    }
+                    .await;
+                    waiting.fetch_sub(1, Ordering::AcqRel);
+                    if let Err(e) = r {
+                        tracing::debug!("agent connection not forwarded: {e}");
+                    }
+                });
+            }
+        });
+        *self.agent.lock().unwrap() = Some(AgentSocket { path, dir, task });
+        Ok(())
+    }
+
+    /// Client: the server opened an agent channel; bridge it to the local
+    /// agent.
+    pub(crate) fn accept_agent(self: &Arc<Self>, chan_id: u64, peer_limit: u64) -> Result<()> {
+        let Some(local) = self.local_agent.lock().unwrap().clone() else {
+            return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
+        };
+        let ch = match self.new_channel(chan_id, 1, Completion::AllLanes) {
+            Ok(ch) => ch,
+            Err(FailReason::Protocol(m)) => return Err(Error::Protocol(m)),
+            Err(reason) => return self.reply_ev(Message::ChannelFail { chan_id, reason }),
+        };
+        ch.lanes[0].set_peer_limit(peer_limit);
+        let me = Arc::downgrade(self);
+        let ch2 = ch.clone();
+        ch.spawn(async move {
+            let Some(s) = me.upgrade() else { return };
+            match tokio::net::UnixStream::connect(&local).await {
+                Ok(stream) => {
+                    let (r, w) = stream.into_split();
+                    s.start_io(&ch2, 0, r, w);
+                    let limit = ch2.lanes[0].initial_limit();
+                    let _ = s.send_event(Message::ChannelOk { chan_id, limit }).await;
+                    if let Err(e) = s.open_lane(&ch2.lanes[0]).await {
+                        tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
+                    }
+                }
+                Err(e) => {
+                    drop(ch2);
+                    drop(s.drop_channel(chan_id));
+                    let reason = FailReason::ConnectFailed(format!("{}: {e}", local.display()));
+                    let _ = s.send_event(Message::ChannelFail { chan_id, reason }).await;
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn start_process(self: &Arc<Self>, ch: &Arc<crate::session::Channel>, sess: &Arc<ServerSess>, kind: ssh3_session::Kind) -> std::result::Result<(), String> {

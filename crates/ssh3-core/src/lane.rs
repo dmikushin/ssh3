@@ -104,6 +104,12 @@ impl Readable for tokio::net::tcp::OwnedReadHalf {
     }
 }
 
+impl Readable for tokio::net::unix::OwnedReadHalf {
+    async fn readable(&self) -> std::io::Result<()> {
+        tokio::net::unix::OwnedReadHalf::readable(self).await
+    }
+}
+
 /// In-memory pipes and boxed process streams cannot report readiness
 /// without a read: treated as ready (one floor chunk per such lane).
 impl Readable for tokio::io::DuplexStream {
