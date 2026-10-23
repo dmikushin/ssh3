@@ -95,7 +95,9 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
 pub struct ClientOptions {
     pub server_addr: SocketAddr,
     pub host: HostCheck,
-    pub signer: Arc<dyn Signer>,
+    /// Keys offered in order on one connection until one is accepted or the
+    /// server stops (MaxAuthTries), as OpenSSH (board R4).
+    pub signers: Vec<Arc<dyn Signer>>,
     pub user: String,
     pub limits: Limits,
     /// Sockets for rebinds and automatic resumes.
@@ -120,6 +122,9 @@ struct ClientInner {
     /// The verified host key of the first connect: the session's target
     /// identity. A resume must present the same key.
     host_key: PublicKey,
+    /// The key that created the session: resumes authenticate with it only
+    /// (the session belongs to that exact key, SPEC §5).
+    auth_signer: Arc<dyn Signer>,
     /// The server's SessionLinger: automatic resume stops after it.
     linger: Duration,
     roam: RoamStats,
@@ -162,9 +167,14 @@ struct Dialed {
     recv: RecvStream,
     info: Option<crate::msg::SessionInfo>,
     host_key: PublicKey,
+    /// The key the server accepted.
+    signer: Arc<dyn Signer>,
 }
 
-async fn connect_and_auth(opts: &ClientOptions, socket: Arc<dyn AsyncUdpSocket>, intent: Intent) -> Result<Dialed> {
+async fn connect_and_auth(opts: &ClientOptions, signers: &[Arc<dyn Signer>], socket: Arc<dyn AsyncUdpSocket>, intent: Intent) -> Result<Dialed> {
+    if signers.is_empty() {
+        return Err(Error::Auth("no identities to offer".into()));
+    }
     let verifier = opts.host.verifier();
     let recording = Arc::new(RecordingVerifier { inner: verifier.clone(), rejected: Mutex::new(None) });
     let cc = transport::client_config(transport::client_tls(recording.clone())?, &opts.limits)?;
@@ -194,35 +204,47 @@ async fn connect_and_auth(opts: &ClientOptions, socket: Arc<dyn AsyncUdpSocket>,
     let mut exporter = [0u8; EXPORTER_LEN];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|_| Error::Tls("TLS exporter unavailable".into()))?;
-    let pubkey = pubkey_blob(opts.signer.public_key()).map_err(|e| Error::Auth(e.to_string()))?;
-    // Agent signing is blocking socket I/O.
-    let (signer, user) = (opts.signer.clone(), opts.user.clone());
-    let sig = tokio::task::spawn_blocking(move || sign_auth(&*signer, &exporter, &user, keys_intent(intent)))
-        .await
-        .map_err(|e| Error::Auth(format!("signing task failed: {e}")))?
-        .map_err(|e| Error::Auth(e.to_string()))?;
-    frame::write_message(&mut send, &Message::Auth { user: opts.user.clone(), pubkey, sig, intent }).await?;
-    match frame::read_message(&mut recv, MAX_FRAME).await.map_err(|e| explain(&conn, e))? {
-        Some(Message::AuthOk { session: info }) => Ok(Dialed { ep, conn, send, recv, info, host_key }),
-        Some(Message::AuthFail { reason }) => {
-            conn.close(close::SHUTDOWN.into(), b"authentication refused");
-            Err(Error::Auth(reason))
+    let mut refusals = Vec::new();
+    for signer in signers {
+        let pubkey = pubkey_blob(signer.public_key()).map_err(|e| Error::Auth(e.to_string()))?;
+        // Agent signing is blocking socket I/O.
+        let (s, user) = (signer.clone(), opts.user.clone());
+        let sig = match tokio::task::spawn_blocking(move || sign_auth(&*s, &exporter, &user, keys_intent(intent))).await {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(e)) => {
+                // This key cannot sign (agent refused, ...): try the next.
+                refusals.push(format!("{}: {e}", signer.public_key().fingerprint(ssh_key::HashAlg::Sha256)));
+                continue;
+            }
+            Err(e) => return Err(Error::Auth(format!("signing task failed: {e}"))),
+        };
+        // A failed write (like a failed read below) means the server stopped
+        // taking attempts after its last AuthFail (MaxAuthTries).
+        if frame::write_message(&mut send, &Message::Auth { user: opts.user.clone(), pubkey, sig, intent }).await.is_err() {
+            break;
         }
-        Some(m) => Err(Error::Protocol(format!("expected AuthOk/AuthFail, got {m:?}"))),
-        None => Err(Error::Protocol("server closed the control stream during authentication".into())),
+        match frame::read_message(&mut recv, MAX_FRAME).await {
+            Ok(Some(Message::AuthOk { session: info })) => return Ok(Dialed { ep, conn, send, recv, info, host_key, signer: signer.clone() }),
+            Ok(Some(Message::AuthFail { reason })) => refusals.push(format!("{}: {reason}", signer.public_key().fingerprint(ssh_key::HashAlg::Sha256))),
+            Ok(Some(m)) => return Err(Error::Protocol(format!("expected AuthOk/AuthFail, got {m:?}"))),
+            // The server stopped taking attempts (MaxAuthTries).
+            Ok(None) | Err(_) => break,
+        }
     }
+    conn.close(close::SHUTDOWN.into(), b"authentication refused");
+    Err(Error::Auth(if refusals.is_empty() { "authentication refused".into() } else { refusals.join("; ") }))
 }
 
 impl ClientSession {
     pub async fn connect(opts: ClientOptions, socket: Arc<dyn AsyncUdpSocket>) -> Result<Self> {
         opts.limits.validate().map_err(Error::Config)?;
-        let Dialed { ep, conn, send, recv, info, host_key } = connect_and_auth(&opts, socket, Intent::New).await?;
+        let Dialed { ep, conn, send, recv, info, host_key, signer } = connect_and_auth(&opts, &opts.signers, socket, Intent::New).await?;
         let info = info.ok_or_else(|| Error::Protocol("AuthOk for a new session carries no session info".into()))?;
         let shared = SessionShared::new(
             info.session_id,
             Role::Client,
             opts.user.clone(),
-            pubkey_blob(opts.signer.public_key()).map_err(|e| Error::Auth(e.to_string()))?,
+            pubkey_blob(signer.public_key()).map_err(|e| Error::Auth(e.to_string()))?,
             Authz::unrestricted(),
             opts.limits.clone(),
             Budgets::new(&opts.limits),
@@ -239,6 +261,7 @@ impl ClientSession {
             opts,
             endpoint: Mutex::new(Some(ep)),
             host_key,
+            auth_signer: signer,
             linger: Duration::from_secs(info.linger_secs),
             roam: RoamStats::default(),
             gave_up: tokio::sync::watch::channel(false).0,
@@ -365,7 +388,7 @@ impl ClientInner {
         let _g = self.shared.attach_lock.lock().await;
         self.shared.detach(close::SUPERSEDED, b"client resuming");
         let ours = self.shared.snapshot_lanes();
-        let Dialed { ep, conn, mut send, mut recv, host_key, .. } = connect_and_auth(&self.opts, socket, Intent::Resume).await?;
+        let Dialed { ep, conn, mut send, mut recv, host_key, .. } = connect_and_auth(&self.opts, std::slice::from_ref(&self.auth_signer), socket, Intent::Resume).await?;
         if !ssh3_keys::spki::same_key(&host_key, &self.host_key) {
             conn.close(close::SHUTDOWN.into(), b"host key changed");
             return Err(Error::HostKey(format!(

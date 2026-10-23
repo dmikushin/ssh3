@@ -304,7 +304,7 @@ fn client_limits(c: &ClientConfig) -> Limits {
 }
 
 async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signer: Arc<dyn Signer>) -> Result<ClientSession, Error> {
-    let opts = ClientOptions { server_addr: addr, host: host.clone(), signer, user: c.user.clone(), limits: client_limits(c), sockets: dual_stack_factory() };
+    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: vec![signer], user: c.user.clone(), limits: client_limits(c), sockets: dual_stack_factory() };
     let sock = (opts.sockets)().map_err(Error::Io)?;
     let fut = ClientSession::connect(opts, sock);
     match c.connect_timeout {

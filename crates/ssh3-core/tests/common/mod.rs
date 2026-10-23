@@ -162,7 +162,7 @@ impl Env {
         ClientOptions {
             server_addr: self.server_addr(),
             host: self.host_check(),
-            signer: key.clone(),
+            signers: vec![key.clone() as Arc<dyn ssh3_core::auth::Signer>],
             user: "tester".into(),
             limits: self.limits.clone(),
             sockets: ssh3_core::client::dual_stack_factory(),

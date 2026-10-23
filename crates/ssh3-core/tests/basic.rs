@@ -468,3 +468,25 @@ fn invalid_limits_are_rejected() {
     }
     Limits::default().validate().unwrap();
 }
+
+/// Board R4: several keys are offered in order on ONE connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_keys_on_one_connection() {
+    let env = env_with(fast_limits());
+    let stranger = user_key(98);
+    let mut opts = env.opts(&env.key);
+    opts.signers = vec![stranger.clone(), env.key.clone()];
+    let c = ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap();
+    let st = env.server.stats();
+    assert_eq!((st.sessions, st.auth_failures), (1, 1), "first key refused, second accepted, one connection: {st:?}");
+    // The session belongs to the accepted key; resume uses it.
+    assert_eq!(env.server.session(&c.session_id()).unwrap().owner_key, ssh3_core::auth::pubkey_blob(env.key.public_key()).unwrap());
+    // With MaxAuthTries 1 the second key is never tried.
+    let env1 = env_with(Limits { max_auth_tries: 1, ..fast_limits() });
+    let mut opts = env1.opts(&env1.key);
+    opts.signers = vec![stranger, env1.key.clone()];
+    match ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await {
+        Err(Error::Auth(m)) => assert!(m.contains("key not present"), "{m}"),
+        other => panic!("expected an auth error, got {:?}", other.err()),
+    }
+}
