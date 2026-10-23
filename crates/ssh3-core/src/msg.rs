@@ -51,6 +51,10 @@ pub enum ChannelKind {
     /// A connection to the session's forwarded agent socket (server opens;
     /// the client bridges it to its local agent).
     AuthAgent,
+    /// -L UDP / SOCKS UDP ASSOCIATE: one flow; the server sends to `host:port`.
+    DirectUdp { host: String, port: u16 },
+    /// -R UDP: one flow from `origin` to the server's UDP listener.
+    ForwardedUdp { bind_host: String, bind_port: u16, origin_host: String, origin_port: u16 },
 }
 
 /// A request on a session channel (RFC 4254 §6, carried as events).
@@ -141,10 +145,13 @@ pub enum Message {
     /// replayed after a resume.
     ExitStatus { chan_id: u64, status: u32 },
     ExitSignal { chan_id: u64, signal: String, core_dumped: bool },
+    /// -R UDP: listen on `host:port` (0 = any); answered by ListenOk/Fail.
+    UdpListenRequest { req_id: u64, host: String, port: u16 },
+    UdpListenCancel { host: String, port: u16 },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 23;
+pub const MESSAGE_TYPES: u32 = 25;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;

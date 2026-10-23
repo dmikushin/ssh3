@@ -71,6 +71,16 @@ pub struct Limits {
     /// SO_RCVBUF / SO_SNDBUF on dialed and accepted TCP sockets (SPEC §5
     /// memory bound).
     pub tcp_socket_buffer: usize,
+    // §6 UDP
+    /// Flows per UDP listener (LRU beyond).
+    pub udp_flows_max: usize,
+    /// A UDP flow idle this long is closed (both sides).
+    pub udp_flow_idle: Duration,
+    /// Inbound datagrams queued per flow before dropping.
+    pub udp_queue: usize,
+    /// Server-wide fragment reassembly storage.
+    pub reassembly_budget: u64,
+    pub reassembly_max_age: Duration,
 }
 
 impl Default for Limits {
@@ -111,6 +121,11 @@ impl Default for Limits {
             resume_backoff_max: Duration::from_secs(10),
             max_sessions: 1024,
             tcp_socket_buffer: 64 * 1024,
+            udp_flows_max: 256,
+            udp_flow_idle: Duration::from_secs(60),
+            udp_queue: 128,
+            reassembly_budget: 4 * 1024 * 1024,
+            reassembly_max_age: Duration::from_secs(1),
         }
     }
 }
@@ -135,6 +150,9 @@ impl Limits {
         }
         if self.floor_window > self.conn_window_ceiling {
             return Err(format!("floor_window {} exceeds conn_window_ceiling {}", self.floor_window, self.conn_window_ceiling));
+        }
+        if self.udp_flows_max == 0 || self.udp_queue == 0 || self.udp_flow_idle.is_zero() {
+            return Err("udp_flows_max, udp_queue and udp_flow_idle must be positive".into());
         }
         if self.max_auth_tries == 0 {
             return Err("max_auth_tries must be at least 1".into());

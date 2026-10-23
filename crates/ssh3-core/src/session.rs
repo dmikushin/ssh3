@@ -45,6 +45,8 @@ pub struct Budgets {
     pub send: Arc<Budget>,
     /// Floor chunks; unlimited, counted.
     pub floor: Arc<Budget>,
+    /// §6 fragment reassembly storage.
+    pub reasm: Arc<Budget>,
     /// Connection windows above the floor (§1).
     pub conn: Arc<Budget>,
 }
@@ -55,6 +57,7 @@ impl Budgets {
             recv: Budget::new("LaneCreditBudget", l.lane_credit_budget),
             send: Budget::new("LaneSendBudget", l.lane_send_budget),
             floor: Budget::new("lane floor", u64::MAX),
+            reasm: Budget::new("ReassemblyBudget", l.reassembly_budget),
             conn: Budget::new("ConnWindowBudget", l.conn_window_budget),
         })
     }
@@ -65,8 +68,8 @@ pub(crate) type Registry = Mutex<HashMap<SessionId, Arc<SessionShared>>>;
 /// Where a SessionReply is delivered (error text on failure).
 type ReplySlot = oneshot::Sender<std::result::Result<(), String>>;
 
-/// A -R request in flight: bind host, local target, reply slot.
-type PendingListen = (String, (String, u16), oneshot::Sender<std::result::Result<u16, FailReason>>);
+/// A -R request in flight: bind host, local target, UDP?, reply slot.
+type PendingListen = (String, (String, u16), bool, oneshot::Sender<std::result::Result<u16, FailReason>>);
 
 /// A server-side -R listener. Dropping it aborts the accept task, which
 /// drops the socket: the port is released at once (SPEC I5).
@@ -102,6 +105,8 @@ pub(crate) enum Completion {
     /// Client session: every lane finished AND the exit is known — the
     /// output may end before the exit-status event arrives.
     AllLanesAndExit(Arc<crate::sesschan::ExitFlag>),
+    /// UDP flows: only an explicit close ends them.
+    Manual,
 }
 
 impl Channel {
@@ -155,6 +160,9 @@ pub struct SessionShared {
     next_req: AtomicU64,
     pub refused_detached: AtomicU64,
     has_pty: AtomicBool,
+    pub(crate) reasm: Mutex<crate::udp::Reassembly>,
+    remote_udp_forwards: Mutex<HashMap<(String, u16), (String, u16)>>,
+    udp_listeners: Mutex<HashMap<(String, u16), Listener>>,
     /// Server: the forwarded agent socket (SPEC §5: owned by the session).
     pub(crate) agent: Mutex<Option<crate::sesschan::AgentSocket>>,
     /// Client: the local agent socket forwarded agent connections go to.
@@ -207,6 +215,9 @@ impl SessionShared {
             next_req: AtomicU64::new(1),
             refused_detached: AtomicU64::new(0),
             has_pty: AtomicBool::new(false),
+            reasm: Mutex::new(crate::udp::Reassembly::new()),
+            remote_udp_forwards: Mutex::new(HashMap::new()),
+            udp_listeners: Mutex::new(HashMap::new()),
             agent: Mutex::new(None),
             local_agent: Mutex::new(None),
             server_env,
@@ -348,6 +359,10 @@ impl SessionShared {
         self.has_pty.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn current_conn(&self) -> Option<(Connection, u64)> {
+        self.conn()
+    }
+
     fn conn(&self) -> Option<(Connection, u64)> {
         self.carrier.lock().unwrap().as_ref().map(|c| (c.conn.clone(), c.epoch))
     }
@@ -397,6 +412,10 @@ impl SessionShared {
             return Err(FailReason::Protocol(format!("channel {chan_id} already exists")));
         }
         let ch = self.make_channel(chan_id, nlanes);
+        if matches!(completion, Completion::Manual) {
+            map.insert(chan_id, ch.clone());
+            return Ok(ch);
+        }
         // Supervisor: drop the channel once it is complete.
         let me = Arc::downgrade(self);
         let lanes = ch.lanes.clone();
@@ -412,6 +431,7 @@ impl SessionShared {
                     let done = match &completion {
                         Completion::AllLanes | Completion::AllLanesAndExit(_) => l.is_complete(),
                         Completion::AfterExit(_) => l.send_complete(),
+                        Completion::Manual => unreachable!("manual channels have no supervisor"),
                     };
                     if done {
                         break;
@@ -545,7 +565,7 @@ impl SessionShared {
         ch.opening.store(true, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(chan_id, tx);
-        let limit = ch.lanes[0].initial_limit();
+        let limit = ch.lanes.first().map_or(0, |l| l.initial_limit());
         self.send_event(Message::ChannelOpen { chan_id, kind, limit }).await?;
         // The answer is an event too: it arrives after a resume if the
         // carrier dies meanwhile. Only teardown drops `tx`.
@@ -582,6 +602,18 @@ impl SessionShared {
             }
             (Role::Server, ChannelKind::Session) => return self.accept_session(chan_id, peer_limit),
             (Role::Client, ChannelKind::AuthAgent) => return self.accept_agent(chan_id, peer_limit),
+            (Role::Server, ChannelKind::DirectUdp { host, port }) => {
+                if !self.authz().allows_direct_tcp(&host, port) {
+                    return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
+                }
+                return self.accept_udp_channel(chan_id, host, port);
+            }
+            (Role::Client, ChannelKind::ForwardedUdp { bind_host, bind_port, .. }) => {
+                return match self.remote_udp_forwards.lock().unwrap().get(&(bind_host, bind_port)).cloned() {
+                    Some((h, p)) => self.accept_udp_channel(chan_id, h, p),
+                    None => self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited }),
+                };
+            }
             (Role::Client, ChannelKind::ForwardedTcp { bind_host, bind_port, .. }) => {
                 match self.remote_forwards.lock().unwrap().get(&(bind_host, bind_port)).cloned() {
                     Some(target) => target,
@@ -640,7 +672,7 @@ impl SessionShared {
     pub async fn forward_remote(self: &Arc<Self>, bind_host: String, bind_port: u16, target: (String, u16)) -> Result<u16> {
         let req_id = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.listen_pending.lock().unwrap().insert(req_id, (bind_host.clone(), target, tx));
+        self.listen_pending.lock().unwrap().insert(req_id, (bind_host.clone(), target, false, tx));
         self.send_event(Message::ListenRequest { req_id, host: bind_host, port: bind_port }).await?;
         match rx.await {
             Ok(Ok(port)) => Ok(port),
@@ -705,7 +737,48 @@ impl SessionShared {
     }
 
     pub fn listener_count(&self) -> usize {
-        self.listeners.lock().unwrap().len()
+        self.listeners.lock().unwrap().len() + self.udp_listeners.lock().unwrap().len()
+    }
+
+    /// Client: -R UDP — the server listens on `bind_host:bind_port` and each
+    /// source becomes a flow forwarded to `target` from here.
+    pub async fn forward_remote_udp(self: &Arc<Self>, bind_host: String, bind_port: u16, target: (String, u16)) -> Result<u16> {
+        let req_id = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.listen_pending.lock().unwrap().insert(req_id, (bind_host.clone(), target, true, tx));
+        self.send_event(Message::UdpListenRequest { req_id, host: bind_host, port: bind_port }).await?;
+        match rx.await {
+            Ok(Ok(port)) => Ok(port),
+            Ok(Err(reason)) => Err(Error::Refused(reason)),
+            Err(_) => Err(Error::CarrierLost),
+        }
+    }
+
+    /// Server: a UdpListenRequest.
+    async fn on_udp_listen_request(self: &Arc<Self>, req_id: u64, host: String, port: u16) -> Result<()> {
+        if self.role != Role::Server {
+            return Err(Error::Protocol("UdpListenRequest sent to a client".into()));
+        }
+        if !self.authz().allows_listen(&host, port) {
+            return self.reply_event(Message::ListenFail { req_id, reason: FailReason::Prohibited });
+        }
+        if self.listener_count() >= self.limits.max_listeners {
+            return self.reply_event(Message::ListenFail { req_id, reason: FailReason::ResourceLimit });
+        }
+        let addr = match host.as_str() {
+            "" | "localhost" => "127.0.0.1".to_string(),
+            "*" => "0.0.0.0".to_string(),
+            h => h.to_string(),
+        };
+        let sock = match tokio::net::UdpSocket::bind((addr.as_str(), port)).await {
+            Ok(s) => s,
+            Err(e) => return self.reply_event(Message::ListenFail { req_id, reason: FailReason::BindFailed(format!("{addr}:{port} (udp): {e}")) }),
+        };
+        let bound = sock.local_addr()?.port();
+        let bind_host = host.clone();
+        let task = self.run_udp_listener(sock, move |src| ChannelKind::ForwardedUdp { bind_host: bind_host.clone(), bind_port: bound, origin_host: src.ip().to_string(), origin_port: src.port() });
+        self.udp_listeners.lock().unwrap().insert((host, bound), Listener { task });
+        self.reply_event(Message::ListenOk { req_id, port: bound })
     }
 
     // ---------------------------------------------------------- dispatch
@@ -751,8 +824,9 @@ impl SessionShared {
                 // first ChannelOpen for this listener comes after ListenOk.
                 let p = self.listen_pending.lock().unwrap().remove(&req_id);
                 match p {
-                    Some((host, target, tx)) => {
-                        self.remote_forwards.lock().unwrap().insert((host, port), target);
+                    Some((host, target, udp, tx)) => {
+                        let map = if udp { &self.remote_udp_forwards } else { &self.remote_forwards };
+                        map.lock().unwrap().insert((host, port), target);
                         let _ = tx.send(Ok(port));
                         Ok(())
                     }
@@ -760,9 +834,14 @@ impl SessionShared {
                 }
             }
             Message::ListenFail { req_id, reason } => {
-                if let Some((_, _, tx)) = self.listen_pending.lock().unwrap().remove(&req_id) {
+                if let Some((_, _, _, tx)) = self.listen_pending.lock().unwrap().remove(&req_id) {
                     let _ = tx.send(Err(reason));
                 }
+                Ok(())
+            }
+            Message::UdpListenRequest { req_id, host, port } => self.on_udp_listen_request(req_id, host, port).await,
+            Message::UdpListenCancel { host, port } => {
+                drop(self.udp_listeners.lock().unwrap().remove(&(host, port)));
                 Ok(())
             }
             Message::ListenCancel { host, port } => {
@@ -923,12 +1002,6 @@ impl SessionShared {
         }
     }
 
-    /// Datagrams are SPEC §6 (next milestone): drained and dropped so they
-    /// never hold connection buffers.
-    async fn datagram_sink(conn: Connection) {
-        while conn.read_datagram().await.is_ok() {}
-    }
-
     /// §1 connection-window scheduler. Every max(RTT, window_sample_min) it
     /// compares the bytes moved (either direction) with what the window
     /// allows per RTT. After `window_raise_after` window-limited samples the
@@ -1055,7 +1128,7 @@ impl SessionShared {
         tasks.spawn(self.clone().control_writer(send, rx, first(epoch)));
         tasks.spawn(self.clone().control_reader(conn.clone(), recv));
         tasks.spawn(self.clone().acceptor(conn.clone()));
-        tasks.spawn(Self::datagram_sink(conn.clone()));
+        tasks.spawn(self.clone().datagram_rx(conn.clone()));
         tasks.spawn(self.clone().watch_death(conn.clone(), epoch));
         tasks.spawn(self.clone().window_scheduler(conn.clone()));
         let old = self.carrier.lock().unwrap().replace(Carrier { epoch, conn, _ctrl: tx, _tasks: tasks });
@@ -1080,6 +1153,8 @@ impl SessionShared {
         self.detach(close::SHUTDOWN, b"session closed");
         let listeners: Vec<_> = self.listeners.lock().unwrap().drain().collect();
         drop(listeners);
+        let udp: Vec<_> = self.udp_listeners.lock().unwrap().drain().collect();
+        drop(udp);
         drop(self.agent.lock().unwrap().take());
         let lp: Vec<_> = self.listen_pending.lock().unwrap().drain().collect();
         drop(lp);

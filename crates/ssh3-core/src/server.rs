@@ -85,6 +85,14 @@ pub struct ServerStats {
     pub conn_window_budget_used: u64,
     pub window_raises: u64,
     pub window_lowers: u64,
+    /// §6: live UDP flows (all flow tables), datagrams dropped (full queue,
+    /// detached, oversize, malformed), reassembly storage in use and groups
+    /// evicted, LRU flow evictions.
+    pub udp_flows: u64,
+    pub datagrams_dropped: u64,
+    pub reassembly_bytes: u64,
+    pub reassembly_evicted: u64,
+    pub udp_evicted: u64,
 }
 
 impl Server {
@@ -139,6 +147,7 @@ impl Server {
             send_budget_used: b.send.used(),
             floor_chunks_bytes: b.floor.used(),
             conn_window_budget_used: b.conn.used(),
+            reassembly_bytes: b.reasm.used(),
             auth_failures: c.auth_failures.load(Ordering::Relaxed),
             resumes_accepted: c.resumes_accepted.load(Ordering::Relaxed),
             resumes_rejected: c.resumes_rejected.load(Ordering::Relaxed),
@@ -156,6 +165,10 @@ impl Server {
             t.listeners += s.listener_count() as u64;
             t.window_raises += s.stats.window_raises.load(Ordering::Relaxed);
             t.window_lowers += s.stats.window_lowers.load(Ordering::Relaxed);
+            t.udp_flows += s.stats.udp_flows.load(Ordering::Relaxed);
+            t.datagrams_dropped += s.stats.dgrams_dropped.load(Ordering::Relaxed);
+            t.reassembly_evicted += s.stats.reasm_evicted.load(Ordering::Relaxed);
+            t.udp_evicted += s.stats.udp_evicted.load(Ordering::Relaxed);
             t.refused_detached += s.refused_detached.load(Ordering::Relaxed);
             t.send_ring_bytes += s.stats.send_ring_bytes.load(Ordering::Relaxed);
             t.recv_ring_bytes += s.stats.recv_ring_bytes.load(Ordering::Relaxed);

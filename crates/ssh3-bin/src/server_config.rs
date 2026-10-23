@@ -129,6 +129,11 @@ pub struct LimitsOverrides {
     resume_backoff_max: Option<Dur>,
     max_sessions: Option<usize>,
     tcp_socket_buffer: Option<usize>,
+    udp_flows_max: Option<usize>,
+    udp_flow_idle: Option<Dur>,
+    udp_queue: Option<usize>,
+    reassembly_budget: Option<u64>,
+    reassembly_max_age: Option<Dur>,
 }
 
 impl LimitsOverrides {
@@ -169,6 +174,11 @@ impl LimitsOverrides {
             resume_backoff_max,
             max_sessions,
             tcp_socket_buffer,
+            udp_flows_max,
+            udp_flow_idle,
+            udp_queue,
+            reassembly_budget,
+            reassembly_max_age,
         } = d;
         let dur = |o: Option<Dur>, v| o.map_or(v, |d| d.0);
         Limits {
@@ -207,6 +217,11 @@ impl LimitsOverrides {
             resume_backoff_max: dur(self.resume_backoff_max, resume_backoff_max),
             max_sessions: self.max_sessions.unwrap_or(max_sessions),
             tcp_socket_buffer: self.tcp_socket_buffer.unwrap_or(tcp_socket_buffer),
+            udp_flows_max: self.udp_flows_max.unwrap_or(udp_flows_max),
+            udp_flow_idle: dur(self.udp_flow_idle, udp_flow_idle),
+            udp_queue: self.udp_queue.unwrap_or(udp_queue),
+            reassembly_budget: self.reassembly_budget.unwrap_or(reassembly_budget),
+            reassembly_max_age: dur(self.reassembly_max_age, reassembly_max_age),
         }
     }
 }

@@ -27,6 +27,11 @@ pub fn to_json(s: &ServerStats) -> Value {
         conn_window_budget_used,
         window_raises,
         window_lowers,
+        udp_flows,
+        datagrams_dropped,
+        reassembly_bytes,
+        reassembly_evicted,
+        udp_evicted,
     } = *s;
     json!({
         "sessions": sessions,
@@ -49,5 +54,10 @@ pub fn to_json(s: &ServerStats) -> Value {
         "conn_window_budget_used": conn_window_budget_used,
         "window_raises": window_raises,
         "window_lowers": window_lowers,
+        "udp_flows": udp_flows,
+        "datagrams_dropped": datagrams_dropped,
+        "reassembly_bytes": reassembly_bytes,
+        "reassembly_evicted": reassembly_evicted,
+        "udp_evicted": udp_evicted,
     })
 }

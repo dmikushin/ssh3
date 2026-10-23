@@ -13,6 +13,7 @@ pub mod server;
 pub mod sesschan;
 pub mod session;
 pub mod transport;
+pub mod udp;
 
 pub use client::{ClientOptions, ClientSession, udp_socket};
 pub use error::{Error, Result};

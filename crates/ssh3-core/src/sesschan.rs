@@ -83,6 +83,7 @@ pub(crate) struct ClientSess {
 pub(crate) enum ChanExt {
     Server(Arc<ServerSess>),
     Client(Arc<ClientSess>),
+    Udp(crate::udp::UdpExt),
 }
 
 /// What the client asks the server to run.

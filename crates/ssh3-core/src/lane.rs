@@ -61,6 +61,14 @@ pub struct Stats {
     pub conn_window_charged: AtomicU64,
     pub window_raises: AtomicU64,
     pub window_lowers: AtomicU64,
+    /// §6: live UDP flows (channels), datagrams, drops, reassembly and LRU
+    /// evictions.
+    pub udp_flows: AtomicU64,
+    pub dgrams_sent: AtomicU64,
+    pub dgrams_received: AtomicU64,
+    pub dgrams_dropped: AtomicU64,
+    pub reasm_evicted: AtomicU64,
+    pub udp_evicted: AtomicU64,
 }
 
 /// Lanes whose ack should be sent: `urgent` now, `lazy` on the next tick.
