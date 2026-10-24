@@ -1057,3 +1057,181 @@ fn gateway_restart_mid_transfer_is_survived() {
     assert_eq!(gs["sessions"].as_u64(), Some(1), "only the target's registration should remain after the client ended: {gs}");
     assert!(gs["conns_accepted"].as_u64().unwrap() >= 2, "{gs}");
 }
+
+// ---------------------------------------------------- predictive echo (§5.2)
+
+/// A UDP relay in front of the server that delays every datagram by
+/// `one_way` in each direction (RTT = 2·one_way), keeping order.
+fn delay_relay(server_port: u16, one_way: Duration) -> u16 {
+    use std::collections::HashMap;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::sync::Arc;
+    /// Arrival time, payload, socket to send from, destination (None:
+    /// the socket's connected peer).
+    type Datagram = (Instant, Vec<u8>, Arc<UdpSocket>, Option<SocketAddr>);
+    // One delivery thread per direction: datagrams leave in arrival order
+    // once their time has come.
+    fn line(one_way: Duration) -> mpsc::Sender<Datagram> {
+        let (tx, rx) = mpsc::channel::<Datagram>();
+        std::thread::spawn(move || {
+            for (at, b, sock, to) in rx {
+                let due = at + one_way;
+                if let Some(w) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(w);
+                }
+                let _ = match to {
+                    Some(to) => sock.send_to(&b, to),
+                    None => sock.send(&b),
+                };
+            }
+        });
+        tx
+    }
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let port = front.local_addr().unwrap().port();
+    let (up_line, down_line) = (line(one_way), line(one_way));
+    std::thread::spawn(move || {
+        let mut ups: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        let mut b = [0u8; 65536];
+        while let Ok((n, from)) = front.recv_from(&mut b) {
+            let up = ups.entry(from).or_insert_with(|| {
+                let up = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+                up.connect(("127.0.0.1", server_port)).unwrap();
+                let (up2, front2, down) = (up.clone(), front.clone(), down_line.clone());
+                std::thread::spawn(move || {
+                    let mut b = [0u8; 65536];
+                    while let Ok(n) = up2.recv(&mut b) {
+                        if down.send((Instant::now(), b[..n].to_vec(), front2.clone(), Some(from))).is_err() {
+                            return;
+                        }
+                    }
+                });
+                up
+            });
+            let _ = up_line.send((Instant::now(), b[..n].to_vec(), up.clone(), None));
+        }
+    });
+    port
+}
+
+/// The local terminal as a user sees it: an emulator fed everything the
+/// client writes to the pty, which also answers the client's cursor
+/// position query (DSR 6) as a terminal does.
+struct Term {
+    rx: mpsc::Receiver<Vec<u8>>,
+    master: std::fs::File,
+    model: ssh3_term::Screen,
+}
+
+impl Term {
+    fn new(pty: &Pty, rows: u16, cols: u16) -> Self {
+        let mut m = pty.master.try_clone().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while let Ok(n) = m.read(&mut b) {
+                if n == 0 || tx.send(b[..n].to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        Term { rx, master: pty.master.try_clone().unwrap(), model: ssh3_term::Screen::new(cols, rows) }
+    }
+
+    /// Takes in whatever arrived within `wait`; false if nothing did.
+    fn pump(&mut self, wait: Duration) -> bool {
+        let Ok(b) = self.rx.recv_timeout(wait) else { return false };
+        if b.windows(4).any(|w| w == b"\x1b[6n") {
+            let (l, c) = self.model.cursor();
+            self.master.write_all(format!("\x1b[{};{}R", l + 1, c + 1).as_bytes()).unwrap();
+        }
+        self.model.feed(&b);
+        true
+    }
+
+    /// Waits until `pred` holds for the terminal; panics naming `what`.
+    fn until(&mut self, what: &str, within: Duration, pred: impl Fn(&ssh3_term::Screen) -> bool) -> Instant {
+        let end = Instant::now() + within;
+        while !pred(&self.model) {
+            let left = end.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "terminal never showed {what} within {within:?}; cursor {:?}", self.model.cursor());
+            self.pump(left);
+        }
+        Instant::now()
+    }
+
+    /// Until nothing arrives for `quiet`.
+    fn settle(&mut self, quiet: Duration) {
+        let end = Instant::now() + DEADLINE;
+        while self.pump(quiet) {
+            assert!(Instant::now() < end, "terminal never went quiet");
+        }
+    }
+}
+
+/// Runs `cat` on a pty through a 200 ms RTT link and types five characters
+/// after the first one was echoed; returns the delay from each keystroke to
+/// the character appearing on the local terminal, and checks that the
+/// terminal ends showing exactly what the server's pty shows.
+fn keystroke_latencies(mode: &str) -> Vec<Duration> {
+    let env = Env::new();
+    let rport = delay_relay(env.port, Duration::from_millis(100));
+    let host_pub = std::fs::read_to_string(env.dir.join("host_key.pub")).unwrap();
+    std::fs::write(env.dir.join("known_hosts.relay"), format!("[127.0.0.1]:{rport} {host_pub}")).unwrap();
+    let cfg = env.dir.join(format!("ssh_config.echo-{mode}"));
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host t\n  HostName 127.0.0.1\n  Port {rport}\n  User {user}\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {d}/known_hosts.relay\n  GlobalKnownHostsFile none\n  PredictiveEcho {mode}\n",
+            user = me(),
+            d = env.dir.display()
+        ),
+    )
+    .unwrap();
+    let pty = openpty(24, 80);
+    let mut term = Term::new(&pty, 24, 80);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    cmd.arg("-F").arg(&cfg).args(["-t", "t", "echo ready; exec cat"]);
+    let mut c = spawn_on_pty(cmd, &pty, "ssh3");
+    term.until("'ready'", DEADLINE, |s| s.cell(0, 0).ch == 'r' && s.cursor() == (1, 0));
+    // The first keystroke of an epoch is shown only once echoed.
+    term.master.write_all(b"a").unwrap();
+    term.until("the echo of 'a'", DEADLINE, |s| s.cell(1, 0).ch == 'a');
+    term.settle(Duration::from_millis(300));
+    let mut lat = Vec::new();
+    for (i, ch) in "bcdef".chars().enumerate() {
+        let col = 1 + i as u16;
+        let sent = Instant::now();
+        term.master.write_all(ch.encode_utf8(&mut [0; 4]).as_bytes()).unwrap();
+        let seen = term.until(&format!("{ch:?} at column {col}"), DEADLINE, |s| s.cell(1, col).ch == ch);
+        lat.push(seen - sent);
+        term.settle(Duration::from_millis(300));
+    }
+    // The server's screen: what its pty shows (cat echoes; no overlay left).
+    let mut server = ssh3_term::Screen::new(80, 24);
+    server.feed(b"ready\r\nabcdef");
+    let norm = |mut s: ssh3_term::Snapshot| {
+        if s.unknown_private_modes.get(&2026) == Some(&false) {
+            s.unknown_private_modes.remove(&2026);
+        }
+        s
+    };
+    let d = norm(server.snapshot()).diff_with(&norm(term.model.snapshot()), false);
+    assert!(d.is_empty(), "[{mode}] local terminal differs from the server's screen:\n{}", d.join("\n"));
+    // End: the line goes to cat, which prints it; EOF ends it.
+    term.master.write_all(b"\r\x04").unwrap();
+    assert_eq!(c.wait_exit(DEADLINE).code(), Some(0));
+    lat
+}
+
+#[test]
+fn predictive_echo_shows_keystrokes_before_the_echo() {
+    let mut with = keystroke_latencies("always");
+    let mut without = keystroke_latencies("never");
+    with.sort();
+    without.sort();
+    eprintln!("keystroke to display, 200 ms RTT: with prediction {with:?}; without {without:?}");
+    let median = |v: &[Duration]| v[v.len() / 2];
+    assert!(median(&with) < Duration::from_millis(20), "with prediction: median {:?} ({with:?})", median(&with));
+    assert!(without[0] >= Duration::from_millis(180), "without prediction faster than the RTT: {without:?}");
+}

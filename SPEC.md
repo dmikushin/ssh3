@@ -346,9 +346,7 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   more than `ContactWarn` (default 6.5 s, mosh terminaloverlay.h:159), an
   interactive client shows "Last contact N s ago" on its pty, removed when
   traffic resumes.
-- **Predictive echo (after mosh).** Later milestone; client-side adaptive
-  local echo with confirmation by epoch, modes adaptive/always/never; needs
-  the client-side terminal emulator from screen mode.
+- **Predictive echo (after mosh).** See §5.2.
 - **Received offset semantics.** `received_offset` = end of the bytes
   accepted into the receiver's receive ring. Bytes delivered to quinn but not
   yet copied into the ring are *not* counted, so a carrier death between the
@@ -429,6 +427,56 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   works for v4 and v6 targets.
 - A change of the **server's** address family cannot happen inside one QUIC
   connection; it is done by **resume** (§5) over a new connection.
+
+### 5.2 Predictive local echo (client only, after mosh)
+
+No protocol messages; the client alone, ported from mosh's
+`PredictionEngine` (src/frontend/terminaloverlay.{h,cc}).
+
+- **Mirror.** For a pty session on a raw local terminal the client feeds
+  every byte of the pty output lane into an `ssh3_term::Screen` (the same
+  emulator as screen mode; resync redraws arrive in-band and keep it exact).
+  At session start it asks the terminal for its cursor (DSR 6, bounded wait
+  1 s; no answer = prediction off) so the mirror scrolls when the terminal
+  does. Content above the session's first line is unknown to the mirror;
+  predictions only touch the cursor row and the cells right of the cursor.
+- **Predictions** (mosh `new_user_byte`): printable width-1 characters
+  (insert at the cursor, cells to the right shift), backspace (DEL), left /
+  right arrows (CSI and SS3 forms), Enter (cursor to the next line). Every
+  other keystroke — control characters, escape sequences, wide or
+  combining characters, a character into the last column — starts a new
+  epoch.
+- **Epochs.** A prediction is displayed only when its epoch is confirmed:
+  some prediction of that epoch appeared in the server's output. The first
+  keystroke after Enter, after ESC (editor command mode) or at a prompt
+  with echo off is therefore never shown.
+- **Judging.** The mirror showing the predicted cell (and it was not there
+  before) confirms at once. A mismatch counts only after `2·SRTT + 100 ms`
+  from the keystroke AND after the server was heard from since `SRTT/2`
+  after it (`last_contact`); a silent server keeps predictions pending, so
+  mosh's glitch triggers apply (shown after 250 ms pending, underlined
+  after 5 s). A wrong prediction in a confirmed epoch resets all
+  predictions; in a tentative one it kills that epoch (mosh `kill_epoch`).
+- **Display.** One task owns the local terminal. Before writing server
+  output it removes the overlay by repainting the overlaid cells from the
+  mirror (`Screen::paint` with `Paint::Mirror`, cursor and pen restored),
+  then writes the output, feeds the mirror, judges, and paints the new
+  overlay. Painting uses only CUP, SGR and printing inside a DECSET 2026
+  bracket and is refused (no predictions) in states those would disturb:
+  alternate screen, origin or insert mode, pending wrap, hyperlink pen,
+  line-drawing charset in GL, an open synchronized update, the parser
+  inside a sequence, wide cells, the last column.
+- **Modes** (`PredictiveEcho` in ssh_config, an ssh3 keyword):
+  `adaptive` (default; shell sessions only, shown when SRTT/2 > 30 ms, off
+  again at ≤ 20 ms when nothing is shown; underlined when SRTT/2 > 80 ms),
+  `always` (any pty session), `never`.
+- **Measured** (e2e, `cat` over a 200 ms RTT relay): keystroke to display
+  0.8–1.1 ms with prediction, 203–206 ms without; the local terminal then
+  equals the server's screen cell for cell.
+- **Not reproduced from mosh:** prediction while the remote is on the
+  alternate screen (vim insert mode), wide characters, overwrite mode,
+  scrolling prediction on the last row. REP (CSI b) after an overlay
+  repeats the last painted character, not the program's.
 
 ## 6. UDP forwarding and datagrams
 

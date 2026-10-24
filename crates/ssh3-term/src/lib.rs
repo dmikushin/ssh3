@@ -85,7 +85,7 @@ mod seq;
 mod snapshot;
 mod track;
 
-pub use resync::max_resync_len;
+pub use resync::{max_resync_len, CellView, Paint, Rendition};
 pub use snapshot::Snapshot;
 
 /// OSC payload bytes passed to the parser per sequence; the rest of an
@@ -234,5 +234,50 @@ impl Screen {
 
     pub fn alternate_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    // ---- client-side overlays (predictive echo, SPEC §5.2) ----
+
+    /// A visible cell (clamped to the screen).
+    pub fn cell(&self, line: u16, col: u16) -> CellView {
+        let g = self.term.grid();
+        let l = (line as usize).min(g.screen_lines() - 1);
+        let c = (col as usize).min(g.columns() - 1);
+        CellView::of(&g[alacritty_terminal::index::Line(l as i32)][alacritty_terminal::index::Column(c)])
+    }
+
+    /// Cursor (line, column), 0-based.
+    pub fn cursor(&self) -> (u16, u16) {
+        let p = self.term.grid().cursor.point;
+        (p.line.0 as u16, p.column.0 as u16)
+    }
+
+    /// The renditions the next printed character gets.
+    pub fn pen(&self) -> Rendition {
+        CellView::of(&self.term.grid().cursor.template).rendition
+    }
+
+    /// Why no overlay can be painted in the current state, if one cannot.
+    pub fn overlay_obstacle(&self) -> Option<&'static str> {
+        // Output that ended inside a sequence left the client's parser
+        // there too: painted bytes would continue it.
+        if !self.seq.held().is_empty() {
+            return Some("parser inside a sequence");
+        }
+        resync::overlay_obstacle(&self.term, &self.extra)
+    }
+
+    /// Bytes that paint `cells` (line, column, what) on a terminal showing
+    /// this screen and leave its cursor at `cursor` with this screen's pen;
+    /// `Paint::Mirror` restores the emulator's cell. None when the state
+    /// rules overlays out ([`Screen::overlay_obstacle`]) or a cell is wide
+    /// or in the last column. Painting every overlaid cell with `Mirror`
+    /// and `cursor` = [`Screen::cursor`] takes the terminal back to exactly
+    /// this screen's state.
+    pub fn paint(&self, cells: &[(u16, u16, Paint)], cursor: (u16, u16)) -> Option<Vec<u8>> {
+        if !self.seq.held().is_empty() {
+            return None;
+        }
+        resync::paint(&self.term, &self.extra, cells, cursor)
     }
 }

@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod duration;
+pub mod predict;
 pub mod server;
 pub mod server_config;
 pub mod stats;

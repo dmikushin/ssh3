@@ -44,6 +44,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::predict::{Display, PredictionEngine, Preference};
+
 /// ssh(1) exits 255 for its own errors.
 const FAIL: u8 = 255;
 
@@ -57,6 +59,20 @@ fn contact_warn(c: &ClientConfig) -> Result<Duration, String> {
     match c.unknown.iter().find(|o| o.keyword == "contactwarn") {
         Some(o) => crate::duration::parse(o.args.first().map_or("", String::as_str)).map_err(|e| format!("{}:{}: ContactWarn: {e}", o.file, o.line)),
         None => Ok(CONTACT_WARN),
+    }
+}
+
+/// `PredictiveEcho` from ssh_config (an ssh3 keyword, SPEC §5.2): mosh's
+/// `--predict` modes, default adaptive.
+fn predictive_echo(c: &ClientConfig) -> Result<Preference, String> {
+    match c.unknown.iter().find(|o| o.keyword == "predictiveecho") {
+        Some(o) => match o.args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("adaptive") => Ok(Preference::Adaptive),
+            Some("always") => Ok(Preference::Always),
+            Some("never") => Ok(Preference::Never),
+            _ => Err(format!("{}:{}: PredictiveEcho: expected adaptive, always or never", o.file, o.line)),
+        },
+        None => Ok(Preference::Adaptive),
     }
 }
 
@@ -178,6 +194,7 @@ pub fn refusals(c: &ClientConfig) -> Result<(), String> {
             why.push(format!("{}:{}: {} {} is not enforced by ssh3; remove it or use ssh", o.file, o.line, o.keyword, o.args.join(" ")));
         }
     }
+    predictive_echo(c)?;
     if let Err(e) = contact_warn(c) {
         why.push(e);
     }
@@ -679,6 +696,10 @@ async fn run(c: ClientConfig, jumps: Jumps) -> ExitCode {
     code
 }
 
+/// How long the local terminal gets to report its cursor position before
+/// predictive echo is left off.
+const CURSOR_QUERY: Duration = Duration::from_secs(1);
+
 /// How long a deliberate end waits for the server's confirmation; the
 /// SESSION_END close that follows ends the session even without it.
 const END_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
@@ -795,8 +816,13 @@ fn exit_code(e: Option<ExitInfo>) -> (ExitCode, Option<String>) {
 /// Copy local stdin into the channel. A plain thread, not tokio's stdin:
 /// a blocking read(2) on a terminal cannot be cancelled, and process exit
 /// simply abandons this thread.
-fn pump_stdin(mut to: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
+/// Keystrokes also go to the predictive echo (`tee`); `typeahead` was read
+/// before the pump started (while asking the terminal for its cursor).
+fn pump_stdin(mut to: tokio::io::DuplexStream, tee: Option<tokio::sync::mpsc::Sender<Ev>>, typeahead: Vec<u8>) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    if !typeahead.is_empty() {
+        let _ = tx.try_send(typeahead);
+    }
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -814,8 +840,131 @@ fn pump_stdin(mut to: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
             if to.write_all(&b).await.is_err() {
                 return;
             }
+            if let Some(t) = &tee {
+                let _ = t.send(Ev::In(b)).await;
+            }
         }
         let _ = to.shutdown().await;
+    })
+}
+
+/// What the terminal-owning task of a session with predictive echo gets.
+enum Ev {
+    /// Server pty output.
+    Out(Vec<u8>),
+    /// The server's output ended.
+    Eof,
+    /// Keystrokes, already sent to the server.
+    In(Vec<u8>),
+    /// The local window size changed.
+    Resize(u16, u16),
+    /// A prediction timer (internal to the display task).
+    Tick,
+}
+
+/// Asks the local terminal where its cursor is (DSR 6) and waits at most
+/// `within` for the report: the mirror must start where the terminal is,
+/// or it would scroll at other times. Keystrokes read meanwhile are
+/// returned for the server.
+fn query_cursor(within: Duration) -> (Option<(u16, u16)>, Vec<u8>) {
+    let q = b"\x1b[6n";
+    if unsafe { libc::write(libc::STDOUT_FILENO, q.as_ptr().cast(), q.len()) } != q.len() as isize {
+        return (None, Vec::new());
+    }
+    let end = std::time::Instant::now() + within;
+    let mut buf = Vec::new();
+    loop {
+        if let Some((pos, at, len)) = cursor_report(&buf) {
+            buf.drain(at..at + len);
+            return (Some(pos), buf);
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return (None, buf);
+        }
+        let mut p = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut p, 1, left.as_millis().max(1) as i32) } <= 0 {
+            continue;
+        }
+        let mut b = [0u8; 256];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr().cast(), b.len()) };
+        if n <= 0 {
+            return (None, buf);
+        }
+        buf.extend_from_slice(&b[..n as usize]);
+    }
+}
+
+/// `ESC [ row ; col R` in `b`: the 0-based position, where it starts, its
+/// length.
+fn cursor_report(b: &[u8]) -> Option<((u16, u16), usize, usize)> {
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == 0x1b && b[i + 1] == b'[' {
+            let rest = &b[i + 2..];
+            let end = rest.iter().position(|&x| !(x.is_ascii_digit() || x == b';'))?;
+            if rest[end] == b'R'
+                && let Some((r, c)) = std::str::from_utf8(&rest[..end]).ok().and_then(|t| t.split_once(';'))
+                && let (Ok(r), Ok(c)) = (r.parse::<u16>(), c.parse::<u16>())
+            {
+                return Some(((r.saturating_sub(1), c.saturating_sub(1)), i, end + 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The task that owns the terminal when predictive echo is on: every byte
+/// for it goes through [`Display`], so the overlay can be removed before
+/// server output lands and drawn again after.
+fn display_task(mut d: Display, link: impl Fn() -> (Option<Duration>, std::time::Instant) + Send + 'static, mut rx: tokio::sync::mpsc::Receiver<Ev>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        loop {
+            let (rtt, heard) = link();
+            if let Some(r) = rtt {
+                d.engine.set_srtt(r);
+            }
+            d.engine.set_heard(heard);
+            let wait = d.engine.wait_time().unwrap_or(Duration::from_secs(3600));
+            let ev = tokio::select! {
+                e = rx.recv() => e,
+                _ = tokio::time::sleep(wait) => Some(Ev::Tick),
+            };
+            let now = std::time::Instant::now();
+            let bytes = match ev {
+                None | Some(Ev::Eof) => break,
+                Some(Ev::Out(b)) => d.output(&b, now),
+                Some(Ev::In(b)) => d.input(&b, now),
+                Some(Ev::Tick) => d.tick(now),
+                Some(Ev::Resize(c, r)) => d.resize(c, r),
+            };
+            if !bytes.is_empty() && (stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err()) {
+                return;
+            }
+        }
+        let bytes = d.finish();
+        let _ = stdout.write_all(&bytes).await;
+        let _ = stdout.flush().await;
+    })
+}
+
+/// Server pty output into the display task.
+fn pump_display(mut from: tokio::io::DuplexStream, tx: tokio::sync::mpsc::Sender<Ev>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match from.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(Ev::Out(buf[..n].to_vec())).await.is_err() {
+                        return;
+                    }
+                },
+            }
+        }
+        let _ = tx.send(Ev::Eof).await;
     })
 }
 
@@ -855,6 +1004,7 @@ async fn session(c: &ClientConfig, sess: &ClientSession) -> ExitCode {
         (_, Some(cmd)) => Command::Exec(cmd.clone()),
         (_, None) => Command::Shell,
     };
+    let spec_command = command.clone();
     let forward_agent = forwarded_agent(c);
     if c.forward_agent != ForwardAgent::No && forward_agent.is_none() {
         eprintln!("ssh3: no agent to forward (IdentityAgent none or SSH_AUTH_SOCK unset)");
@@ -870,14 +1020,53 @@ async fn session(c: &ClientConfig, sess: &ClientSession) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&format!("cannot put the terminal in raw mode: {e}")),
     };
+    // Predictive echo (SPEC §5.2): on a raw local terminal; adaptive mode
+    // only for interactive shells, `always` for any pty session.
+    let pref = predictive_echo(c).expect("validated by refusals()");
+    let interactive = matches!(spec_command, Command::Shell);
+    let echo = (raw.is_some() && std::io::stdout().is_terminal() && !c.stdin_null)
+        && (pref == Preference::Always || (pref == Preference::Adaptive && interactive));
+    let (display, typeahead) = if echo {
+        let size = tty::size(libc::STDIN_FILENO).unwrap_or(tty::Size { cols: 80, rows: 24, xpixel: 0, ypixel: 0 });
+        match query_cursor(CURSOR_QUERY) {
+            (Some((row, col)), typeahead) => {
+                let mut mirror = ssh3_term::Screen::new(size.cols as u16, size.rows as u16);
+                mirror.feed(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+                (Some(Display::new(mirror, PredictionEngine::new(pref))), typeahead)
+            },
+            (None, typeahead) => {
+                tracing::info!("predictive echo off: the terminal did not report its cursor within {CURSOR_QUERY:?}");
+                (None, typeahead)
+            },
+        }
+    } else {
+        (None, Vec::new())
+    };
+    let (ev_tx, show) = match display {
+        Some(d) => {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let shared = sess.shared.clone();
+            (Some(tx), Some(display_task(d, move || (shared.rtt(), shared.last_contact()), rx)))
+        },
+        None => (None, None),
+    };
     let stdin_task = if c.stdin_null {
         let mut s = take(&mut ch.stdin);
         let _ = s.shutdown().await;
         None
     } else {
-        Some(pump_stdin(take(&mut ch.stdin)))
+        Some(pump_stdin(take(&mut ch.stdin), ev_tx.clone(), typeahead))
     };
-    let out = pump_out(take(&mut ch.stdout), tokio::io::stdout());
+    let out = match (&ev_tx, show) {
+        (Some(tx), Some(show)) => {
+            let pump = pump_display(take(&mut ch.stdout), tx.clone());
+            tokio::spawn(async move {
+                let _ = pump.await;
+                let _ = show.await;
+            })
+        },
+        _ => pump_out(take(&mut ch.stdout), tokio::io::stdout()),
+    };
     let err = pump_out(take(&mut ch.stderr), tokio::io::stderr());
     let watch = status_watch(c, sess, if raw.is_some() { StatusLine::BottomRow } else { StatusLine::Cooked });
     let (Ok(mut term), Ok(mut int), Ok(mut hup), Ok(mut winch)) =
@@ -900,11 +1089,13 @@ async fn session(c: &ClientConfig, sess: &ClientSession) -> ExitCode {
             _ = sess.gave_up() => break End::GaveUp,
             _ = winch.recv() => {}
         }
-        if want_pty
-            && let Some(s) = tty::size(libc::STDIN_FILENO)
-            && let Err(e) = ch.resize(s.cols, s.rows, s.xpixel, s.ypixel).await
-        {
-            tracing::info!("window-change: {e}");
+        if want_pty && let Some(s) = tty::size(libc::STDIN_FILENO) {
+            if let Some(tx) = &ev_tx {
+                let _ = tx.send(Ev::Resize(s.cols as u16, s.rows as u16)).await;
+            }
+            if let Err(e) = ch.resize(s.cols, s.rows, s.xpixel, s.ypixel).await {
+                tracing::info!("window-change: {e}");
+            }
         }
     };
     if let Some(w) = watch {
@@ -959,6 +1150,22 @@ mod tests {
     #[test]
     fn sessions_and_new_forwards_are_accepted() {
         refusals(&cfg(&["-A", "-D", "1080", "-U", "5353:127.0.0.1:53", "-u", "0:127.0.0.1:53", "h", "echo", "hi"], "")).unwrap();
+    }
+
+    #[test]
+    fn predictive_echo_keyword() {
+        assert_eq!(predictive_echo(&cfg(&["-N", "h"], "")).unwrap(), Preference::Adaptive);
+        assert_eq!(predictive_echo(&cfg(&["-N", "h"], "PredictiveEcho never\n")).unwrap(), Preference::Never);
+        assert_eq!(predictive_echo(&cfg(&["-o", "PredictiveEcho=Always", "-N", "h"], "")).unwrap(), Preference::Always);
+        let e = refusals(&cfg(&["-N", "h"], "PredictiveEcho sometimes\n")).unwrap_err();
+        assert!(e.contains("PredictiveEcho: expected adaptive, always or never"), "{e}");
+    }
+
+    #[test]
+    fn cursor_reports_are_found_among_keystrokes() {
+        assert_eq!(cursor_report(b"ab\x1b[12;40Rcd"), Some(((11, 39), 2, 8)));
+        assert_eq!(cursor_report(b"\x1b[A\x1b[3;1R"), Some(((2, 0), 3, 6)));
+        assert_eq!(cursor_report(b"\x1b[12;40"), None);
     }
 
     #[test]

@@ -27,11 +27,13 @@ ssh3-config = { path = "../ssh3-config" }
 ssh3-core = { path = "../ssh3-core" }
 ssh3-keys = { path = "../ssh3-keys" }
 ssh3-session = { path = "../ssh3-session" }
+ssh3-term = { path = "../ssh3-term" }
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1", features = ["full"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 sha2 = "0.10"

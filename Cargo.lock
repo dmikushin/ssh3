@@ -2122,11 +2122,13 @@ dependencies = [
  "ssh3-core",
  "ssh3-keys",
  "ssh3-session",
+ "ssh3-term",
  "tikv-jemallocator",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

@@ -1237,3 +1237,140 @@ fn cursor_style(out: &mut Out, style: Option<CursorStyle>) {
     };
     let _ = write!(out, "\x1b[{code} q");
 }
+
+// ------------------------------------------------- client overlays (§5.2)
+
+/// A cell's renditions (SGR state), opaque outside the crate: the client's
+/// predictive echo copies them between cells and compares them.
+#[derive(Clone, PartialEq)]
+pub struct Rendition(Attrs);
+
+impl std::fmt::Debug for Rendition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rendition({:?}/{:?}/{:?})", self.0.fg, self.0.bg, self.0.flags)
+    }
+}
+
+/// One visible cell, as the client's predictive echo sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellView {
+    pub ch: char,
+    /// Carries combining characters.
+    pub combining: bool,
+    /// A wide character or one of its spacers.
+    pub wide: bool,
+    pub rendition: Rendition,
+}
+
+impl CellView {
+    pub(crate) fn of(cell: &Cell) -> Self {
+        CellView {
+            ch: cell.c,
+            combining: cell.zerowidth().is_some_and(|z| !z.is_empty()),
+            wide: cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+            rendition: Rendition(Attrs::of(cell)),
+        }
+    }
+
+    /// Blank as mosh's `Cell::is_blank` (terminalframebuffer.h): a space or
+    /// nothing, whatever the renditions.
+    pub fn is_blank(&self) -> bool {
+        !self.combining && (self.ch == ' ' || self.ch == '\0' || self.ch == '\t')
+    }
+
+    /// Same text as `other` (mosh `contents_match`), renditions ignored.
+    pub fn contents_match(&self, other: &CellView) -> bool {
+        (self.is_blank() && other.is_blank()) || (self.ch == other.ch && self.combining == other.combining && !self.combining)
+    }
+}
+
+/// What to put in one cell of the client's terminal.
+#[derive(Clone, Debug)]
+pub enum Paint {
+    /// The emulator's own cell (removes an overlay).
+    Mirror,
+    /// A predicted character.
+    Glyph { ch: char, rendition: Rendition, underline: bool },
+}
+
+/// Why a terminal state cannot carry an overlay: painting and unpainting
+/// use only cursor positioning, SGR and printing, so every state those would
+/// change, or which changes what they do, rules it out.
+pub(crate) fn overlay_obstacle(term: &T, extra: &Extra) -> Option<&'static str> {
+    let mode = *term.mode();
+    let g = term.grid();
+    if mode.contains(TermMode::ALT_SCREEN) {
+        return Some("alternate screen");
+    }
+    if mode.contains(TermMode::ORIGIN) {
+        return Some("origin mode");
+    }
+    if mode.contains(TermMode::INSERT) {
+        return Some("insert mode");
+    }
+    if g.cursor.input_needs_wrap {
+        return Some("pending wrap");
+    }
+    if g.cursor.template.hyperlink().is_some() {
+        return Some("hyperlink pen");
+    }
+    if g.cursor.charsets[extra.active_charset] != StandardCharset::Ascii {
+        return Some("line-drawing charset");
+    }
+    if extra.unknown_private.get(&2026) == Some(&true) {
+        return Some("synchronized update in progress");
+    }
+    None
+}
+
+/// Bytes that put `cells` on a client terminal that shows this emulator's
+/// state (plus earlier paints of the same cells), then leave its cursor at
+/// `cursor` with the emulator's pen. None when the state or a cell rules
+/// painting out (see [`overlay_obstacle`]; cells must not be in the last
+/// column, where printing sets a pending wrap, nor wide).
+pub(crate) fn paint(term: &T, extra: &Extra, cells: &[(u16, u16, Paint)], cursor: (u16, u16)) -> Option<Vec<u8>> {
+    if overlay_obstacle(term, extra).is_some() {
+        return None;
+    }
+    let g = term.grid();
+    let (lines, cols) = (g.screen_lines(), g.columns());
+    if cursor.0 as usize >= lines || cursor.1 as usize >= cols {
+        return None;
+    }
+    let pen = Attrs::of(&g.cursor.template);
+    let mut r = Redraw::new(true, Out::writer(64 + cells.len() * (POS_MAX + CELL_MAX + OSC8_MAX)));
+    r.attrs = pen.clone();
+    r.out.extend_from_slice(b"\x1b[?2026h");
+    for (line, col, p) in cells {
+        let (l, c) = (*line as usize, *col as usize);
+        if l >= lines || c + 1 >= cols {
+            return None;
+        }
+        let mirror = &g[Line(l as i32)][Column(c)];
+        if mirror.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            return None;
+        }
+        r.goto(l, c);
+        match p {
+            Paint::Mirror => r.put(mirror),
+            Paint::Glyph { ch, rendition, underline } => {
+                if ch.width() != Some(1) {
+                    return None;
+                }
+                let mut a = rendition.0.clone();
+                if *underline {
+                    a.flags.insert(Flags::UNDERLINE);
+                }
+                r.sgr(&a);
+                r.hyperlink(None);
+                let mut buf = [0u8; 4];
+                r.out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            },
+        }
+    }
+    r.hyperlink(None);
+    r.sgr(&pen);
+    r.goto(cursor.0 as usize, cursor.1 as usize);
+    r.out.extend_from_slice(b"\x1b[?2026l");
+    Some(r.out.buf)
+}

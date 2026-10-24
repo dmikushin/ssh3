@@ -354,8 +354,9 @@ impl SessionShared {
         self.carrier.lock().unwrap().as_ref().is_some_and(|c| c._ctrl.try_send(m).is_ok())
     }
 
-    /// Smoothed RTT of the current carrier.
-    pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
+    /// Smoothed RTT of the current carrier (None while detached); read by
+    /// the client's predictive echo (SPEC §5.2).
+    pub fn rtt(&self) -> Option<std::time::Duration> {
         self.carrier.lock().unwrap().as_ref().map(|c| c.conn.rtt())
     }
 
