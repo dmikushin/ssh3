@@ -531,7 +531,10 @@ No protocol messages; the client alone, ported from mosh's
     → `ConnectFailed`); a host name without it never reaches a registration,
     so registering `localhost` or `github` cannot capture jumps to them.
   - `Register{label}` requires `permitlisten="<label>.peer:0"`, jumping to a
-    peer requires `permitopen="<label>.peer:0"` (OpenSSH option syntax).
+    peer requires `permitopen="<label>.peer:0"` (OpenSSH option syntax) —
+    one check, whatever port the client names (its ssh_config `Port`). The
+    gateway logs every refused registration or jump with user, key
+    fingerprint and target.
 - **Name ownership.** A name belongs to the (authenticated user, exact key)
   that registered it for as long as that registration's session lives
   (attached or lingering). The same owner may register it again from

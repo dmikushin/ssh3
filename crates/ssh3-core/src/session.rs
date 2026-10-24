@@ -690,15 +690,18 @@ impl SessionShared {
             (Role::Client, ChannelKind::PeerRelay { from }) => return self.accept_peer_relay(chan_id, from),
             (Role::Client, ChannelKind::AuthAgent) => return self.accept_agent(chan_id, peer_limit),
             (Role::Server, ChannelKind::DirectUdp { host, port }) => {
-                if !self.authz().allows_direct_tcp(&host, port) {
-                    return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
-                }
                 // Registered peers have their own namespace (SPEC §7.1):
                 // `ssh3 -J gw box.peer` reaches the peer registered as `box`,
                 // whatever port the client names; such a name never goes to
-                // DNS, and no other name ever reaches a registration.
+                // DNS, and no other name ever reaches a registration. Its one
+                // permission check is `permitopen="<label>.peer:0"`, in
+                // accept_jump_peer.
                 if crate::rendezvous::peer_target(&host).is_some() {
                     return self.accept_jump_peer(chan_id, host);
+                }
+                if !self.authz().allows_direct_tcp(&host, port) {
+                    tracing::warn!(user = %self.user, key = %crate::rendezvous::key_fingerprint(&self.owner_key), target = %format!("{host}:{port}"), "jump refused: not permitted by permitopen");
+                    return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
                 }
                 return self.accept_udp_channel(chan_id, host, port);
             }
