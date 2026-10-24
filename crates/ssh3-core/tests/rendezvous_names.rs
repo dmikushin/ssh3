@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use ssh3_core::auth::Signer;
 use ssh3_core::error::Error;
 use ssh3_core::msg::FailReason;
 use ssh3_core::path::{PathConfig, PathManager};
@@ -193,4 +194,30 @@ async fn registrations_are_capped_in_total() {
     // Re-registering a held name is not a new entry.
     reg.register_name("n3").await.unwrap();
     assert_eq!(gw.server.stats().peers_registered, 3);
+}
+
+/// Connecting to a registered peer is permitted by exactly one rule,
+/// `permitopen="<label>.peer:0"`, whatever port the client names (it names
+/// its ssh_config Port, e.g. 443): one check, not two with different ports.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_connection_is_permitted_by_label_peer_port_0() {
+    let (gw, ka, _) = gateway(fast_limits());
+    let p = peer();
+    let _reg = register(&p, &gw, &ka, &current_user(), "box").await.unwrap();
+    // The jumping client's key may open only box.peer.
+    let kc = user_key(33);
+    let ak = std::fs::read_to_string(&gw.authorized_keys).unwrap();
+    std::fs::write(&gw.authorized_keys, format!("{ak}permitopen=\"box.peer:0\" {}\n", kc.public_key().to_openssh().unwrap())).unwrap();
+    let c = ClientSession::connect(gw.opts(&kc), ssh3_core::udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap();
+    let path = c.jump("box.peer", 443).await.expect("permitopen=\"box.peer:0\" allows a jump to box.peer with Port 443");
+    let mut o = p.opts(&p.key);
+    o.server_addr = path.virt;
+    let _inner = tokio::time::timeout(BOUND, ClientSession::connect(path.inner_opts(o), path.socket())).await.expect("inner connect timed out").expect("inner connect to the peer");
+    // Any other target stays refused: another peer, a real host.
+    for (h, port) in [("other.peer", 443), ("localhost", 443)] {
+        match c.jump(h, port).await {
+            Err(Error::Refused(FailReason::Prohibited)) => {}
+            r => panic!("jump to {h}:{port} should be Prohibited, got {:?}", r.map(|_| ())),
+        }
+    }
 }

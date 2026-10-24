@@ -69,6 +69,14 @@ pub fn peer_target(host: &str) -> Option<std::result::Result<String, String>> {
     suffix.eq_ignore_ascii_case(PEER_SUFFIX).then(|| peer_label(label))
 }
 
+/// SHA-256 fingerprint of an OpenSSH public key blob, for logs.
+pub(crate) fn key_fingerprint(blob: &[u8]) -> String {
+    match ssh_key::PublicKey::from_bytes(blob) {
+        Ok(k) => k.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+        Err(_) => "<unparseable key>".into(),
+    }
+}
+
 /// Who registered a name: the authenticated user and the exact key.
 #[derive(Clone, PartialEq, Eq)]
 struct Owner {
@@ -280,6 +288,7 @@ impl SessionShared {
             Err(m) => return self.reply_ev(Message::ListenFail { req_id, reason: FailReason::BindFailed(m) }),
         };
         if !self.authz().allows_listen(&format!("{label}{PEER_SUFFIX}"), 0) {
+            tracing::warn!(user = %self.user, key = %key_fingerprint(&self.owner_key), peer = %label, "peer registration refused: not permitted (needs permitlisten=\"{label}{PEER_SUFFIX}:0\")");
             return self.reply_ev(Message::ListenFail { req_id, reason: FailReason::Prohibited });
         }
         let Some(rv) = self.rendezvous.lock().unwrap().clone() else {
@@ -309,6 +318,7 @@ impl SessionShared {
         };
         let name = format!("{label}{PEER_SUFFIX}");
         if !self.authz().allows_direct_tcp(&name, 0) {
+            tracing::warn!(user = %self.user, key = %key_fingerprint(&self.owner_key), target = %name, "peer connection refused: not permitted (needs permitopen=\"{name}:0\")");
             return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
         }
         let rv = self.rendezvous.lock().unwrap().clone();
