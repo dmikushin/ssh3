@@ -53,60 +53,84 @@ fn normalized(mut s: Snapshot) -> Snapshot {
     s
 }
 
+/// Full comparison, the REP character included wherever the emulator's
+/// state lets it be reproduced.
 fn diff(a: &Screen, b: &Screen) -> Vec<String> {
-    normalized(a.snapshot()).diff_with(&normalized(b.snapshot()), false)
+    let sa = a.snapshot();
+    let rep = sa.rep_reproducible();
+    normalized(sa).diff_with(&normalized(b.snapshot()), rep)
 }
 
-/// Paints random predictions at `k` cut points of `bytes` and removes them.
-/// Returns how many cut points carried an overlay.
+/// Two emulators fed the same stream: the emulator (A) and the client
+/// terminal (B). At about `points` cut points an overlay of random
+/// predictions is painted on B and taken back; B must then equal A, and
+/// keep equal while both read on (hidden state the overlay touched would
+/// show later). Returns how many cut points carried an overlay.
 fn check(name: &str, bytes: &[u8], cols: u16, rows: u16, points: usize, seed: u64) -> usize {
     let mut rng = Rng(seed);
     let mut checked = 0;
     let step = (bytes.len() / points).max(1);
+    let (mut a, mut b) = (Screen::new(cols, rows), Screen::new(cols, rows));
     let mut k = 0;
-    while k <= bytes.len() {
-        let mut a = Screen::new(cols, rows);
-        a.feed(&bytes[..k]);
-        if a.overlay_obstacle().is_some() {
-            k += step;
+    loop {
+        if a.overlay_obstacle().is_none() {
+            overlay_once(&a, &mut b, &mut rng, &format!("{name}@{k}"));
+            checked += 1;
+        }
+        let d = diff(&a, &b);
+        assert!(d.is_empty(), "{name}@{k}: the client differs:\n{}", d.join("\n"));
+        if k == bytes.len() {
+            return checked;
+        }
+        let next = (k + step).min(bytes.len());
+        a.feed(&bytes[k..next]);
+        b.feed(&bytes[k..next]);
+        k = next;
+    }
+}
+
+fn overlay_once(a: &Screen, b: &mut Screen, rng: &mut Rng, at: &str) {
+    let (c, r) = a.size();
+    let mut cells: Vec<(u16, u16, Paint)> = Vec::new();
+    let mut want = Vec::new();
+    for _ in 0..1 + rng.below(8) {
+        let (l, x) = (rng.below(r as u64) as u16, rng.below(c as u64 - 1) as u16);
+        if a.cell(l, x).wide || want.iter().any(|&(wl, wx, _)| (wl, wx) == (l, x)) {
             continue;
         }
-        let mut b = Screen::new(cols, rows);
-        b.feed(&bytes[..k]);
-        let (c, r) = a.size();
-        let mut cells: Vec<(u16, u16, Paint)> = Vec::new();
-        let mut want = Vec::new();
-        for _ in 0..1 + rng.below(8) {
-            let (l, x) = (rng.below(r as u64) as u16, rng.below(c as u64 - 1) as u16);
+        // Some cells are only taken back (a status line over the bottom
+        // row reaches the last column).
+        if rng.below(4) == 0 {
+            let x = if rng.below(2) == 0 { c - 1 } else { x };
             if a.cell(l, x).wide || want.iter().any(|&(wl, wx, _)| (wl, wx) == (l, x)) {
                 continue;
             }
-            let ch = (b'a' + rng.below(26) as u8) as char;
-            let like = a.cell(rng.below(r as u64) as u16, rng.below(c as u64) as u16).rendition;
-            cells.push((l, x, Paint::Glyph { ch, rendition: like, underline: rng.below(2) == 0 }));
-            want.push((l, x, ch));
+            cells.push((l, x, Paint::Mirror));
+            want.push((l, x, a.cell(l, x).ch));
+            continue;
         }
-        let cursor = (rng.below(r as u64) as u16, rng.below(c as u64) as u16);
-        let paint = a.paint(&cells, cursor).unwrap_or_else(|| panic!("{name}@{k}: paint refused in a state without obstacle"));
-        b.feed(&paint);
-        for &(l, x, ch) in &want {
-            assert_eq!(b.cell(l, x).ch, ch, "{name}@{k}: predicted {ch:?} not shown at ({l},{x})");
-        }
-        assert_eq!(b.cursor(), cursor, "{name}@{k}: overlay cursor not placed");
-        let back: Vec<_> = want.iter().map(|&(l, x, _)| (l, x, Paint::Mirror)).collect();
-        let unpaint = a.paint(&back, a.cursor()).unwrap_or_else(|| panic!("{name}@{k}: unpaint refused"));
-        b.feed(&unpaint);
-        let d = diff(&a, &b);
-        assert!(d.is_empty(), "{name}@{k}: after unpaint the client differs:\n{}", d.join("\n"));
-        // Both continue: hidden state the overlay touched would show now.
-        a.feed(&bytes[k..]);
-        b.feed(&bytes[k..]);
-        let d = diff(&a, &b);
-        assert!(d.is_empty(), "{name}@{k}: after the rest of the stream the client differs:\n{}", d.join("\n"));
-        checked += 1;
-        k += step;
+        let ch = (b'a' + rng.below(26) as u8) as char;
+        let like = a.cell(rng.below(r as u64) as u16, rng.below(c as u64) as u16).rendition;
+        cells.push((l, x, Paint::Glyph { ch, rendition: like, underline: rng.below(2) == 0 }));
+        want.push((l, x, ch));
     }
-    checked
+    let cursor = (rng.below(r as u64) as u16, rng.below(c as u64) as u16);
+    // A mirror cell in the last column of a wrapped row is refused; that
+    // is the documented rule, not a failure.
+    let Some(paint) = a.paint(&cells, cursor) else {
+        assert!(cells.iter().any(|&(_, x, _)| x == c - 1), "{at}: paint refused in a state without obstacle");
+        return;
+    };
+    b.feed(&paint);
+    for &(l, x, ch) in &want {
+        assert_eq!(b.cell(l, x).ch, ch, "{at}: {ch:?} not shown at ({l},{x})");
+    }
+    assert_eq!(b.cursor(), cursor, "{at}: overlay cursor not placed");
+    let back: Vec<_> = want.iter().map(|&(l, x, _)| (l, x, Paint::Mirror)).collect();
+    let unpaint = a.paint(&back, a.cursor()).unwrap_or_else(|| panic!("{at}: unpaint refused"));
+    b.feed(&unpaint);
+    let d = diff(a, b);
+    assert!(d.is_empty(), "{at}: after unpaint the client differs:\n{}", d.join("\n"));
 }
 
 #[test]
@@ -125,8 +149,7 @@ fn paint_then_unpaint_restores_the_emulator_state() {
 #[test]
 fn obstacles_refuse_painting() {
     for (setup, why) in [
-        (&b"\x1b[?1049h"[..], "alternate screen"),
-        (b"\x1b[?6h", "origin mode"),
+        (&b"\x1b[?6h"[..], "origin mode"),
         (b"\x1b[4h", "insert mode"),
         (b"\x1b(0", "line-drawing charset"),
         (b"\x1b]8;;http://x\x1b\\", "hyperlink pen"),
@@ -138,6 +161,31 @@ fn obstacles_refuse_painting() {
         assert_eq!(s.overlay_obstacle(), Some(why), "{setup:?}");
         assert!(s.paint(&[(0, 0, Paint::Mirror)], (0, 0)).is_none(), "{setup:?} painted");
     }
-    let s = Screen::new(80, 24);
-    assert!(s.paint(&[(0, 79, Paint::Mirror)], (0, 0)).is_none(), "last column painted");
+    let mut s = Screen::new(80, 24);
+    let r = s.pen();
+    assert!(s.paint(&[(0, 79, Paint::Glyph { ch: 'x', rendition: r, underline: false })], (0, 0)).is_none(), "glyph in the last column");
+    // A mirror cell in the last column only while its row does not wrap.
+    assert!(s.paint(&[(0, 79, Paint::Mirror)], (0, 0)).is_some());
+    s.feed(&[b'w'; 81]);
+    assert!(s.paint(&[(0, 79, Paint::Mirror)], (1, 1)).is_none(), "last cell of a wrapped row");
+    // The alternate screen carries overlays (editors in insert mode).
+    s.feed(b"\x1b[?1049h");
+    assert_eq!(s.overlay_obstacle(), None);
+}
+
+/// REP after an overlay repeats the program's last character.
+#[test]
+fn rep_after_a_paint_repeats_the_programs_character() {
+    let mut a = Screen::new(80, 24);
+    a.feed(b"$ a");
+    let mut b = Screen::new(80, 24);
+    b.feed(b"$ a");
+    let pen = a.pen();
+    b.feed(&a.paint(&[(0, 3, Paint::Glyph { ch: 'z', rendition: pen, underline: false })], (0, 4)).unwrap());
+    b.feed(&a.paint(&[(0, 3, Paint::Mirror)], a.cursor()).unwrap());
+    a.feed(b"\x1b[2b");
+    b.feed(b"\x1b[2b");
+    assert_eq!((b.cell(0, 3).ch, b.cell(0, 4).ch), ('a', 'a'), "REP repeated the painted character");
+    let d = diff(&a, &b);
+    assert!(d.is_empty(), "{}", d.join("\n"));
 }

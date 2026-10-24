@@ -499,7 +499,9 @@ fn spawn_on_pty(mut cmd: Command, pty: &Pty, name: &'static str) -> Proc {
     Proc { child: cmd.spawn().unwrap(), name }
 }
 
-/// Everything the master side has produced so far, read by a thread.
+/// Everything the master side has produced so far, read by a thread. It
+/// answers the client's cursor position query (DSR 6) as a terminal does:
+/// these tests start on a fresh pty, whose cursor is at 1;1.
 struct Screen {
     rx: mpsc::Receiver<Vec<u8>>,
     text: String,
@@ -508,10 +510,14 @@ struct Screen {
 impl Screen {
     fn new(master: &std::fs::File) -> Self {
         let mut m = master.try_clone().unwrap();
+        let mut w = master.try_clone().unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut b = [0u8; 4096];
             while let Ok(n) = m.read(&mut b) {
+                if b[..n].windows(4).any(|q| q == b"\x1b[6n") {
+                    let _ = w.write_all(b"\x1b[1;1R");
+                }
                 if n == 0 || tx.send(b[..n].to_vec()).is_err() {
                     return;
                 }
@@ -581,7 +587,11 @@ fn pty_exec_output_starts_with_the_command_output() {
     let mut c = spawn_on_pty(env.cmd("user_key", &["-t", "t", "echo first-bytes"]), &pty, "ssh3");
     assert_eq!(c.wait_exit(DEADLINE).code(), Some(0), "screen: {:?}", screen.text);
     screen.wait_for("Connection to 127.0.0.1 closed.", DEADLINE);
-    assert!(screen.text.starts_with("first-bytes\r\n"), "first output bytes: {:?}", screen.text);
+    // The client asks its own terminal for the cursor position (DSR 6,
+    // for the mirror of SPEC §5.2); that goes to the local terminal, not
+    // to the remote pty.
+    let text = screen.text.strip_prefix("\x1b[6n").unwrap_or(&screen.text);
+    assert!(text.starts_with("first-bytes\r\n"), "first output bytes: {:?}", screen.text);
 }
 
 #[test]
@@ -1141,6 +1151,7 @@ struct Term {
     rx: mpsc::Receiver<Vec<u8>>,
     master: std::fs::File,
     model: ssh3_term::Screen,
+    raw: Vec<u8>,
 }
 
 impl Term {
@@ -1155,7 +1166,7 @@ impl Term {
                 }
             }
         });
-        Term { rx, master: pty.master.try_clone().unwrap(), model: ssh3_term::Screen::new(cols, rows) }
+        Term { rx, master: pty.master.try_clone().unwrap(), model: ssh3_term::Screen::new(cols, rows), raw: Vec::new() }
     }
 
     /// Takes in whatever arrived within `wait`; false if nothing did.
@@ -1166,6 +1177,7 @@ impl Term {
             self.master.write_all(format!("\x1b[{};{}R", l + 1, c + 1).as_bytes()).unwrap();
         }
         self.model.feed(&b);
+        self.raw.extend_from_slice(&b);
         true
     }
 
@@ -1174,7 +1186,11 @@ impl Term {
         let end = Instant::now() + within;
         while !pred(&self.model) {
             let left = end.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "terminal never showed {what} within {within:?}; cursor {:?}", self.model.cursor());
+            if left.is_zero() {
+                let dump = PathBuf::from(std::env::var("HOME").unwrap()).join("scratch/ssh-udp/bins-tests/term-dump.bin");
+                let _ = std::fs::write(&dump, &self.raw);
+                panic!("terminal never showed {what} within {within:?}; cursor {:?}; raw output in {}", self.model.cursor(), dump.display());
+            }
             self.pump(left);
         }
         Instant::now()
@@ -1254,6 +1270,141 @@ fn predictive_echo_shows_keystrokes_before_the_echo() {
     let median = |v: &[Duration]| v[v.len() / 2];
     assert!(median(&with) < Duration::from_millis(20), "with prediction: median {:?} ({with:?})", median(&with));
     assert!(without[0] >= Duration::from_millis(180), "without prediction faster than the RTT: {without:?}");
+}
+
+/// The emulator state of `bytes` compared with the local terminal, REP
+/// included where reproducible; DECSET 2026 left reset by the overlay's
+/// bracket counts as never set.
+fn screen_diff(server: &ssh3_term::Screen, local: &ssh3_term::Screen) -> Vec<String> {
+    let norm = |mut s: ssh3_term::Snapshot| {
+        if s.unknown_private_modes.get(&2026) == Some(&false) {
+            s.unknown_private_modes.remove(&2026);
+        }
+        s
+    };
+    let a = server.snapshot();
+    let rep = a.rep_reproducible();
+    norm(a).diff_with(&norm(local.snapshot()), rep)
+}
+
+/// "Last contact" on a pty session: drawn over the bottom row while the
+/// server is silent, and when contact returns the row is drawn again from
+/// the mirror — the terminal equals the server's screen, bottom row
+/// included (it used to stay blank).
+#[test]
+fn status_line_clear_restores_the_bottom_row() {
+    let env = Env::new();
+    let cfg = env.dir.join("ssh_config.contact-pty");
+    std::fs::write(&cfg, format!("{}  ContactWarn 2s\n", std::fs::read_to_string(env.client_config("user_key")).unwrap())).unwrap();
+    let pty = openpty(24, 80);
+    let mut term = Term::new(&pty, 24, 80);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    cmd.arg("-F").arg(&cfg).args(["-t", "t", "seq 1 23; printf 'bottom row text'; exec cat"]);
+    let mut c = spawn_on_pty(cmd, &pty, "ssh3");
+    let mut server = ssh3_term::Screen::new(80, 24);
+    for i in 1..=23 {
+        server.feed(format!("{i}\r\n").as_bytes());
+    }
+    server.feed(b"bottom row text");
+    term.until("the server's screen", DEADLINE, |s| screen_diff(&server, s).is_empty());
+    let pid = env.server.child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    term.until("the 'Last contact' line", Duration::from_secs(5), |s| s.cell(23, 1).ch == 's' && s.cell(23, 7).ch == 'L');
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    // Cleared once contact returns. ContactWarn is twice the 1 s liveness
+    // probe interval (the client refuses less), so an idle session does not
+    // show the line at all (at 300 ms it came and went every second, and
+    // under load the clear was missed — the flake of the first version).
+    term.until("the server's screen again", DEADLINE, |s| screen_diff(&server, s).is_empty());
+    term.master.write_all(b"\x04").unwrap();
+    assert_eq!(c.wait_exit(DEADLINE).code(), Some(0));
+}
+
+/// A recording (tests/fixtures/vim_insert.steps, made by record_steps.py
+/// from nvim 0.12 with `-u NONE`): startup, then per keystroke the output
+/// that followed it.
+fn steps() -> Vec<(u8, Vec<u8>)> {
+    let d = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vim_insert.steps")).unwrap();
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < d.len() {
+        let n = u32::from_be_bytes(d[i + 1..i + 5].try_into().unwrap()) as usize;
+        v.push((d[i], d[i + 5..i + 5 + n].to_vec()));
+        i += 5 + n;
+    }
+    v
+}
+
+/// An editor in insert mode on the alternate screen over a 200 ms RTT
+/// link: the server side replays the recorded nvim session keystroke by
+/// keystroke. Insert-mode typing is predicted once an echo confirmed the
+/// epoch; after ESC (normal mode) the next keystrokes are not shown before
+/// the server answers; the terminal ends equal to the server's screen.
+#[test]
+fn predictive_echo_in_editor_insert_mode() {
+    let env = Env::new();
+    let rport = delay_relay(env.port, Duration::from_millis(100));
+    let host_pub = std::fs::read_to_string(env.dir.join("host_key.pub")).unwrap();
+    std::fs::write(env.dir.join("known_hosts.relay"), format!("[127.0.0.1]:{rport} {host_pub}")).unwrap();
+    let cfg = env.dir.join("ssh_config.vim");
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host t\n  HostName 127.0.0.1\n  Port {rport}\n  User {user}\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {d}/known_hosts.relay\n  GlobalKnownHostsFile none\n  PredictiveEcho always\n",
+            user = me(),
+            d = env.dir.display()
+        ),
+    )
+    .unwrap();
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let remote = format!("python3 {fixtures}/replay_steps.py {fixtures}/vim_insert.steps");
+    let steps = steps();
+    let pty = openpty(24, 80);
+    let mut term = Term::new(&pty, 24, 80);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    cmd.arg("-F").arg(&cfg).args(["-t", "t", &remote]);
+    let mut c = spawn_on_pty(cmd, &pty, "ssh3");
+    let mut server = ssh3_term::Screen::new(80, 24);
+    server.feed(&steps[0].1);
+    term.until("the editor's start screen", DEADLINE, |s| s.alternate_screen() && s.cell(1, 0).ch == '~');
+    term.settle(Duration::from_millis(300));
+    let mut fast = Vec::new();
+    for pair in steps[1..].chunks(2) {
+        let (key, out) = (&pair[0].1, &pair[1].1);
+        if key == b"q" {
+            break;
+        }
+        let at = term.model.cursor();
+        let sent = Instant::now();
+        term.master.write_all(key).unwrap();
+        let ch = key[0] as char;
+        if "elowrd".contains(ch) {
+            // Insert mode, epoch confirmed by the echo of 'h': shown at
+            // once at the cursor.
+            let seen = term.until(&format!("{ch:?} at {at:?}"), DEADLINE, |s| s.cell(at.0, at.1).ch == ch);
+            fast.push((seen - sent, ch));
+        }
+        if key == b"x" || key == b":" {
+            // Normal mode after ESC: nothing is predicted at the cursor.
+            let end = sent + Duration::from_millis(150);
+            while Instant::now() < end {
+                term.pump(Duration::from_millis(10));
+                assert_ne!(term.model.cell(at.0, at.1).ch, ch, "normal-mode {ch:?} shown before the server answered");
+            }
+        }
+        server.feed(out);
+        // Long enough for the echo and for a contradicted prediction to be
+        // judged (2·SRTT + 100 ms).
+        term.settle(Duration::from_millis(if key == b"i" || key == b"\x1b" { 700 } else { 300 }));
+        let d = screen_diff(&server, &term.model);
+        assert!(d.is_empty(), "after {key:?} the local terminal differs from the server's screen:\n{}", d.join("\n"));
+    }
+    fast.sort();
+    eprintln!("insert-mode keystroke to display over 200 ms RTT: {fast:?}");
+    assert_eq!(fast.len(), 9);
+    assert!(fast[fast.len() / 2].0 < Duration::from_millis(20), "insert mode not predicted: {fast:?}");
+    term.master.write_all(b"q!\r").unwrap();
+    assert_eq!(c.wait_exit(DEADLINE).code(), Some(0));
 }
 
 /// A healthy idle link never shows "Last contact": the liveness probes

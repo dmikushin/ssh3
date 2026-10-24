@@ -455,10 +455,11 @@ No protocol messages; the client alone, ported from mosh's
   with echo off is therefore never shown.
 - **Judging.** The mirror showing the predicted cell (and it was not there
   before) confirms at once. A mismatch counts only after `2·SRTT + 100 ms`
-  from the keystroke AND after the server was heard from since `SRTT/2`
-  after it (`last_contact`); a silent server keeps predictions pending, so
-  mosh's glitch triggers apply (shown after 250 ms pending, underlined
-  after 5 s). A wrong prediction in a confirmed epoch resets all
+  from the keystroke AND after the server was heard from (acks, probe
+  replies or output) since `SRTT/2` after it; a silent server keeps
+  predictions pending, so mosh's glitch triggers apply (shown after 250 ms
+  pending, underlined after 5 s). Predictions are looked at every 50 ms
+  while any exist. A wrong prediction in a confirmed epoch resets all
   predictions; in a tentative one it kills that epoch (mosh `kill_epoch`).
 - **Display.** One task owns the local terminal. Before writing server
   output it removes the overlay by repainting the overlaid cells from the
@@ -466,20 +467,30 @@ No protocol messages; the client alone, ported from mosh's
   then writes the output, feeds the mirror, judges, and paints the new
   overlay. Painting uses only CUP, SGR and printing inside a DECSET 2026
   bracket and is refused (no predictions) in states those would disturb:
-  alternate screen, origin or insert mode, pending wrap, hyperlink pen,
-  line-drawing charset in GL, an open synchronized update, the parser
-  inside a sequence, wide cells, the last column.
+  origin or insert mode, pending wrap, hyperlink pen, line-drawing charset
+  in GL, an open synchronized update, the parser inside a sequence, wide
+  cells, a glyph in the last column. The alternate screen is allowed (an
+  editor in insert mode; mosh predicts on any screen, terminaloverlay.cc
+  621-828, and ESC makes the next keystroke tentative, cc:805-807).
+  Every paint ends by printing the program's last character again where
+  that leaves no trace, so REP (CSI b) repeats it and not a painted one.
+- **Status line.** For a raw pty session the "Last contact" line is drawn
+  by the same task over the bottom row (all columns but the last), and
+  cleared by drawing those cells again from the mirror — the row shows the
+  server's content again instead of a blank.
 - **Modes** (`PredictiveEcho` in ssh_config, an ssh3 keyword):
-  `adaptive` (default; shell sessions only, shown when SRTT/2 > 30 ms, off
-  again at ≤ 20 ms when nothing is shown; underlined when SRTT/2 > 80 ms),
-  `always` (any pty session), `never`.
-- **Measured** (e2e, `cat` over a 200 ms RTT relay): keystroke to display
-  0.8–1.1 ms with prediction, 203–206 ms without; the local terminal then
+  `adaptive` (default; predictions in shell sessions only, shown when
+  SRTT/2 > 30 ms, off again at ≤ 20 ms when nothing is shown; underlined
+  when SRTT/2 > 80 ms), `always` (any pty session), `never` (no mirror
+  either: no cursor query, the status line clears to a blank row).
+- **Measured** (e2e over a 200 ms RTT relay): `cat`, keystroke to display
+  0.8–1.2 ms with prediction, 203–209 ms without; a recorded nvim 0.12
+  insert-mode session replayed by the server, 0.8–1.8 ms for all nine
+  keystrokes after the confirming one, and normal-mode keystrokes after
+  ESC not shown before the server answers. In both the local terminal
   equals the server's screen cell for cell.
-- **Not reproduced from mosh:** prediction while the remote is on the
-  alternate screen (vim insert mode), wide characters, overwrite mode,
-  scrolling prediction on the last row. REP (CSI b) after an overlay
-  repeats the last painted character, not the program's.
+- **Not reproduced from mosh:** wide characters, overwrite mode, scrolling
+  prediction on the last row.
 
 ## 6. UDP forwarding and datagrams
 

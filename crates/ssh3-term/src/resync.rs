@@ -1038,9 +1038,13 @@ impl Redraw {
 
     fn preceding_char(&mut self, g: &Grid<Cell>, c: char) {
         let cell = |l: usize, x: usize| &g[Line(l as i32)][Column(x)];
-        let Some((l, start, bg)) = rep_slot(g.screen_lines(), g.columns(), &cell, c) else {
-            return;
-        };
+        if let Some(slot) = rep_slot(g.screen_lines(), g.columns(), &cell, c) {
+            self.print_and_erase(slot, c);
+        }
+    }
+
+    /// Prints `c` over the blank run `slot` (from [`rep_slot`]) and erases it.
+    fn print_and_erase(&mut self, (l, start, bg): (usize, usize, Color), c: char) {
         let width = c.width().unwrap_or(1);
         let mut attrs = Attrs::default();
         attrs.bg = bg;
@@ -1299,9 +1303,6 @@ pub enum Paint {
 pub(crate) fn overlay_obstacle(term: &T, extra: &Extra) -> Option<&'static str> {
     let mode = *term.mode();
     let g = term.grid();
-    if mode.contains(TermMode::ALT_SCREEN) {
-        return Some("alternate screen");
-    }
     if mode.contains(TermMode::ORIGIN) {
         return Some("origin mode");
     }
@@ -1325,9 +1326,12 @@ pub(crate) fn overlay_obstacle(term: &T, extra: &Extra) -> Option<&'static str> 
 
 /// Bytes that put `cells` on a client terminal that shows this emulator's
 /// state (plus earlier paints of the same cells), then leave its cursor at
-/// `cursor` with the emulator's pen. None when the state or a cell rules
-/// painting out (see [`overlay_obstacle`]; cells must not be in the last
-/// column, where printing sets a pending wrap, nor wide).
+/// `cursor` with the emulator's pen, and REP repeating the program's last
+/// character again. None when the state or a cell rules painting out (see
+/// [`overlay_obstacle`]; no wide cells; a glyph never in the last column; a
+/// mirror cell there only when its row does not wrap — printing it sets a
+/// pending wrap, which the final positioning ends, but would clear the
+/// wrap flag).
 pub(crate) fn paint(term: &T, extra: &Extra, cells: &[(u16, u16, Paint)], cursor: (u16, u16)) -> Option<Vec<u8>> {
     if overlay_obstacle(term, extra).is_some() {
         return None;
@@ -1343,11 +1347,15 @@ pub(crate) fn paint(term: &T, extra: &Extra, cells: &[(u16, u16, Paint)], cursor
     r.out.extend_from_slice(b"\x1b[?2026h");
     for (line, col, p) in cells {
         let (l, c) = (*line as usize, *col as usize);
-        if l >= lines || c + 1 >= cols {
+        if l >= lines || c >= cols {
             return None;
         }
         let mirror = &g[Line(l as i32)][Column(c)];
         if mirror.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            return None;
+        }
+        let last = c + 1 == cols;
+        if last && (matches!(p, Paint::Glyph { .. }) || mirror.flags.contains(Flags::WRAPLINE)) {
             return None;
         }
         r.goto(l, c);
@@ -1365,6 +1373,36 @@ pub(crate) fn paint(term: &T, extra: &Extra, cells: &[(u16, u16, Paint)], cursor
                 r.hyperlink(None);
                 let mut buf = [0u8; 4];
                 r.out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            },
+        }
+    }
+    // REP repeats the last character printed: the program's, not one just
+    // painted. It is printed again where that leaves no trace (as in the
+    // redraw's final state, but never via the line-drawing set, which would
+    // designate G0).
+    if !cells.is_empty()
+        && let Some(ch) = extra.last_char
+    {
+        // Cells showing a painted glyph are not the mirror's: never used.
+        let glyph = |l: usize, x: usize| cells.iter().any(|(pl, px, p)| (*pl as usize, *px as usize) == (l, x) && matches!(p, Paint::Glyph { .. }));
+        let busy = Cell { c: '\u{fffd}', ..Cell::default() };
+        let at = |l: usize, x: usize| if glyph(l, x) { &busy } else { &g[Line(l as i32)][Column(x)] };
+        let plain = |l: usize, x: usize| {
+            let c = at(l, x);
+            match c.zerowidth().and_then(<[char]>::last) {
+                Some(&z) => z == ch,
+                None => c.c == ch,
+            }
+        };
+        match rep_cell(lines, cols, &at, ch).filter(|&(l, x)| plain(l, x)) {
+            Some((l, x)) => {
+                r.goto(l, x);
+                r.put(at(l, x));
+            },
+            None => {
+                if let Some(slot) = rep_slot(lines, cols, &at, ch) {
+                    r.print_and_erase(slot, ch);
+                }
             },
         }
     }

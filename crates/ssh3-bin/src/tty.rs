@@ -138,50 +138,65 @@ pub enum StatusLine {
 }
 
 impl StatusLine {
-    pub fn show(self, silent_for: Duration) {
-        let msg = format!("ssh3: Last contact {} s ago", silent_for.as_secs());
-        let s = match self {
+    pub fn message(silent_for: Duration) -> String {
+        format!("ssh3: Last contact {} s ago", silent_for.as_secs())
+    }
+
+    /// Bytes that draw the line (stderr's terminal size).
+    pub fn show_bytes(self, silent_for: Duration) -> String {
+        let msg = Self::message(silent_for);
+        match self {
             StatusLine::Cooked => format!("\r\x1b[K{msg}"),
             StatusLine::BottomRow => {
                 let rows = size(libc::STDERR_FILENO).map_or(24, |s| s.rows);
                 format!("\x1b7\x1b[{rows};1H\x1b[7m {msg} \x1b[0m\x1b[K\x1b8")
             }
-        };
-        let mut e = std::io::stderr();
-        let _ = e.write_all(s.as_bytes());
-        let _ = e.flush();
+        }
     }
 
-    pub fn clear(self) {
-        let s = match self {
+    /// Bytes that remove it; on the bottom row that leaves the row blank
+    /// (used only when no mirror of the remote screen exists to restore it
+    /// from, see `predict::Display::status_clear`).
+    pub fn clear_bytes(self) -> String {
+        match self {
             StatusLine::Cooked => "\r\x1b[K".to_string(),
             StatusLine::BottomRow => {
                 let rows = size(libc::STDERR_FILENO).map_or(24, |s| s.rows);
                 format!("\x1b7\x1b[{rows};1H\x1b[K\x1b8")
             }
-        };
+        }
+    }
+
+    pub fn show(self, silent_for: Duration) {
         let mut e = std::io::stderr();
-        let _ = e.write_all(s.as_bytes());
+        let _ = e.write_all(self.show_bytes(silent_for).as_bytes());
+        let _ = e.flush();
+    }
+
+    pub fn clear(self) {
+        let mut e = std::io::stderr();
+        let _ = e.write_all(self.clear_bytes().as_bytes());
         let _ = e.flush();
     }
 }
 
-/// Shows the status line while the server has been silent for at least
-/// `warn`, refreshing once a second while shown, and clears it when contact
-/// returns. Sleeps until the next deadline in between — no polling.
-pub async fn contact_watch(last_contact: impl Fn() -> std::time::Instant, warn: Duration, line: StatusLine) {
+/// Shows the status line (`draw(Some(silence))`) while the server has been
+/// silent for at least `warn`, refreshing once a second while shown, and
+/// clears it (`draw(None)`) when contact returns. Sleeps until the next
+/// deadline in between — no polling.
+pub async fn contact_watch(last_contact: impl Fn() -> std::time::Instant, warn: Duration, mut draw: impl FnMut(Option<Duration>)) {
     let mut shown = false;
     loop {
         let silent = last_contact().elapsed();
         if silent < warn {
             if shown {
-                line.clear();
+                draw(None);
                 shown = false;
             }
             tokio::time::sleep(warn - silent).await;
             continue;
         }
-        line.show(silent);
+        draw(Some(silent));
         shown = true;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

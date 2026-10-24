@@ -721,7 +721,24 @@ fn status_watch(c: &ClientConfig, sess: &ClientSession, line: StatusLine) -> Opt
     }
     let warn = contact_warn(c).expect("validated by refusals()");
     let shared = sess.shared.clone();
-    Some(tokio::spawn(tty::contact_watch(move || shared.last_contact(), warn, line)))
+    Some(tokio::spawn(tty::contact_watch(move || shared.last_contact(), warn, move |s| match s {
+        Some(d) => line.show(d),
+        None => line.clear(),
+    })))
+}
+
+/// The "Last contact" watcher of a pty session whose terminal belongs to
+/// the display task: the line goes through it, so clearing it restores the
+/// bottom row from the mirror.
+fn status_watch_display(c: &ClientConfig, sess: &ClientSession, tx: tokio::sync::mpsc::Sender<Ev>) -> Option<tokio::task::JoinHandle<()>> {
+    if !std::io::stderr().is_terminal() || c.log_level <= LogLevel::Quiet {
+        return None;
+    }
+    let warn = contact_warn(c).expect("validated by refusals()");
+    let shared = sess.shared.clone();
+    Some(tokio::spawn(tty::contact_watch(move || shared.last_contact(), warn, move |s| {
+        let _ = tx.try_send(Ev::Status(s));
+    })))
 }
 
 fn gave_up_message(c: &ClientConfig) -> String {
@@ -870,6 +887,8 @@ enum Ev {
     Resize(u16, u16),
     /// A prediction timer (internal to the display task).
     Tick,
+    /// "Last contact": show after this much silence, or clear (None).
+    Status(Option<Duration>),
 }
 
 /// Asks the local terminal where its cursor is (DSR 6) and waits at most
@@ -948,6 +967,10 @@ fn display_task(mut d: Display, link: impl Fn() -> (Option<Duration>, std::time:
                 Some(Ev::Out(b)) => d.output(&b, now),
                 Some(Ev::In(b)) => d.input(&b, now),
                 Some(Ev::Tick) => d.tick(now),
+                Some(Ev::Status(Some(silent))) => {
+                    d.status_show(&StatusLine::message(silent)).unwrap_or_else(|| StatusLine::BottomRow.show_bytes(silent).into_bytes())
+                },
+                Some(Ev::Status(None)) => d.status_clear().unwrap_or_else(|| StatusLine::BottomRow.clear_bytes().into_bytes()),
                 Some(Ev::Resize(c, r)) => d.resize(c, r),
             };
             if !bytes.is_empty() && (stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err()) {
@@ -1032,10 +1055,13 @@ async fn session(c: &ClientConfig, sess: &ClientSession) -> ExitCode {
     };
     // Predictive echo (SPEC §5.2): on a raw local terminal; adaptive mode
     // only for interactive shells, `always` for any pty session.
+    // The mirror also serves the "Last contact" line (restored from it when
+    // cleared), so it exists for every raw pty session unless
+    // `PredictiveEcho never`; predictions themselves are on per `pref`.
     let pref = predictive_echo(c).expect("validated by refusals()");
     let interactive = matches!(spec_command, Command::Shell);
-    let echo = (raw.is_some() && std::io::stdout().is_terminal() && !c.stdin_null)
-        && (pref == Preference::Always || (pref == Preference::Adaptive && interactive));
+    let echo = raw.is_some() && std::io::stdout().is_terminal() && !c.stdin_null && pref != Preference::Never;
+    let pref = if pref == Preference::Adaptive && !interactive { Preference::Never } else { pref };
     let (display, typeahead) = if echo {
         let size = tty::size(libc::STDIN_FILENO).unwrap_or(tty::Size { cols: 80, rows: 24, xpixel: 0, ypixel: 0 });
         match query_cursor(CURSOR_QUERY) {
@@ -1078,7 +1104,10 @@ async fn session(c: &ClientConfig, sess: &ClientSession) -> ExitCode {
         _ => pump_out(take(&mut ch.stdout), tokio::io::stdout()),
     };
     let err = pump_out(take(&mut ch.stderr), tokio::io::stderr());
-    let watch = status_watch(c, sess, if raw.is_some() { StatusLine::BottomRow } else { StatusLine::Cooked });
+    let watch = match &ev_tx {
+        Some(tx) => status_watch_display(c, sess, tx.clone()),
+        None => status_watch(c, sess, if raw.is_some() { StatusLine::BottomRow } else { StatusLine::Cooked }),
+    };
     let (Ok(mut term), Ok(mut int), Ok(mut hup), Ok(mut winch)) =
         (signal(SignalKind::terminate()), signal(SignalKind::interrupt()), signal(SignalKind::hangup()), signal(SignalKind::window_change()))
     else {

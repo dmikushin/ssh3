@@ -18,11 +18,12 @@
 //!   There is no such ordered acknowledgement here (keystrokes and output
 //!   travel on different streams), so a prediction that the mirror already
 //!   shows is confirmed at once, and a mismatch counts only after
-//!   `judge_after` (2·SRTT + 100 ms) from the keystroke.
-//! - No predictions on the alternate screen or in any state the overlay
-//!   cannot be removed from by repainting cells
-//!   ([`ssh3_term::Screen::overlay_obstacle`]); none in the last column
-//!   (mosh makes those tentative, terminaloverlay.cc:724-728, we skip them).
+//!   2·SRTT + 100 ms from the keystroke and once the server was heard from
+//!   since; predictions are looked at every 50 ms while any exist.
+//! - No predictions in a state the overlay cannot be removed from by
+//!   repainting cells ([`ssh3_term::Screen::overlay_obstacle`]); none in
+//!   the last column (mosh makes those tentative, terminaloverlay.cc:724-728,
+//!   we skip them). The alternate screen is allowed, as in mosh.
 //! - Only mosh's Adaptive, Always and Never modes; no overwrite mode.
 
 use std::time::{Duration, Instant};
@@ -323,8 +324,9 @@ impl PredictionEngine {
         self.srtt = srtt;
     }
 
+    /// The server was heard from at `at` (acks, probe replies, output).
     pub fn set_heard(&mut self, at: Instant) {
-        self.heard = at;
+        self.heard = self.heard.max(at);
     }
 
     fn judge(&self, now: Instant) -> Judge {
@@ -340,10 +342,12 @@ impl PredictionEngine {
         self.preference != Preference::Never && (self.srtt_trigger || self.glitch_trigger > 0 || self.preference == Preference::Always)
     }
 
-    /// When the timing triggers next need a look (h:283-305).
+    /// When predictions next need a look. mosh polls every 50 ms only while
+    /// a timing trigger may still fire (h:283-305) and judges on frame
+    /// acks; here a mismatch is judged by time, so while predictions exist
+    /// they are looked at every 50 ms.
     pub fn wait_time(&self) -> Option<Duration> {
-        let timing = !(self.glitch_trigger > 0 && self.flagging);
-        (timing && self.active()).then_some(Duration::from_millis(50))
+        self.active().then_some(Duration::from_millis(50))
     }
 
     /// cc:393-400.
@@ -705,6 +709,12 @@ impl PredictionEngine {
 thread_local! {
     /// Renditions of a default cell, for fresh overlay rows.
     static BLANK: ssh3_term::Rendition = Screen::new(2, 2).cell(0, 0).rendition;
+    /// Reverse video, for the "Last contact" line.
+    static STATUS: ssh3_term::Rendition = {
+        let mut s = Screen::new(2, 2);
+        s.feed(b"\x1b[7m");
+        s.pen()
+    };
 }
 
 /// The local terminal as seen by the overlay: the mirror plus whatever the
@@ -717,11 +727,14 @@ pub struct Display {
     shown: Vec<(u16, u16)>,
     cursor_moved: bool,
     last: Frame,
+    /// Cells the "Last contact" line covers while it is shown; no overlay
+    /// is painted meanwhile.
+    status: Vec<(u16, u16)>,
 }
 
 impl Display {
     pub fn new(mirror: Screen, engine: PredictionEngine) -> Self {
-        Display { mirror, engine, shown: Vec::new(), cursor_moved: false, last: Frame::default() }
+        Display { mirror, engine, shown: Vec::new(), cursor_moved: false, last: Frame::default(), status: Vec::new() }
     }
 
     /// Bytes that remove the overlay (the terminal then shows the mirror).
@@ -741,6 +754,9 @@ impl Display {
     /// Bytes that bring the terminal from its current overlay to the
     /// engine's current frame.
     fn repaint(&mut self) -> Vec<u8> {
+        if !self.status.is_empty() {
+            return Vec::new();
+        }
         let frame = self.engine.frame(&self.mirror);
         if frame == self.last {
             return Vec::new();
@@ -769,6 +785,9 @@ impl Display {
 
     /// Server output: bytes for the terminal.
     pub fn output(&mut self, bytes: &[u8], now: Instant) -> Vec<u8> {
+        // Output is word from the server too (stdin acks come on their own
+        // interval, up to a second apart).
+        self.engine.set_heard(now);
         let mut out = self.unpaint();
         out.extend_from_slice(bytes);
         self.mirror.feed(bytes);
@@ -794,9 +813,52 @@ impl Display {
     /// Local window size changed: the overlay goes, predictions reset.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Vec<u8> {
         let out = self.unpaint();
+        self.status.clear();
         self.mirror.resize(cols, rows);
         self.engine.reset();
         out
+    }
+
+    /// Draws the "Last contact" line over the bottom row (reverse video,
+    /// all columns but the last); None when the state rules painting out
+    /// (the caller then draws it the old way).
+    pub fn status_show(&mut self, msg: &str) -> Option<Vec<u8>> {
+        let (cols, rows) = self.mirror.size();
+        let line = rows - 1;
+        let reverse = STATUS.with(|s| s.clone());
+        let blank = BLANK.with(|b| b.clone());
+        let text: Vec<char> = format!(" {msg} ").chars().collect();
+        let cells: Vec<(u16, u16, Paint)> = (0..cols - 1)
+            .map(|x| {
+                let (ch, rendition) = match text.get(x as usize) {
+                    Some(&ch) if ch.is_ascii_graphic() || ch == ' ' => (ch, reverse.clone()),
+                    _ => (' ', blank.clone()),
+                };
+                (line, x, Paint::Glyph { ch, rendition, underline: false })
+            })
+            .collect();
+        // Refused only for the mirror's state, in which no overlay can be
+        // shown either: nothing to take back first then.
+        let b = self.mirror.paint(&cells, self.mirror.cursor())?;
+        let mut out = self.unpaint();
+        out.extend(b);
+        self.status = cells.iter().map(|c| (c.0, c.1)).collect();
+        Some(out)
+    }
+
+    /// Removes the "Last contact" line: the bottom row is drawn again from
+    /// the mirror, then the overlay comes back. None when the state rules
+    /// painting out (the caller then blanks the row the old way).
+    pub fn status_clear(&mut self) -> Option<Vec<u8>> {
+        if self.status.is_empty() {
+            return Some(Vec::new());
+        }
+        let cells: Vec<(u16, u16, Paint)> = self.status.iter().map(|&(l, c)| (l, c, Paint::Mirror)).collect();
+        let b = self.mirror.paint(&cells, self.mirror.cursor());
+        self.status.clear();
+        let mut out = b?;
+        out.extend(self.repaint());
+        Some(out)
     }
 
     /// The session's output ended: the overlay goes.
@@ -865,7 +927,9 @@ mod tests {
                 }
                 s
             };
-            let diff = norm(self.d.mirror.snapshot()).diff_with(&norm(self.term.snapshot()), false);
+            let m = self.d.mirror.snapshot();
+            let rep = m.rep_reproducible();
+            let diff = norm(m).diff_with(&norm(self.term.snapshot()), rep);
             assert!(diff.is_empty(), "terminal differs from the mirror:\n{}", diff.join("\n"));
         }
         /// The first keystroke of an epoch is confirmed by the echo.
@@ -961,16 +1025,69 @@ mod tests {
         assert!(!r.d.overlay_shown(), "keystrokes after ESC shown");
     }
 
+    /// An editor in insert mode on the alternate screen: predicted as on
+    /// the primary one (mosh has no screen check, cc:621-828), and ESC
+    /// (normal mode) makes the next keystroke tentative (cc:805-807).
     #[test]
-    fn alternate_screen_gets_no_predictions() {
+    fn alternate_screen_insert_mode_is_predicted() {
         let mut r = Rig::new(Preference::Always, 200, b"$ ");
-        r.out(b"\x1b[?1049h\x1b[H~\r\n~");
-        r.key(b"a");
+        r.out(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[2;1H~\x1b[3;1H~\x1b[24;1H-- INSERT --\x1b[1;1H");
+        r.confirm_first(b'h');
+        r.key(b"i");
+        assert_eq!(r.shows(0, 1), 'i', "insert-mode keystroke not predicted on the alternate screen");
         r.at(200);
-        r.out(b"a");
-        r.key(b"bcd");
-        assert!(!r.d.overlay_shown(), "prediction on the alternate screen");
+        r.out(b"i");
         r.assert_mirror();
+        r.key(b"\x1b");
+        r.at(200);
+        r.out(b"\x1b[24;1H\x1b[K\x1b[1;2H");
+        r.key(b"x");
+        assert!(!r.d.overlay_shown(), "normal-mode keystroke after ESC shown");
+        r.at(200);
+        r.out(b"\x1b[1;2H\x1b[K");
+        r.at(600);
+        r.heard();
+        r.tick();
+        r.assert_mirror();
+    }
+
+    /// REP right after a confirmed prediction repeats the program's
+    /// character, not the painted one (nor the blank painted back) — here
+    /// on a line no overlay covers, so nothing paints over the result.
+    #[test]
+    fn rep_after_a_prediction_repeats_the_programs_character() {
+        let mut r = Rig::new(Preference::Adaptive, 200, b"$ ");
+        r.confirm_first(b'a');
+        r.key(b"b");
+        assert_eq!(r.shows(0, 3), 'b');
+        r.out(b"\r\n\x1b[3b");
+        assert_eq!((r.shows(1, 0), r.shows(1, 1), r.shows(1, 2)), ('a', 'a', 'a'), "REP repeated the overlay's character");
+        r.at(600);
+        r.heard();
+        r.tick();
+        r.assert_mirror();
+    }
+
+    #[test]
+    fn status_line_clear_restores_the_bottom_row() {
+        let mut r = Rig::new(Preference::Adaptive, 200, b"");
+        let mut lines = Vec::new();
+        for i in 1..24 {
+            lines.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        lines.extend_from_slice(b"\x1b[1mbottom row text\x1b[0m $ ");
+        r.out(&lines);
+        r.confirm_first(b'a');
+        r.key(b"b");
+        let b = r.d.status_show("ssh3: Last contact 7 s ago").expect("status painted");
+        r.term.feed(&b);
+        assert_eq!(r.shows(23, 1), 's', "status line not drawn");
+        // While shown, server output still lands (and is mirrored).
+        r.out(b"b");
+        let b = r.d.status_clear().expect("status cleared");
+        r.term.feed(&b);
+        r.assert_mirror();
+        assert_eq!(r.shows(23, 0), 'b');
     }
 
     #[test]
