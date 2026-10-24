@@ -137,11 +137,13 @@ async fn stderr_is_separate_without_pty() {
 
 #[tokio::test]
 async fn exit_signal_reports_name() {
-    // The core-dump flag is the kernel's CLD_DUMPED and depends on the host's
-    // core_pattern (a pipe handler dumps even with RLIMIT_CORE 0), so only
-    // the name is asserted.
-    let (_, _, x) = run(&SessionConfig::default(), &exec("kill -SEGV $$")).await;
-    assert!(matches!(x, Exit::Signal { name: "SEGV", .. }), "{x:?}");
+    // Only signals whose default action does not dump core: a core-dumping
+    // signal (SEGV, QUIT, ABRT) hands the process to the host's core_pattern
+    // pipe handler (systemd-coredump here), which wrote a real dump of `sh` to
+    // /var/lib/systemd/coredump on every run (81 found) and, under load, kept
+    // the pipe open past this file's 10 s limit — a failure seen at 050b115.
+    let (_, _, x) = run(&SessionConfig::default(), &exec("kill -HUP $$")).await;
+    assert_eq!(x, Exit::Signal { name: "HUP", core_dumped: false });
     let (_, _, x) = run(&SessionConfig::default(), &exec("kill -USR1 $$")).await;
     assert_eq!(x, Exit::Signal { name: "USR1", core_dumped: false });
 }
