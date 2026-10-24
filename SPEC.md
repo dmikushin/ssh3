@@ -462,6 +462,19 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
   observed address (server-reflexive) and host candidates the peer reports.
 - At most 8 candidates per peer (`MaxCandidates`); extra ones are rejected
   with `Fail`. Punch fan-out is therefore ≤ 8 × 8 pairs.
+- As implemented (050b115): a gateway enables this with `rendezvous`; a
+  server's `[register]` section keeps a registration session from its own
+  UDP socket (the one its endpoint serves on, so the gateway observes the
+  real mapping) and re-registers whenever that session is lost.
+  `Register{name}` requires `permitlisten="name:0"`, jumping to a peer
+  requires `permitopen="name:0"` (OpenSSH option syntax reused). At the
+  gateway a registered name takes precedence over DNS, matched
+  case-insensitively. After every attach the gateway sends
+  `Observed{addr}` (the client's server-reflexive address); path signalling
+  (`PathSignal`) travels on the inner connection's control stream. Channel
+  kinds: `JumpPeer` (client side) paired with `PeerRelay` (on the peer's
+  registration session). Counters: datagrams_sent/received,
+  peers_registered, relay_routes.
 
 ### 7.2 Relay path
 - `ssh3 -J gw target` opens a `jump` channel to the gateway. If `target` is a
@@ -515,8 +528,10 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
    inner connection's exporter) to every candidate pair from the socket that
    carries their gateway connection, so the NAT mapping already observed by
    the gateway is reused. The socket demultiplexes by fixed bit (E3c).
-3. **Nomination.** The controlling peer (lower (key, address) tuple, as
-   for simultaneous dial) nominates one validated pair with
+3. **Nomination.** The controlling peer — the one that dialed the inner
+   connection (implementation 050b115; it is unambiguous because the inner
+   connection exists before candidates are exchanged, so the key-tuple rule
+   is needed only for simultaneous dial) — nominates one validated pair with
    `Nominate{generation, pair}` over the inner connection; the other peer
    answers `NominateAck{generation}` only if it has itself validated that
    pair; both switch on ack. A newer generation supersedes older ones.
