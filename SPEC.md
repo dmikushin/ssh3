@@ -345,7 +345,10 @@ has one or more **lanes**; each lane is an ordered byte stream per direction
 - **Client status line (after mosh).** When the server has been silent for
   more than `ContactWarn` (default 6.5 s, mosh terminaloverlay.h:159), an
   interactive client shows "Last contact N s ago" on its pty, removed when
-  traffic resumes.
+  traffic resumes. `ContactWarn` below twice the client's liveness probe
+  interval (`ServerAliveInterval`, default 1 s) is refused: on a healthy
+  idle link the server is heard about once per probe interval, so a
+  shorter warning would show every second for nothing.
 - **Predictive echo (after mosh).** See §5.2.
 - **Received offset semantics.** `received_offset` = end of the bytes
   accepted into the receiver's receive ring. Bytes delivered to quinn but not
@@ -531,10 +534,7 @@ No protocol messages; the client alone, ported from mosh's
     → `ConnectFailed`); a host name without it never reaches a registration,
     so registering `localhost` or `github` cannot capture jumps to them.
   - `Register{label}` requires `permitlisten="<label>.peer:0"`, jumping to a
-    peer requires `permitopen="<label>.peer:0"` (OpenSSH option syntax) —
-    one check, whatever port the client names (its ssh_config `Port`). The
-    gateway logs every refused registration or jump with user, key
-    fingerprint and target.
+    peer requires `permitopen="<label>.peer:0"` (OpenSSH option syntax).
 - **Name ownership.** A name belongs to the (authenticated user, exact key)
   that registered it for as long as that registration's session lives
   (attached or lingering). The same owner may register it again from

@@ -195,6 +195,16 @@ pub fn refusals(c: &ClientConfig) -> Result<(), String> {
         }
     }
     predictive_echo(c)?;
+    if let (Ok(warn), Some(probe)) = (contact_warn(c), client_limits(c).probe_interval)
+        && warn < probe * 2
+    {
+        // On a healthy idle link the server is heard about once per probe
+        // interval: a shorter warning would show "Last contact" every
+        // second for nothing.
+        return Err(format!(
+            "ContactWarn {warn:?} is shorter than twice the liveness probe interval {probe:?} (ServerAliveInterval, default 1 s): it would show on a healthy link"
+        ));
+    }
     if let Err(e) = contact_warn(c) {
         why.push(e);
     }
@@ -1171,7 +1181,13 @@ mod tests {
     #[test]
     fn contact_warn_keyword() {
         assert_eq!(contact_warn(&cfg(&["-N", "h"], "")).unwrap(), CONTACT_WARN);
-        assert_eq!(contact_warn(&cfg(&["-N", "h"], "ContactWarn 500ms\n")).unwrap(), Duration::from_millis(500));
+        assert_eq!(contact_warn(&cfg(&["-N", "h"], "ContactWarn 2500ms\n")).unwrap(), Duration::from_millis(2500));
+        // Below twice the probe interval it would fire on a healthy link.
+        let e = refusals(&cfg(&["-N", "h"], "ContactWarn 500ms\n")).unwrap_err();
+        assert!(e.contains("ContactWarn 500ms is shorter than twice the liveness probe interval 1s"), "{e}");
+        let e = refusals(&cfg(&["-o", "ServerAliveInterval=3", "-N", "h"], "ContactWarn 5s\n")).unwrap_err();
+        assert!(e.contains("3s"), "{e}");
+        assert!(refusals(&cfg(&["-o", "ServerAliveInterval=3", "-N", "h"], "ContactWarn 6s\n")).is_ok());
         let e = refusals(&cfg(&["-N", "h"], "ContactWarn 5\n")).unwrap_err();
         assert!(e.contains("ContactWarn"), "{e}");
     }

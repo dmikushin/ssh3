@@ -605,7 +605,7 @@ fn last_contact_line_follows_server_silence() {
     let mut screen = Screen::new(&pty.master);
     std::fs::OpenOptions::new().append(true).open(env.client_config("user_key")).unwrap();
     let cfg = env.dir.join("ssh_config.contact");
-    std::fs::write(&cfg, format!("{}  ContactWarn 300ms\n", std::fs::read_to_string(env.client_config("user_key")).unwrap())).unwrap();
+    std::fs::write(&cfg, format!("{}  ContactWarn 2s\n", std::fs::read_to_string(env.client_config("user_key")).unwrap())).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
     let lport = free_port();
     cmd.arg("-F").arg(&cfg).args(["-N", "-L", &format!("{lport}:127.0.0.1:9"), "t"]);
@@ -1254,4 +1254,32 @@ fn predictive_echo_shows_keystrokes_before_the_echo() {
     let median = |v: &[Duration]| v[v.len() / 2];
     assert!(median(&with) < Duration::from_millis(20), "with prediction: median {:?} ({with:?})", median(&with));
     assert!(without[0] >= Duration::from_millis(180), "without prediction faster than the RTT: {without:?}");
+}
+
+/// A healthy idle link never shows "Last contact": the liveness probes
+/// (1 s) keep the server heard well within ContactWarn (2 s).
+#[test]
+fn healthy_link_shows_no_status_line() {
+    let env = Env::new();
+    let cfg = env.dir.join("ssh_config.healthy");
+    std::fs::write(&cfg, format!("{}  ContactWarn 2s\n", std::fs::read_to_string(env.client_config("user_key")).unwrap())).unwrap();
+    let pty = openpty(24, 80);
+    let mut screen = Screen::new(&pty.master);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ssh3"));
+    let lport = free_port();
+    cmd.arg("-F").arg(&cfg).args(["-N", "-L", &format!("{lport}:127.0.0.1:9"), "t"]);
+    let _c = spawn_on_pty(cmd, &pty, "ssh3");
+    let end = Instant::now() + DEADLINE;
+    while !tcp_listening(lport) {
+        assert!(Instant::now() < end, "client never in its session");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Three probe periods past the warning threshold.
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        if let Ok(b) = screen.rx.recv_timeout(Duration::from_millis(100)) {
+            screen.text.push_str(&String::from_utf8_lossy(&b));
+        }
+    }
+    assert!(!screen.text.contains("Last contact"), "status line on a healthy link: {:?}", screen.text);
 }
