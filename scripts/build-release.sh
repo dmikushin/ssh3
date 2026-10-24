@@ -26,8 +26,15 @@
 #
 # Usage:
 #   scripts/build-release.sh              build release binaries
+#   scripts/build-release.sh --test       run the whole suite on the musl
+#                                         target in the release profile
 #   scripts/build-release.sh --repro      build twice into separate target
 #                                         dirs and compare sha256
+#
+# Target directory: $SSH3_RELEASE_TARGET_DIR, default "$WS/target" — private to
+# the worktree the script lives in. A directory shared between worktrees lets
+# one checkout run another checkout's stale test binary, which produced a false
+# failure for a fork on 2026-10-24.
 set -euo pipefail
 
 TARGET=x86_64-unknown-linux-musl
@@ -67,7 +74,7 @@ if [[ ${1:-} == --test ]]; then
     # Run the whole suite as it will be shipped: musl target, release profile.
     # A test that only ever ran on the host gnu target proves nothing about the
     # artifact that goes to oracle.
-    td=${SSH3_RELEASE_TARGET_DIR:-/dev/shm/ssh3-musl-test}
+    td=${SSH3_RELEASE_TARGET_DIR:-"$WS/target"}
     (cd "$WS" && cargo test --release --workspace --target "$TARGET" --target-dir "$td")
     exit $?
 fi
