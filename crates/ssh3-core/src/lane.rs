@@ -414,6 +414,15 @@ impl Lane {
 
     /// A chunk for the receive tail: from the lane's reservation, else a
     /// floor chunk. Credit is only granted when one of the two exists.
+    /// Storage for the send ring: a floor chunk while the lane has one
+    /// left, else a chunk of the shared send budget.
+    fn send_chunk(&self, st: &LaneState) -> Option<Tail> {
+        if let Some(t) = floor_chunk(&self.env.floor_budget, &st.sfloor, SEND_FLOOR_CHUNKS) {
+            return Some(t);
+        }
+        Permit::try_new(&self.env.send_budget, CH).map(|p| Tail::new(ChunkPermit { _permit: p, floor: None }))
+    }
+
     fn recv_chunk(&self, st: &mut LaneState) -> Option<Tail> {
         if st.reserve.amount() >= CH {
             let p = st.reserve.split(CH);
@@ -611,6 +620,11 @@ impl Lane {
     fn release_accepted(&self, st: &mut LaneState, accepted: u64) {
         let n = (accepted - st.sbase) as usize;
         st.sbuf.drain(n);
+        if st.sbuf.is_empty() {
+            // A drained ring keeps only a floor spare; a budget-charged one
+            // goes back so idle lanes do not pin the shared send budget.
+            st.sbuf.release_budget_tail();
+        }
         st.sbase = accepted;
         self.env.stats.send_ring_bytes.fetch_sub(n as u64, Ordering::Relaxed);
         if st.s_eof && st.sbuf.is_empty() {
@@ -768,10 +782,7 @@ impl Lane {
                     if want > 0 {
                         let tail = match st.sbuf.take_tail() {
                             Some(t) => Some(t),
-                            None => match Permit::try_new(&self.env.send_budget, CH) {
-                                Some(p) => Some(Tail::new(ChunkPermit { _permit: p, floor: None })),
-                                None => floor_chunk(&self.env.floor_budget, &st.sfloor, SEND_FLOOR_CHUNKS),
-                            },
+                            None => self.send_chunk(&st),
                         };
                         if let Some(t) = tail {
                             let want = want.min(t.space());
@@ -826,17 +837,22 @@ impl Lane {
         let k = need.div_ceil(CHUNK);
         let mut chunks = Vec::with_capacity(k);
         if k > 0 {
-            match Permit::try_new(&self.env.send_budget, k as u64 * CH) {
-                Some(mut p) => {
-                    for _ in 0..k {
-                        chunks.push(Tail::new(ChunkPermit { _permit: p.split(CH), floor: None }));
+            // The lane's floor chunk first, then the shared budget: an idle
+            // lane (the event lane of every idle session) holds only floor
+            // storage, never shared budget (SPEC §4).
+            if let Some(t) = floor_chunk(&self.env.floor_budget, &st.sfloor, SEND_FLOOR_CHUNKS) {
+                chunks.push(t);
+            }
+            let rest = k - chunks.len();
+            if rest > 0 {
+                match Permit::try_new(&self.env.send_budget, rest as u64 * CH) {
+                    Some(mut p) => {
+                        for _ in 0..rest {
+                            chunks.push(Tail::new(ChunkPermit { _permit: p.split(CH), floor: None }));
+                        }
                     }
+                    None => return false, // all or nothing: the floor chunk goes back with `chunks`
                 }
-                None if k == 1 => match floor_chunk(&self.env.floor_budget, &st.sfloor, SEND_FLOOR_CHUNKS) {
-                    Some(t) => chunks.push(t),
-                    None => return false,
-                },
-                None => return false,
             }
         }
         let mut chunks = chunks.into_iter();

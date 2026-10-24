@@ -505,3 +505,41 @@ async fn connection_counters() {
     wait_until("all closed", Duration::from_secs(5), || env.server.stats().conns_active == 0, || format!("{:?}", env.server.stats())).await;
     assert_eq!(env.server.stats().conns_accepted, 2);
 }
+
+/// O1 (QA M1): idle sessions and idle lanes hold only their floor chunks,
+/// never shared budget — otherwise N idle sessions exhaust the send budget
+/// active forwards need (each idle session's event lane held a 16 KiB
+/// budget chunk since the pty-lane rework).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_sessions_and_lanes_hold_no_shared_budget() {
+    let env = env_with(fast_limits());
+    let mut clients = Vec::new();
+    for _ in 0..16 {
+        clients.push(env.client().await);
+    }
+    let echo = echo_server().await;
+    let fwd = forward(&clients[0], echo).await;
+    let data = Arc::new(pattern(1 << 20, 7));
+    assert_eq!(*echo_roundtrip(fwd, data.clone()).await, *data);
+    // The forward's TCP connection is closed, but the lane of an open
+    // channel would hold its spare too: keep one connection open and idle.
+    let mut idle = TcpStream::connect(fwd).await.unwrap();
+    // Not a multiple of the chunk size: the last chunk stays as the ring's
+    // spare tail once drained.
+    idle.write_all(&pattern(70_000, 9)).await.unwrap();
+    let mut back = vec![0u8; 70_000];
+    idle.read_exact(&mut back).await.unwrap();
+    wait_until(
+        "shared budgets back to zero with every session and lane idle",
+        Duration::from_secs(10),
+        || {
+            let st = env.server.stats();
+            st.sessions == 16 && st.send_budget_used == 0 && st.recv_budget_used == 0
+        },
+        || format!("{:?}", env.server.stats()),
+    )
+    .await;
+    let st = env.server.stats();
+    assert!(st.floor_chunks_bytes > 0, "the event lanes' storage is floor storage: {st:?}");
+    drop(idle);
+}
