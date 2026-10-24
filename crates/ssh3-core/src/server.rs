@@ -116,10 +116,25 @@ pub struct ServerStats {
     /// detached, oversize, malformed), reassembly storage in use and groups
     /// evicted, LRU flow evictions.
     pub udp_flows: u64,
-    /// Datagrams sent and received on live sessions (relay activity, §7.2).
+    /// UDP payloads (user datagrams; for a relay, inner QUIC packets) on
+    /// live sessions, each counted once however many QUIC DATAGRAM frames
+    /// (fragments, §6) it took: `datagrams_sent` handed to the carrier,
+    /// `datagrams_received` complete (whole or reassembled), and
+    /// `datagrams_dropped` not delivered or not sent (full queue, detached,
+    /// oversize, still-opening flow). At a pure relay (§7.2) every payload
+    /// received is sent on or dropped: received == sent + dropped. Payloads
+    /// whose fragments never all arrive count in `reassembly_evicted`
+    /// (groups), not here.
     pub datagrams_sent: u64,
     pub datagrams_received: u64,
     pub datagrams_dropped: u64,
+    /// Received DATAGRAM frames that could not be parsed (bad channel id or
+    /// fragment header).
+    pub datagrams_malformed: u64,
+    /// QUIC DATAGRAM frames sent and received (wire units; ≥ the payload
+    /// counts when payloads are fragmented).
+    pub datagram_fragments_sent: u64,
+    pub datagram_fragments_received: u64,
     pub reassembly_bytes: u64,
     pub reassembly_evicted: u64,
     pub udp_evicted: u64,
@@ -258,6 +273,9 @@ impl Server {
             t.datagrams_sent += s.stats.dgrams_sent.load(Ordering::Relaxed);
             t.datagrams_received += s.stats.dgrams_received.load(Ordering::Relaxed);
             t.datagrams_dropped += s.stats.dgrams_dropped.load(Ordering::Relaxed);
+            t.datagrams_malformed += s.stats.dgrams_malformed.load(Ordering::Relaxed);
+            t.datagram_fragments_sent += s.stats.dgram_frags_sent.load(Ordering::Relaxed);
+            t.datagram_fragments_received += s.stats.dgram_frags_received.load(Ordering::Relaxed);
             t.reassembly_evicted += s.stats.reasm_evicted.load(Ordering::Relaxed);
             t.udp_evicted += s.stats.udp_evicted.load(Ordering::Relaxed);
             t.credit_retractions += s.stats.credit_retractions.load(Ordering::Relaxed);

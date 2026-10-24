@@ -232,7 +232,11 @@ impl SessionShared {
             d.put_slice(&hdr);
             d.put_u8(0);
             d.put_slice(data);
-            return conn.send_datagram(d.freeze()).is_ok();
+            let ok = conn.send_datagram(d.freeze()).is_ok();
+            if ok {
+                self.stats.dgram_frags_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            return ok;
         }
         let room = max.saturating_sub(hdr.len() + FRAG_HDR);
         if room == 0 {
@@ -254,6 +258,7 @@ impl SessionShared {
             if conn.send_datagram(d.freeze()).is_err() {
                 return false;
             }
+            self.stats.dgram_frags_sent.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
@@ -262,9 +267,9 @@ impl SessionShared {
     /// its channel's queue; a full queue drops (never blocks the reader).
     pub(crate) async fn datagram_rx(self: Arc<Self>, conn: Connection) {
         while let Ok(d) = conn.read_datagram().await {
-            self.stats.dgrams_received.fetch_add(1, Ordering::Relaxed);
+            self.stats.dgram_frags_received.fetch_add(1, Ordering::Relaxed);
             let Some((chan_id, n)) = get_varint(&d) else {
-                self.stats.dgrams_dropped.fetch_add(1, Ordering::Relaxed);
+                self.stats.dgrams_malformed.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             let payload = match d.get(n) {
@@ -282,10 +287,12 @@ impl SessionShared {
                     }
                 }
                 _ => {
-                    self.stats.dgrams_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.stats.dgrams_malformed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
+            // A complete payload (whole, or its last fragment just arrived).
+            self.stats.dgrams_received.fetch_add(1, Ordering::Relaxed);
             let tx = self.channel_by_id(chan_id).and_then(|ch| match &*ch.ext.lock().unwrap() {
                 Some(crate::sesschan::ChanExt::Udp(u)) => Some(u.tx.clone()),
                 _ => None,

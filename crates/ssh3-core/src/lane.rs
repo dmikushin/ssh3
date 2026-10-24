@@ -62,11 +62,16 @@ pub struct Stats {
     pub window_raises: AtomicU64,
     pub window_lowers: AtomicU64,
     /// §6: live UDP flows (channels), datagrams, drops, reassembly and LRU
-    /// evictions.
+    /// evictions. `dgrams_*` count UDP payloads (one per user datagram /
+    /// inner QUIC packet, however many QUIC DATAGRAM frames it took);
+    /// `dgram_frags_*` count the QUIC DATAGRAM frames themselves.
     pub udp_flows: AtomicU64,
     pub dgrams_sent: AtomicU64,
     pub dgrams_received: AtomicU64,
     pub dgrams_dropped: AtomicU64,
+    pub dgrams_malformed: AtomicU64,
+    pub dgram_frags_sent: AtomicU64,
+    pub dgram_frags_received: AtomicU64,
     pub reasm_evicted: AtomicU64,
     pub udp_evicted: AtomicU64,
     /// §4 fenced retraction: completed (acked or unilateral), and peers cut
