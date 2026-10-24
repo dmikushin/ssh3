@@ -1,6 +1,16 @@
 # systemd unit for ssh3-server (ssh3-rs). Install the static binary as
 # /usr/local/bin/ssh3-server and the configuration as
 # /etc/ssh3/ssh3-server.toml (format: crates/ssh3-bin/src/server_config.rs).
+#
+# Hardening. `systemd-analyze security` rates this unit 9.5, the same class as
+# Arch's own sshd.service (9.6), on purpose: user sessions are child processes
+# of the server and inherit every sandbox setting of this unit, so
+# ProtectSystem=, ProtectHome=, PrivateTmp=, NoNewPrivileges= and friends would
+# give every login shell a read-only /usr, a private /tmp, no home directories
+# and no setuid (no sudo, no su). sshd ships without them for the same reason.
+#
+# Accounts. The release binary is static musl: users and groups come from
+# /etc/passwd and /etc/group only (no NSS: no LDAP, sssd or systemd-homed).
 [Unit]
 Description=ssh3 server (secure shell over QUIC)
 Documentation=https://github.com/dmikushin/ssh3
@@ -11,21 +21,40 @@ Wants=network-online.target
 Type=exec
 ExecStartPre=/usr/local/bin/ssh3-server -t -f /etc/ssh3/ssh3-server.toml
 ExecStart=/usr/local/bin/ssh3-server -f /etc/ssh3/ssh3-server.toml
-# SIGTERM: sessions torn down, -R listeners released at once (SPEC I5).
-KillMode=mixed
+# No ExecReload: the server has no SIGHUP reload. A configuration change needs
+# a restart, which ends all sessions (they live in this process); clients learn
+# of the restart at once (persisted stateless-reset key, SPEC §1), their
+# resumes are refused and they reconnect.
+#
+# SIGTERM: CONNECTION_CLOSE to every client, -R listeners released at once
+# (SPEC I5), then exit.
 KillSignal=SIGTERM
+# KillMode=process, as sshd: stop/restart signals only the server. User
+# processes meant to outlive their session (`nohup cmd &`, which survives
+# session end under OpenSSH semantics, ssh3-session 1a13411) also survive a
+# server restart instead of being SIGKILLed as KillMode=mixed would do.
+KillMode=process
 TimeoutStopSec=5
-Restart=on-failure
+# Restart=always, as sshd: the way in must come back even after a clean exit.
+Restart=always
 RestartSec=2
 # Persisted endpoint keys (stateless reset after restart, SPEC §1) and the
 # stats socket.
 StateDirectory=ssh3
 RuntimeDirectory=ssh3
-# Runs as root to serve every account; drop to one user with User= to serve
-# only that user (the server refuses all other accounts by name).
-# No ProtectSystem=/NoNewPrivileges=: session processes inherit the
-# service's sandbox, and a user shell must see the system as under sshd.
+# Hundreds of connections x channels x forwarded sockets.
+LimitNOFILE=65536
+# Runs as root to serve every account. With User= it serves only that user (the
+# server refuses all other accounts by name) and needs this capability to bind
+# port 443.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Memory budget: session processes run in this unit's cgroup, so MemoryMax=
+# here would also cap users' programs. For a side-by-side test instance on a
+# small host put the budget in a drop-in of that instance, e.g.
+#   /etc/systemd/system/ssh3-server-test.service.d/budget.conf
+#   [Service]
+#   MemoryHigh=96M
+#   MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target
