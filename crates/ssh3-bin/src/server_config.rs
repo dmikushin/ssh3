@@ -15,6 +15,7 @@
 //!                                                  # relative paths are relative to %h
 //! stats_socket = "/run/ssh3/stats.sock"     # optional; one JSON object per connection
 //! rendezvous = false                        # act as a gateway for registered peers (SPEC §7.1)
+//! worker_threads = 2                        # tokio workers; default 2, not one per CPU
 //!
 //! [register]                                # optional: be reachable as a peer at a gateway
 //! gateway = "gw.example.org:443"            # the gateway's ssh3-server
@@ -61,6 +62,13 @@ pub struct ServerConfig {
     #[serde(default)]
     pub rendezvous: bool,
     pub register: Option<Register>,
+    /// Tokio worker threads; independent of the CPU count so idle memory is too.
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+}
+
+fn default_worker_threads() -> usize {
+    2
 }
 
 /// Registration at a gateway (SPEC §7.1): the server keeps a client session
@@ -91,6 +99,9 @@ impl ServerConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         let c: ServerConfig = toml::from_str(text).map_err(|e| e.to_string())?;
         c.limits().validate()?;
+        if c.worker_threads == 0 {
+            return Err("worker_threads must be at least 1".into());
+        }
         Ok(c)
     }
 

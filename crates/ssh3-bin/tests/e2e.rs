@@ -360,6 +360,26 @@ fn server_config_check() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("idle_timout"));
 }
 
+/// The allocator options the server binary relies on are really in effect:
+/// an unprefixed `malloc_conf` symbol was silently ignored by the prefixed
+/// jemalloc for weeks (background_thread off, 4 arenas per CPU).
+#[test]
+fn server_allocator_options_are_effective() {
+    let env = Env::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_ssh3-server"))
+        .arg("-t")
+        .arg("-f")
+        .arg(env.dir.join("server.toml"))
+        .env("_RJEM_MALLOC_CONF", "stats_print:true")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stats = String::from_utf8_lossy(&out.stderr);
+    for want in ["opt.background_thread: true", "opt.narenas: 1\n"] {
+        assert!(stats.contains(want), "jemalloc stats lack {want:?}:\n{}", stats.lines().filter(|l| l.contains("opt.")).collect::<Vec<_>>().join("\n"));
+    }
+}
+
 // ------------------------------------------------------------- sessions
 
 struct Output {

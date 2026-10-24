@@ -130,7 +130,13 @@ fn run(args: Args) -> Result<(), String> {
         Some(ssh3_config::LocalEnv::from_system(443)?.user)
     };
     let authenticator = Arc::new(Authorizer { cfg: cfg.clone(), only_user });
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+    // A fixed worker count, not one per CPU: per-thread allocator state made
+    // idle RSS grow with the core count (531 MB on 88 CPUs).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.worker_threads)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
     rt.block_on(async move {
         let socket = dual_stack_socket(cfg.listen).map_err(|e| format!("listen {}: {e}", cfg.listen))?;
         let session = Some(ssh3_core::ServerSessionEnv::new(cfg.session()));
