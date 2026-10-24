@@ -468,19 +468,26 @@ impl Lane {
     }
 
     /// The `(accepted, limit, seq)` to send now. Works on closed lanes too:
-    /// the final ack of a completed lane must still go out. While a Retract
-    /// is outstanding the advertised limit is at most its new limit.
+    /// the final ack of a completed lane must still go out.
+    ///
+    /// While a Retract is outstanding the receiver cannot state a limit in
+    /// the new fence: the sender holds max(sent, new_limit) there and only
+    /// the RetractAck tells us `sent` (bytes may be in flight, sent >
+    /// received). So the ack carries the PREVIOUS fence and the unchanged
+    /// limit: the sender, having processed the Retract first (same control
+    /// stream, written earlier), treats it as a stale grant and uses only
+    /// `accepted`; no new credit is granted meanwhile (recompute_limit).
     pub(crate) fn take_ack(&self) -> (u64, u64, u64) {
         let mut st = self.st.lock().unwrap();
         st.queued_lazy = false;
         st.queued_urgent = false;
         st.last_ack_accepted = st.received;
         st.last_ack_limit = st.limit;
-        let limit = match st.retract {
-            Some(r) => st.limit.min(r.new_limit.max(st.received)),
-            None => st.limit,
+        let seq = match st.retract {
+            Some(r) => r.seq - 1,
+            None => st.seq,
         };
-        (st.received, limit, st.seq)
+        (st.received, st.limit, seq)
     }
 
     // ---------------------------------------------------------- retraction
@@ -1239,4 +1246,68 @@ fn floor_chunk(budget: &Arc<Budget>, count: &Arc<AtomicU32>, max: u32) -> Option
     }
     let p = Permit::try_new(budget, CH).expect("the floor budget is unlimited");
     Some(Tail::new(ChunkPermit { _permit: p, floor: Some(count.clone()) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env() -> LaneEnv {
+        let (events, _rx) = mpsc::channel(16);
+        LaneEnv {
+            cap: 8 << 20,
+            floor: CH,
+            ack_bytes: CH,
+            credit_idle: Duration::ZERO,
+            ack_interval: Duration::from_millis(50),
+            stats: Arc::new(Stats::default()),
+            acks: Arc::new(AckQueue::default()),
+            recv_budget: Budget::new("recv", 64 << 20),
+            send_budget: Budget::new("send", 64 << 20),
+            floor_budget: Budget::new("floor", u64::MAX),
+            events,
+        }
+    }
+
+    /// Real-network race (N-stage 6b, ~40 ms RTT): the receiver retracts while
+    /// bytes it has not yet received are in flight (sent > received), then
+    /// acks in the new fence before the RetractAck arrives. The sender holds
+    /// max(sent, new_limit) in that fence, so any ack of that fence must not
+    /// advertise less, or the sender cuts a conforming peer.
+    #[test]
+    fn ack_during_outstanding_retract_with_bytes_in_flight() {
+        let recv = Lane::new(2, 0, env());
+        let send = Lane::new(2, 0, env());
+        let (limit0, sent, received, delivered) = (1_327_104u64, 1_327_104u64, 1_000_000u64, 1_000_000u64);
+        {
+            let mut r = recv.st.lock().unwrap();
+            r.limit = limit0;
+            r.received = received;
+            r.delivered = delivered;
+            r.granted = limit0 - delivered;
+            r.last_arrival = Instant::now() - Duration::from_secs(1);
+        }
+        {
+            let mut s = send.st.lock().unwrap();
+            s.sent_hi = sent;
+            s.sbase = received;
+            s.peer_limit = limit0;
+        }
+        let (seq, new_limit) = match recv.credit_check(Duration::from_secs(10)) {
+            CreditAction::Retract { seq, new_limit } => (seq, new_limit),
+            _ => panic!("no retract"),
+        };
+        assert!(new_limit < sent, "precondition: retract below what is in flight");
+        send.on_retract(seq, new_limit).unwrap();
+        // The receiver acks (lazy tick) before the RetractAck arrives.
+        let (acc, limit, aseq) = recv.take_ack();
+        send.on_ack(acc, limit, aseq).expect("conforming sender cut by an in-fence ack");
+        // The sender still must not send beyond max(sent, new_limit), and the
+        // ack's `accepted` was applied (its send ring released).
+        assert_eq!(send.st.lock().unwrap().peer_limit, sent.max(new_limit));
+        assert_eq!(send.st.lock().unwrap().sbase, received);
+        // The check stays strict: a hostile receiver lowering the limit
+        // inside the current fence is still cut.
+        assert!(send.on_ack(received, sent.max(new_limit) - 1, seq).is_err());
+    }
 }
