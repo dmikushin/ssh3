@@ -19,7 +19,7 @@
 //!
 //! [register]                                # optional: be reachable as a peer at a gateway
 //! gateway = "gw.example.org:443"            # the gateway's ssh3-server
-//! name = "home"                             # clients reach us as `ssh3 -J gw home`
+//! name = "home"                             # clients reach us as `ssh3 -J gw home.peer`
 //! user = "peer"                             # account at the gateway
 //! identity = "/etc/ssh3/peer_ed25519"       # private key (OpenSSH format)
 //! known_hosts = "/etc/ssh3/gateway_known_hosts"   # the gateway's host key
@@ -101,6 +101,9 @@ impl ServerConfig {
         c.limits().validate()?;
         if c.worker_threads == 0 {
             return Err("worker_threads must be at least 1".into());
+        }
+        if let Some(r) = &c.register {
+            ssh3_core::rendezvous::peer_label(&r.name).map_err(|e| format!("[register] name: {e}"))?;
         }
         Ok(c)
     }
@@ -363,6 +366,16 @@ mod tests {
     fn invalid_limits_are_rejected_with_the_field_named() {
         let e = ServerConfig::parse(&format!("{MIN}[limits]\nlane_floor = 4096\n")).unwrap_err();
         assert!(e.contains("lane_floor"), "{e}");
+    }
+
+    #[test]
+    fn invalid_register_name_is_rejected() {
+        let reg = |name: &str| format!("{MIN}[register]\ngateway = \"g:443\"\nname = \"{name}\"\nuser = \"u\"\nidentity = \"/i\"\nknown_hosts = \"/k\"\n");
+        assert!(ServerConfig::parse(&reg("home")).is_ok());
+        for bad in ["home.peer", "a.b", "bad_name", ""] {
+            let e = ServerConfig::parse(&reg(bad)).unwrap_err();
+            assert!(e.contains("[register] name") && e.contains("invalid peer name"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

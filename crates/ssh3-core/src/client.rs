@@ -308,6 +308,15 @@ impl ClientSession {
         self.shared.last_contact()
     }
 
+    /// Register this session at the gateway as the peer `label` (SPEC
+    /// §7.1), in addition to any name it already holds. Refused if another
+    /// (user, key) holds the name, if the label is invalid, or past the
+    /// gateway's per-session cap (`max_listeners`). The name lives as long
+    /// as this session.
+    pub async fn register_name(&self, label: &str) -> Result<()> {
+        self.shared.register(label.to_string()).await
+    }
+
     /// End the session on purpose (SPEC §5 "Deliberate end"): no linger on
     /// the server. Sends SessionEnd on the event log, waits at most `bound`
     /// for the server to confirm by closing with SESSION_END, then closes

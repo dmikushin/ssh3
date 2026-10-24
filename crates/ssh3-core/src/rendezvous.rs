@@ -13,8 +13,9 @@
 //!   connection's control stream (`PathSignal`) and upgrades to a direct
 //!   path when the NATs allow it; the relay stays as fallback.
 //!
-//! Every table here is bounded: peers by `max_sessions`, routes by the
-//! registered session's channel cap, queues by `udp_queue`.
+//! Every table here is bounded: names by `max_sessions` in total and by
+//! `max_listeners` per registering session, routes by the registered
+//! session's channel cap, queues by `udp_queue`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,42 +31,100 @@ use crate::msg::{ChannelKind, FailReason, Message};
 use crate::session::{Completion, Role, SessionShared};
 use crate::udp::UdpExt;
 
-/// Gateway: name → registered peer session. A newer registration of a name
-/// replaces the older (a restarted peer takes its name back).
+/// Suffix that puts a host name in the registered-peer namespace: a client
+/// reaches the peer registered as `box` with `-J gw box.peer`. A name without
+/// it is always a DNS name (or address) and never reaches a registration, so
+/// a peer registering `github` or `localhost` cannot capture jumps to those
+/// hosts (SPEC §7.1).
+pub const PEER_SUFFIX: &str = ".peer";
+
+/// Longest peer label (one DNS label).
+pub const MAX_PEER_LABEL: usize = 63;
+
+/// A registered peer name: one DNS-style label, ASCII letters, digits and
+/// inner hyphens, at most 63 characters; matched case-insensitively. Returns
+/// the canonical (lower-case) label or why the name is refused.
+pub fn peer_label(name: &str) -> std::result::Result<String, String> {
+    let ok = !name.is_empty()
+        && name.len() <= MAX_PEER_LABEL
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if ok {
+        Ok(name.to_ascii_lowercase())
+    } else {
+        Err(format!(
+            "invalid peer name {name:?}: one label of 1-{MAX_PEER_LABEL} ASCII letters, digits and inner hyphens \
+             (no dots, no `{PEER_SUFFIX}` suffix when registering)"
+        ))
+    }
+}
+
+/// The peer label a client host name addresses, if it is in the peer
+/// namespace (`<label>.peer`, any case); `Err` when it has the suffix but an
+/// invalid label.
+pub fn peer_target(host: &str) -> Option<std::result::Result<String, String>> {
+    let n = host.len().checked_sub(PEER_SUFFIX.len())?;
+    let (label, suffix) = host.split_at_checked(n)?;
+    suffix.eq_ignore_ascii_case(PEER_SUFFIX).then(|| peer_label(label))
+}
+
+/// Who registered a name: the authenticated user and the exact key.
+#[derive(Clone, PartialEq, Eq)]
+struct Owner {
+    user: String,
+    key: Vec<u8>,
+}
+
+struct Registration {
+    owner: Owner,
+    session: Weak<SessionShared>,
+}
+
+/// Gateway: peer label → registration. A name belongs to the (user, key)
+/// that registered it for as long as that registration's session lives
+/// (attached or lingering); the same owner may replace it (a restarted peer
+/// takes its name back), any other owner is refused. Bounded: `max` names in
+/// total, `per_session` names per registering session.
 pub struct Rendezvous {
-    peers: Mutex<HashMap<String, Weak<SessionShared>>>,
+    peers: Mutex<HashMap<String, Registration>>,
     max: usize,
+    per_session: usize,
 }
 
 impl Rendezvous {
-    pub fn new(max: usize) -> Arc<Self> {
-        Arc::new(Self { peers: Mutex::new(HashMap::new()), max })
+    pub fn new(max: usize, per_session: usize) -> Arc<Self> {
+        Arc::new(Self { peers: Mutex::new(HashMap::new()), max, per_session })
     }
 
-    // Names are host names to clients (`ssh3 -J gw NAME`, which ssh_config
-    // lower-cases): matched case-insensitively.
-    fn register(&self, name: String, s: &Arc<SessionShared>) -> std::result::Result<(), FailReason> {
-        let name = name.to_ascii_lowercase();
+    fn register(&self, label: String, s: &Arc<SessionShared>) -> std::result::Result<(), FailReason> {
+        let owner = Owner { user: s.user.clone(), key: s.owner_key.clone() };
         let mut p = self.peers.lock().unwrap();
-        p.retain(|_, w| w.strong_count() > 0);
-        if !p.contains_key(&name) && p.len() >= self.max {
-            return Err(FailReason::ResourceLimit);
+        p.retain(|_, r| r.session.strong_count() > 0);
+        if let Some(r) = p.get(&label) {
+            if r.owner != owner {
+                return Err(FailReason::BindFailed(format!("peer name {label} is registered by another owner")));
+            }
+        } else {
+            if p.len() >= self.max {
+                return Err(FailReason::ResourceLimit);
+            }
+            let mine = p.values().filter(|r| std::ptr::eq(r.session.as_ptr(), Arc::as_ptr(s))).count();
+            if mine >= self.per_session {
+                return Err(FailReason::ResourceLimit);
+            }
         }
-        p.insert(name, Arc::downgrade(s));
+        p.insert(label, Registration { owner, session: Arc::downgrade(s) });
         Ok(())
     }
 
-    fn lookup(&self, name: &str) -> Option<Arc<SessionShared>> {
-        self.peers.lock().unwrap().get(&name.to_ascii_lowercase()).and_then(Weak::upgrade)
-    }
-
-    pub fn has(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
+    fn lookup(&self, label: &str) -> Option<Arc<SessionShared>> {
+        self.peers.lock().unwrap().get(label).and_then(|r| r.session.upgrade())
     }
 
     /// Live registrations.
     pub fn len(&self) -> usize {
-        self.peers.lock().unwrap().values().filter(|w| w.strong_count() > 0).count()
+        self.peers.lock().unwrap().values().filter(|r| r.session.strong_count() > 0).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -210,36 +269,50 @@ impl SessionShared {
         }
     }
 
-    /// Gateway: a Register. Permitted like a listen on `name:0` (the
-    /// registration is the peer's listener at the gateway).
+    /// Gateway: a Register. Permitted like a listen on `<label>.peer:0`
+    /// (the registration is the peer's listener at the gateway).
     pub(crate) fn on_register(self: &Arc<Self>, req_id: u64, name: String) -> Result<()> {
         if self.role != Role::Server {
             return Err(Error::Protocol("Register sent to a client".into()));
         }
-        if !self.authz().allows_listen(&name, 0) {
+        let label = match peer_label(&name) {
+            Ok(l) => l,
+            Err(m) => return self.reply_ev(Message::ListenFail { req_id, reason: FailReason::BindFailed(m) }),
+        };
+        if !self.authz().allows_listen(&format!("{label}{PEER_SUFFIX}"), 0) {
             return self.reply_ev(Message::ListenFail { req_id, reason: FailReason::Prohibited });
         }
         let Some(rv) = self.rendezvous.lock().unwrap().clone() else {
             return self.reply_ev(Message::ListenFail { req_id, reason: FailReason::Prohibited });
         };
-        match rv.register(name.clone(), self) {
+        match rv.register(label.clone(), self) {
             Ok(()) => {
-                tracing::info!(peer = %name, "peer registered");
+                tracing::info!(peer = %label, user = %self.user, "peer registered");
                 self.reply_ev(Message::ListenOk { req_id, port: 0 })
             }
-            Err(reason) => self.reply_ev(Message::ListenFail { req_id, reason }),
+            Err(reason) => {
+                tracing::info!(peer = %label, user = %self.user, %reason, "peer registration refused");
+                self.reply_ev(Message::ListenFail { req_id, reason })
+            }
         }
     }
 
     /// Gateway: a client jumps to the registered peer `name`. Opens the
     /// peer's half and copies datagrams both ways; either half ending ends
     /// the other.
+    /// `name` is a peer label, bare or with the `.peer` suffix; permitted
+    /// like a direct connection to `<label>.peer:0`.
     pub(crate) fn accept_jump_peer(self: &Arc<Self>, chan_id: u64, name: String) -> Result<()> {
+        let label = match peer_target(&name).unwrap_or_else(|| peer_label(&name)) {
+            Ok(l) => l,
+            Err(m) => return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::ConnectFailed(m) }),
+        };
+        let name = format!("{label}{PEER_SUFFIX}");
         if !self.authz().allows_direct_tcp(&name, 0) {
             return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
         }
         let rv = self.rendezvous.lock().unwrap().clone();
-        let Some(peer) = rv.and_then(|r| r.lookup(&name)) else {
+        let Some(peer) = rv.and_then(|r| r.lookup(&label)) else {
             return self.reply_ev(Message::ChannelFail { chan_id, reason: FailReason::ConnectFailed(format!("no peer registered as {name}")) });
         };
         let (tx_c, mut rx_c) = mpsc::channel::<Bytes>(self.limits.udp_queue);

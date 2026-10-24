@@ -157,7 +157,7 @@ impl Server {
     }
 
     fn on_endpoint(opts: ServerOptions, endpoint: Endpoint, path: Option<Arc<ssh3_path::PathManager>>) -> Result<Self> {
-        let rendezvous = opts.rendezvous.then(|| crate::rendezvous::Rendezvous::new(opts.limits.max_sessions));
+        let rendezvous = opts.rendezvous.then(|| crate::rendezvous::Rendezvous::new(opts.limits.max_sessions, opts.limits.max_listeners));
         let local_port = endpoint.local_addr()?.port();
         let session_env = opts.session.map(|mut e| {
             e.local_port = local_port;

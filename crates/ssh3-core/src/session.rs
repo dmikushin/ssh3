@@ -693,10 +693,11 @@ impl SessionShared {
                 if !self.authz().allows_direct_tcp(&host, port) {
                     return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
                 }
-                // A gateway resolves registered peer names before DNS (SPEC
-                // §7.1): `ssh3 -J gw B` reaches the peer registered as B,
-                // whatever port the client names.
-                if self.rendezvous.lock().unwrap().as_ref().is_some_and(|r| r.has(&host)) {
+                // Registered peers have their own namespace (SPEC §7.1):
+                // `ssh3 -J gw box.peer` reaches the peer registered as `box`,
+                // whatever port the client names; such a name never goes to
+                // DNS, and no other name ever reaches a registration.
+                if crate::rendezvous::peer_target(&host).is_some() {
                     return self.accept_jump_peer(chan_id, host);
                 }
                 return self.accept_udp_channel(chan_id, host, port);

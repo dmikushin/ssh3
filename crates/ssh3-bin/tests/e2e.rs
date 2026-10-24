@@ -918,7 +918,7 @@ fn proxyjump_wrong_target_key_is_refused() {
 }
 
 /// A server registered at a gateway (SPEC §7.1) is reached by its name
-/// through the gateway: `ssh3 -J gw B`. The name exists only in the
+/// through the gateway: `ssh3 -J gw B.peer`. The name exists only in the
 /// gateway's registry (no DNS for it), so a working session proves the
 /// relay went through the registration; the connection to B is end to end
 /// (B's own host key and authorized_keys).
@@ -941,12 +941,12 @@ fn registered_peer_reached_by_name_through_gateway() {
     }
     let kh = target.dir.join("known_hosts.peer");
     let host_pub = std::fs::read_to_string(target.dir.join("host_key.pub")).unwrap();
-    std::fs::write(&kh, format!("[b]:443 {host_pub}")).unwrap();
+    std::fs::write(&kh, format!("[b.peer]:443 {host_pub}")).unwrap();
     let cfg = target.dir.join("ssh_config.peer");
     std::fs::write(
         &cfg,
         format!(
-            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\nHost peer\n  HostName B\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n",
+            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\nHost peer\n  HostName B.peer\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n",
             gp = gw.port,
             u = me(),
             g = gw.dir.display(),
@@ -1003,7 +1003,7 @@ fn gateway_restart_mid_transfer_is_survived() {
     registered(&gw);
     let kh = target.dir.join("known_hosts.peer");
     let host_pub = std::fs::read_to_string(target.dir.join("host_key.pub")).unwrap();
-    std::fs::write(&kh, format!("[b]:443 {host_pub}")).unwrap();
+    std::fs::write(&kh, format!("[b.peer]:443 {host_pub}")).unwrap();
     let cfg = target.dir.join("ssh_config.peer");
     // DirectPath no: the data must go over the relay, so it can only survive
     // the restart if the client moves the relay onto a new gateway session.
@@ -1011,7 +1011,7 @@ fn gateway_restart_mid_transfer_is_survived() {
     std::fs::write(
         &cfg,
         format!(
-            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}Host peer\n  HostName B\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}",
+            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}Host peer\n  HostName B.peer\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}",
             gp = gw.port,
             u = me(),
             g = gw.dir.display(),

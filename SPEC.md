@@ -514,19 +514,39 @@ No protocol messages; the client alone, ported from mosh's
   server's `[register]` section keeps a registration session from its own
   UDP socket (the one its endpoint serves on, so the gateway observes the
   real mapping) and re-registers whenever that session is lost.
-  `Register{name}` requires `permitlisten="name:0"`, jumping to a peer
-  requires `permitopen="name:0"` (OpenSSH option syntax reused). At the
-  gateway a registered name takes precedence over DNS, matched
-  case-insensitively. After every attach the gateway sends
+  After every attach the gateway sends
   `Observed{addr}` (the client's server-reflexive address); path signalling
   (`PathSignal`) travels on the inner connection's control stream. Channel
   kinds: `JumpPeer` (client side) paired with `PeerRelay` (on the peer's
   registration session). Counters: datagrams_sent/received,
   peers_registered, relay_routes.
+- **Peer namespace (security, after review of 050b115).** Registered names
+  live in their own namespace and never shadow DNS:
+  - A name is one label: 1–63 ASCII letters, digits and inner hyphens,
+    matched case-insensitively (canonical form lower case). Anything else —
+    dots, the suffix itself, non-ASCII — is refused with `BindFailed`
+    naming the rule.
+  - Clients address a peer as `<label>.peer` (`ssh3 -J gw box.peer`). A
+    host name ending in `.peer` is never resolved through DNS (unregistered
+    → `ConnectFailed`); a host name without it never reaches a registration,
+    so registering `localhost` or `github` cannot capture jumps to them.
+  - `Register{label}` requires `permitlisten="<label>.peer:0"`, jumping to a
+    peer requires `permitopen="<label>.peer:0"` (OpenSSH option syntax).
+- **Name ownership.** A name belongs to the (authenticated user, exact key)
+  that registered it for as long as that registration's session lives
+  (attached or lingering). The same owner may register it again from
+  another session (a restarted peer takes its name back); any other owner —
+  another user, or the same user with another key — gets `BindFailed`
+  ("registered by another owner"). The name is freed when the owner's
+  session ends. Without this a second permitted peer could take over a live
+  name and a client on accept-new would pin the impostor.
+- **Bounds (O1).** At most `max_sessions` names per gateway and
+  `max_listeners` per registering session (`ResourceLimit` beyond); relay
+  routes per peer are channels of its registration session (`max_channels`).
 
 ### 7.2 Relay path
-- `ssh3 -J gw target` opens a `jump` channel to the gateway. If `target` is a
-  registered peer, the gateway relays **QUIC packets as datagrams** between
+- `ssh3 -J gw target` opens a `jump` channel to the gateway. If `target` is
+  `<label>.peer` (§7.1), the gateway relays **QUIC packets as datagrams** between
   the two carrier connections. Otherwise the gateway forwards UDP to
   `target:port` like `direct-udp`.
 - **Fragmentation is end-to-end; the relay keeps no reassembly state.**
