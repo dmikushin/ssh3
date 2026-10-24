@@ -133,6 +133,21 @@ impl PathManager {
         *self.endpoint.lock().unwrap() = Some(ep);
     }
 
+    /// The endpoint attached to this manager, creating it with `make` (on
+    /// [`Self::socket`]) if there is none yet. One endpoint per manager:
+    /// every connection of a node — its gateway carrier, inner connections
+    /// it dials or accepts — rides the same UDP socket, so the NAT mapping
+    /// the gateway observes is the one punches reuse (SPEC §7.3).
+    pub fn endpoint_or_init(&self, make: impl FnOnce(Arc<PathSocket>) -> io::Result<Endpoint>) -> io::Result<Endpoint> {
+        let mut g = self.endpoint.lock().unwrap();
+        if let Some(ep) = g.as_ref() {
+            return Ok(ep.clone());
+        }
+        let ep = make(self.socket())?;
+        *g = Some(ep.clone());
+        Ok(ep)
+    }
+
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }

@@ -98,6 +98,12 @@ impl Env {
 
     /// `limits`: extra lines for the server's `[limits]` section.
     fn with_limits(limits: &str) -> Self {
+        Self::build("", limits, |_| String::new())
+    }
+
+    /// `top`: extra top-level config lines; `sections`: extra sections,
+    /// made from the new server's directory.
+    fn build(top: &str, limits: &str, sections: impl FnOnce(&Path) -> String) -> Self {
         let dir = PathBuf::from(std::env::var("HOME").unwrap())
             .join("scratch/ssh-udp/bins-tests")
             .join(format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
@@ -115,8 +121,9 @@ impl Env {
         std::fs::write(
             &conf,
             format!(
-                "listen = \"[::]:0\"\nhost_key = \"{d}/host_key\"\nendpoint_keys = \"{d}/endpoint-keys\"\nauthorized_keys = \"{d}/authorized_keys\"\nstats_socket = \"{d}/stats.sock\"\n[session]\nset_env = {{ HOME = \"{d}\", XDG_CONFIG_HOME = \"{d}/.config\" }}\n[limits]\nlogin_grace = \"5s\"\n{limits}",
-                d = dir.display()
+                "listen = \"[::]:0\"\nhost_key = \"{d}/host_key\"\nendpoint_keys = \"{d}/endpoint-keys\"\nauthorized_keys = \"{d}/authorized_keys\"\nstats_socket = \"{d}/stats.sock\"\n{top}[session]\nset_env = {{ HOME = \"{d}\", XDG_CONFIG_HOME = \"{d}/.config\" }}\n[limits]\nlogin_grace = \"5s\"\n{limits}\n{extra}",
+                d = dir.display(),
+                extra = sections(&dir)
             ),
         )
         .unwrap();
@@ -864,4 +871,51 @@ fn proxyjump_wrong_target_key_is_refused() {
     assert!(o.stderr.contains("Host key verification failed."), "{}", o.stderr);
     assert!(o.stdout.is_empty());
     assert_eq!(target.stats()["sessions"].as_u64(), Some(0));
+}
+
+/// A server registered at a gateway (SPEC §7.1) is reached by its name
+/// through the gateway: `ssh3 -J gw B`. The name exists only in the
+/// gateway's registry (no DNS for it), so a working session proves the
+/// relay went through the registration; the connection to B is end to end
+/// (B's own host key and authorized_keys).
+#[test]
+fn registered_peer_reached_by_name_through_gateway() {
+    let gw = Env::build("rendezvous = true\n", "", |_| String::new());
+    let gwd = gw.dir.clone();
+    let gw_port = gw.port;
+    let target = Env::build("", "", move |_| {
+        format!(
+            "[register]\ngateway = \"127.0.0.1:{gw_port}\"\nname = \"B\"\nuser = \"{u}\"\nidentity = \"{g}/user_key\"\nknown_hosts = \"{g}/known_hosts\"\n",
+            u = me(),
+            g = gwd.display()
+        )
+    });
+    let end = Instant::now() + DEADLINE;
+    while gw.stats()["peers_registered"].as_u64() != Some(1) {
+        assert!(Instant::now() < end, "target never registered: {}", gw.stats());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let kh = target.dir.join("known_hosts.peer");
+    let host_pub = std::fs::read_to_string(target.dir.join("host_key.pub")).unwrap();
+    std::fs::write(&kh, format!("[b]:443 {host_pub}")).unwrap();
+    let cfg = target.dir.join("ssh_config.peer");
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\nHost peer\n  HostName B\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n",
+            gp = gw.port,
+            u = me(),
+            g = gw.dir.display(),
+            t = target.dir.display(),
+            kh = kh.display()
+        ),
+    )
+    .unwrap();
+    let o = run(jcmd(&cfg, &["peer", "echo via-peer; exit 6"]), b"");
+    assert_eq!(o.code, Some(6), "stderr: {}", o.stderr);
+    assert_eq!(o.stdout, b"via-peer\n");
+    let data: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 9) as u8).collect();
+    let o = run(jcmd(&cfg, &["peer", "cat"]), &data);
+    assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
+    assert_eq!(sha(&o.stdout), sha(&data));
 }

@@ -24,6 +24,10 @@ pub struct ServerOptions {
     pub keys: EndpointKeys,
     /// Session channels (shell/exec/subsystem); None refuses them.
     pub session: Option<crate::sesschan::ServerSessionEnv>,
+    /// Act as a rendezvous gateway (SPEC §7.1): clients may register as
+    /// peers (permitted like a listen on `name:0`) and others may jump to
+    /// them (permitted like direct-tcp to `name:0`).
+    pub rendezvous: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +49,10 @@ struct ServerShared {
     budgets: Arc<Budgets>,
     counters: Counters,
     session_env: Option<Arc<crate::sesschan::ServerSessionEnv>>,
+    rendezvous: Option<Arc<crate::rendezvous::Rendezvous>>,
+    /// Set once this server has registered at a gateway.
+    hub: Mutex<Option<Arc<crate::rendezvous::PeerHub>>>,
+    path: Option<Arc<ssh3_path::PathManager>>,
 }
 
 pub struct Server {
@@ -123,13 +131,33 @@ pub struct ServerStats {
     /// except for their effect on the screen) and redraws appended.
     pub pty_screen_bytes: u64,
     pub pty_redraws: u64,
+    /// §7: peers registered at this gateway; relayed inner connections
+    /// routed to this registered server.
+    pub peers_registered: u64,
+    pub relay_routes: u64,
 }
 
 impl Server {
     pub fn bind(opts: ServerOptions, socket: std::net::UdpSocket) -> Result<Self> {
         opts.limits.validate().map_err(Error::Config)?;
-        let sc = transport::server_config(opts.tls, &opts.limits)?;
+        let sc = transport::server_config(opts.tls.clone(), &opts.limits)?;
         let endpoint = Endpoint::new(transport::endpoint_config(&opts.keys), Some(sc), socket, Arc::new(TokioRuntime))?;
+        Self::on_endpoint(opts, endpoint, None)
+    }
+
+    /// Serve on a path manager's endpoint (SPEC §7): the node's gateway
+    /// registration and every relayed or direct inner connection share its
+    /// one UDP socket.
+    pub fn bind_path(opts: ServerOptions, mgr: Arc<ssh3_path::PathManager>) -> Result<Self> {
+        opts.limits.validate().map_err(Error::Config)?;
+        let sc = transport::server_config(opts.tls.clone(), &opts.limits)?;
+        let keys = opts.keys.clone();
+        let endpoint = mgr.endpoint_or_init(|sock| Endpoint::new_with_abstract_socket(transport::endpoint_config(&keys), Some(sc), sock, Arc::new(TokioRuntime)))?;
+        Self::on_endpoint(opts, endpoint, Some(mgr))
+    }
+
+    fn on_endpoint(opts: ServerOptions, endpoint: Endpoint, path: Option<Arc<ssh3_path::PathManager>>) -> Result<Self> {
+        let rendezvous = opts.rendezvous.then(|| crate::rendezvous::Rendezvous::new(opts.limits.max_sessions));
         let local_port = endpoint.local_addr()?.port();
         let session_env = opts.session.map(|mut e| {
             e.local_port = local_port;
@@ -143,6 +171,9 @@ impl Server {
             registry: Arc::new(Mutex::new(HashMap::new())),
             counters: Counters::default(),
             session_env,
+            rendezvous,
+            hub: Mutex::new(None),
+            path,
         });
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self { endpoint, shared, accept_task })
@@ -175,6 +206,22 @@ impl Server {
         self.shared.registry.lock().unwrap().get(id).cloned()
     }
 
+    /// Register this server (built with `bind_path`) at a gateway as the
+    /// peer `name` (SPEC §7.1), over a client session on the same endpoint.
+    /// Relayed clients then reach this server through the gateway and both
+    /// ends upgrade to a direct path with `cfg` when the NATs allow. Keep the
+    /// returned session alive: dropping it ends the registration.
+    pub async fn register_at(&self, opts: crate::ClientOptions, name: &str, cfg: ssh3_path::PathConfig) -> Result<crate::ClientSession> {
+        let mgr = self.shared.path.clone().ok_or_else(|| Error::Config("register_at needs a server made with bind_path".into()))?;
+        let hub = crate::rendezvous::PeerHub::new(mgr.clone(), cfg);
+        let sess = crate::ClientSession::connect(crate::ClientOptions { path: Some(mgr.clone()), ..opts }, mgr.socket()).await?;
+        hub.set_gateway(&sess.shared);
+        *sess.shared.hub.lock().unwrap() = Some(hub.clone());
+        sess.shared.register(name.to_string()).await?;
+        *self.shared.hub.lock().unwrap() = Some(hub);
+        Ok(sess)
+    }
+
     pub fn stats(&self) -> ServerStats {
         let all: Vec<_> = self.shared.registry.lock().unwrap().values().cloned().collect();
         let c = &self.shared.counters;
@@ -193,6 +240,8 @@ impl Server {
             resumes_rejected: c.resumes_rejected.load(Ordering::Relaxed),
             protocol_closes: c.protocol_closes.load(Ordering::Relaxed),
             refused_unauth_cap: c.refused_unauth_cap.load(Ordering::Relaxed),
+            peers_registered: self.shared.rendezvous.as_ref().map_or(0, |r| r.len() as u64),
+            relay_routes: self.shared.hub.lock().unwrap().as_ref().map_or(0, |h| h.routes() as u64),
             ..Default::default()
         };
         for s in all {
@@ -303,6 +352,7 @@ async fn handle(conn: Connection, shared: Arc<ServerShared>, permit: OwnedSemaph
                 Some(Arc::downgrade(&shared.registry)),
                 shared.session_env.clone(),
             );
+            *session.rendezvous.lock().unwrap() = shared.rendezvous.clone();
             {
                 let mut reg = shared.registry.lock().unwrap();
                 if reg.len() >= shared.limits.max_sessions {
@@ -316,7 +366,8 @@ async fn handle(conn: Connection, shared: Arc<ServerShared>, permit: OwnedSemaph
             let info = SessionInfo { session_id: id, linger_secs: shared.limits.linger.as_secs() };
             tracing::info!(session = %hex(&id), user = %session.user, "session created");
             let _g = session.attach_lock.lock().await;
-            session.install_carrier(conn, send, recv, |_| Some(Message::AuthOk { session: Some(info) }));
+            session.install_carrier(conn.clone(), send, recv, |_| Some(Message::AuthOk { session: Some(info) }));
+            after_attach(&shared, &session, &conn);
             Ok(())
         }
         Authed::Resume { user, key, authz, session_id, lanes } => {
@@ -355,10 +406,24 @@ async fn handle(conn: Connection, shared: Arc<ServerShared>, permit: OwnedSemaph
             let n = ours.len();
             // Counted before Resumed is sent: Resumed confirms it.
             shared.counters.resumes_accepted.fetch_add(1, Ordering::Relaxed);
-            let epoch = session.install_carrier(conn, send, recv, move |epoch| Some(Message::Resumed { lanes: ours, epoch }));
+            let epoch = session.install_carrier(conn.clone(), send, recv, move |epoch| Some(Message::Resumed { lanes: ours, epoch }));
+            after_attach(&shared, &session, &conn);
             tracing::info!(session = %hex(&session_id), lanes = n, epoch, "session resumed");
             Ok(())
         }
+    }
+}
+
+/// Every attach: tell the client where we see it (its server-reflexive
+/// candidate, SPEC §7.3), and start the direct-path machinery of a relayed
+/// inner connection.
+fn after_attach(shared: &ServerShared, session: &Arc<SessionShared>, conn: &Connection) {
+    let addr = ssh3_path::socket::canonical(conn.remote_address());
+    if !ssh3_path::is_virtual(addr.ip()) {
+        let _ = session.send_ctrl(Message::Observed { addr: addr.to_string() });
+    }
+    if let Some(h) = shared.hub.lock().unwrap().clone() {
+        h.on_inner_attach(session, conn);
     }
 }
 

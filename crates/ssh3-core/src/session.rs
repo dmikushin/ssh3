@@ -183,6 +183,16 @@ pub struct SessionShared {
     /// When the peer was last heard on the control stream (acks, pongs).
     last_contact: Mutex<std::time::Instant>,
     registry: Option<Weak<Registry>>,
+    /// Gateway (server) side of §7.1: the server-wide peer registry.
+    pub(crate) rendezvous: Mutex<Option<Arc<crate::rendezvous::Rendezvous>>>,
+    /// Registered peer: where relayed inner connections are routed (its
+    /// gateway session only).
+    pub(crate) hub: Mutex<Option<Arc<crate::rendezvous::PeerHub>>>,
+    /// Inner connection: the direct-path machinery fed by PathSignal.
+    pub(crate) path_peer: Mutex<Option<Arc<ssh3_path::PeerPath>>>,
+    /// Client: our address as the server observes it (Observed, §7.3).
+    pub(crate) observed: watch::Sender<Option<std::net::SocketAddr>>,
+    register_pending: Mutex<HashMap<u64, oneshot::Sender<std::result::Result<(), FailReason>>>>,
 }
 
 impl SessionShared {
@@ -232,6 +242,11 @@ impl SessionShared {
             last_pong: watch::channel(0).0,
             last_contact: Mutex::new(std::time::Instant::now()),
             registry,
+            rendezvous: Mutex::new(None),
+            hub: Mutex::new(None),
+            path_peer: Mutex::new(None),
+            observed: watch::channel(None).0,
+            register_pending: Mutex::new(HashMap::new()),
             limits,
         });
         s.start_event_log(events_rx);
@@ -369,6 +384,14 @@ impl SessionShared {
 
     fn conn(&self) -> Option<(Connection, u64)> {
         self.carrier.lock().unwrap().as_ref().map(|c| (c.conn.clone(), c.epoch))
+    }
+
+    pub(crate) fn next_req_id(&self) -> u64 {
+        self.next_req.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn register_pending_insert(&self, req_id: u64, tx: oneshot::Sender<std::result::Result<(), FailReason>>) {
+        self.register_pending.lock().unwrap().insert(req_id, tx);
     }
 
     /// Queue a session event (reliable, survives carrier death).
@@ -647,10 +670,18 @@ impl SessionShared {
                 (host, port)
             }
             (Role::Server, ChannelKind::Session) => return self.accept_session(chan_id, peer_limit),
+            (Role::Server, ChannelKind::JumpPeer { name }) => return self.accept_jump_peer(chan_id, name),
+            (Role::Client, ChannelKind::PeerRelay { from }) => return self.accept_peer_relay(chan_id, from),
             (Role::Client, ChannelKind::AuthAgent) => return self.accept_agent(chan_id, peer_limit),
             (Role::Server, ChannelKind::DirectUdp { host, port }) => {
                 if !self.authz().allows_direct_tcp(&host, port) {
                     return self.reply_event(Message::ChannelFail { chan_id, reason: FailReason::Prohibited });
+                }
+                // A gateway resolves registered peer names before DNS (SPEC
+                // §7.1): `ssh3 -J gw B` reaches the peer registered as B,
+                // whatever port the client names.
+                if self.rendezvous.lock().unwrap().as_ref().is_some_and(|r| r.has(&host)) {
+                    return self.accept_jump_peer(chan_id, host);
                 }
                 return self.accept_udp_channel(chan_id, host, port);
             }
@@ -865,6 +896,19 @@ impl SessionShared {
                 self.on_exit(chan_id, crate::sesschan::ExitInfo::Signal { name: signal, core_dumped });
                 Ok(())
             }
+            Message::ListenOk { req_id, .. } if self.register_pending.lock().unwrap().contains_key(&req_id) => {
+                if let Some(tx) = self.register_pending.lock().unwrap().remove(&req_id) {
+                    let _ = tx.send(Ok(()));
+                }
+                Ok(())
+            }
+            Message::ListenFail { req_id, reason } if self.register_pending.lock().unwrap().contains_key(&req_id) => {
+                if let Some(tx) = self.register_pending.lock().unwrap().remove(&req_id) {
+                    let _ = tx.send(Err(reason));
+                }
+                Ok(())
+            }
+            Message::Register { req_id, name } => self.on_register(req_id, name),
             Message::ListenOk { req_id, port } => {
                 // Register the target here, in event order: the server's
                 // first ChannelOpen for this listener comes after ListenOk.
@@ -934,6 +978,22 @@ impl SessionShared {
                 // Best effort: a full queue means the path is congested
                 // anyway, and the prober will try again.
                 let _ = self.send_ctrl(Message::Pong { n });
+                Ok(())
+            }
+            Message::Observed { addr } => {
+                if self.role != Role::Client {
+                    return Err(Error::Protocol("Observed sent to a server".into()));
+                }
+                let a: std::net::SocketAddr = addr.parse().map_err(|e| Error::Protocol(format!("Observed address {addr:?}: {e}")))?;
+                self.observed.send_replace(Some(ssh3_path::socket::canonical(a)));
+                Ok(())
+            }
+            Message::PathSignal { bytes } => {
+                // A signal for a connection without path machinery (yet) is
+                // dropped: the peer's round times out and retries.
+                if let Some(p) = self.path_peer.lock().unwrap().as_ref() {
+                    p.signal_in(bytes);
+                }
                 Ok(())
             }
             Message::Pong { n } => {
@@ -1316,6 +1376,10 @@ impl SessionShared {
         drop(pending);
         let chans: Vec<_> = self.channels.lock().unwrap().drain().collect();
         drop(chans);
+        drop(self.path_peer.lock().unwrap().take());
+        drop(self.hub.lock().unwrap().take());
+        let rp: Vec<_> = self.register_pending.lock().unwrap().drain().collect();
+        drop(rp);
         if let Some(r) = self.registry.as_ref().and_then(|r| r.upgrade()) {
             let me = r.lock().unwrap().remove(&self.id);
             drop(me);

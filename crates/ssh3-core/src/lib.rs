@@ -9,6 +9,7 @@ pub mod jump;
 pub mod lane;
 pub mod limits;
 pub mod msg;
+pub mod rendezvous;
 pub mod ring;
 pub mod server;
 pub mod sesschan;
@@ -24,3 +25,4 @@ pub use server::{Server, ServerOptions, ServerStats};
 pub use session::Budgets;
 pub use sesschan::{Command, ExitInfo, PtySpec, ServerSessionEnv, SessionChannel, SessionSpec, UserLookup};
 
+pub use ssh3_path as path;

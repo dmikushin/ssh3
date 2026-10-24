@@ -11,6 +11,12 @@
 //! the rest by name. Session processes (when core gains session channels)
 //! are spawned through ssh3-session, which drops privileges per session.
 //!
+//! `rendezvous = true` makes it a gateway for registered peers; a
+//! `[register]` section makes it such a peer (SPEC §7.1): it serves on a
+//! path-managed endpoint, keeps a client session to the gateway from the same
+//! UDP socket, and relayed clients upgrade to a direct path when the NATs
+//! allow (§7.3).
+//!
 //! Observability (SPEC §8 I6): SIGUSR1 prints one JSON line of server
 //! counters on stdout; `stats_socket` serves the same JSON to each client
 //! that connects. SIGTERM/SIGINT: every session is torn down (carriers
@@ -128,10 +134,15 @@ fn run(args: Args) -> Result<(), String> {
     rt.block_on(async move {
         let socket = dual_stack_socket(cfg.listen).map_err(|e| format!("listen {}: {e}", cfg.listen))?;
         let session = Some(ssh3_core::ServerSessionEnv::new(cfg.session()));
-        let server = Server::bind(ServerOptions { tls, authenticator, limits, keys, session }, socket).map_err(|e| e.to_string())?;
+        let rendezvous = cfg.rendezvous;
+        // Every server runs on a path manager: the one UDP socket carries its
+        // own connections, a gateway registration and direct-path punches.
+        let mgr = ssh3_core::path::PathManager::new(ssh3_core::udp_socket(socket).map_err(|e| e.to_string())?);
+        let server = Server::bind_path(ServerOptions { tls, authenticator, limits, keys, session, rendezvous }, mgr).map_err(|e| e.to_string())?;
         println!("ssh3-server: listening on {}", server.local_addr());
         let _ = std::io::stdout().flush();
         let server = Arc::new(server);
+        let register_task = cfg.register.as_ref().map(|r| tokio::spawn(keep_registered(server.clone(), r.clone_spec())));
         let stats_task = match &cfg.stats_socket {
             Some(p) => Some(serve_stats(p, server.clone())?),
             None => None,
@@ -156,11 +167,81 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(t) = stats_task {
             t.abort();
         }
+        if let Some(t) = register_task {
+            t.abort();
+        }
         if let Some(p) = &cfg.stats_socket {
             let _ = std::fs::remove_file(p);
         }
         Ok(())
     })
+}
+
+/// What a registration needs, owned by the supervisor task.
+pub struct RegisterSpec {
+    gateway: String,
+    name: String,
+    user: String,
+    identity: PathBuf,
+    known_hosts: PathBuf,
+    alias: Option<String>,
+}
+
+impl crate::server_config::Register {
+    fn clone_spec(&self) -> RegisterSpec {
+        RegisterSpec { gateway: self.gateway.clone(), name: self.name.clone(), user: self.user.clone(), identity: self.identity.clone(), known_hosts: self.known_hosts.clone(), alias: self.host_key_alias.clone() }
+    }
+}
+
+const REGISTER_RETRY_MIN: Duration = Duration::from_secs(1);
+const REGISTER_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Register at the gateway and stay registered: when the registration
+/// session gives up (the gateway refused the resume, e.g. it restarted),
+/// register again, with exponential backoff on failures.
+async fn keep_registered(server: Arc<Server>, r: RegisterSpec) {
+    let mut wait = REGISTER_RETRY_MIN;
+    loop {
+        match register_once(&server, &r).await {
+            Ok(sess) => {
+                tracing::info!(gateway = %r.gateway, name = %r.name, "registered at the gateway");
+                wait = REGISTER_RETRY_MIN;
+                sess.gave_up().await;
+                tracing::warn!(gateway = %r.gateway, "registration session lost; registering again");
+            }
+            Err(e) => {
+                tracing::warn!(gateway = %r.gateway, "registration failed: {e}; retrying in {wait:?}");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(REGISTER_RETRY_MAX);
+            }
+        }
+    }
+}
+
+async fn register_once(server: &Server, r: &RegisterSpec) -> Result<ssh3_core::ClientSession, String> {
+    let (host, port) = match r.gateway.rsplit_once(':') {
+        Some((h, p)) => (h.trim_start_matches('[').trim_end_matches(']').to_string(), p.parse::<u16>().map_err(|e| format!("gateway {:?}: port: {e}", r.gateway))?),
+        None => (r.gateway.clone(), 443),
+    };
+    let addr = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| format!("resolve {host}: {e}"))?.next().ok_or_else(|| format!("resolve {host}: no address"))?;
+    let signer: Arc<dyn ssh3_core::auth::Signer> = Arc::new(ssh3_keys::signer::FileSigner::load(&r.identity).map_err(|e| format!("identity {}: {e}", r.identity.display()))?);
+    let opts = ssh3_core::ClientOptions {
+        server_addr: addr,
+        host: ssh3_core::client::HostCheck {
+            name: r.alias.clone().unwrap_or(host),
+            port,
+            files: vec![r.known_hosts.clone()],
+            mode: ssh3_keys::verifier::StrictHostKeyChecking::Yes,
+            hash_known_hosts: false,
+            prompt: None,
+        },
+        signers: vec![signer],
+        user: r.user.clone(),
+        limits: ssh3_core::Limits::default(),
+        sockets: ssh3_core::client::dual_stack_factory(),
+        path: None,
+    };
+    server.register_at(opts, &r.name, ssh3_core::path::PathConfig::default()).await.map_err(|e| e.to_string())
 }
 
 /// One JSON object per connection on a Unix socket.

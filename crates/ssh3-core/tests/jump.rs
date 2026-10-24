@@ -12,7 +12,7 @@ use ssh3_core::{ClientOptions, ClientSession, Error};
 /// Inner options: the target's own known_hosts and authorized_keys, dialled
 /// at the jump path's virtual address.
 fn inner_opts(target: &Env, path: &ssh3_core::jump::JumpPath) -> ClientOptions {
-    ClientOptions { server_addr: path.virt, sockets: path.socket_factory(), ..target.opts(&target.key) }
+    path.inner_opts(target.opts(&target.key))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

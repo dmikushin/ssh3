@@ -100,8 +100,13 @@ pub struct ClientOptions {
     pub signers: Vec<Arc<dyn Signer>>,
     pub user: String,
     pub limits: Limits,
-    /// Sockets for rebinds and automatic resumes.
+    /// Sockets for rebinds and automatic resumes (unused with `path`).
     pub sockets: SocketFactory,
+    /// Run on this path manager's one endpoint instead of an own one (SPEC
+    /// §7): every connection of the node shares its UDP socket — the NAT
+    /// mapping the gateway observes is the one punches reuse — and rebinds
+    /// go through the manager (the single route owner).
+    pub path: Option<Arc<ssh3_path::PathManager>>,
 }
 
 /// Roaming counters (SPEC §8 I6).
@@ -178,9 +183,11 @@ async fn connect_and_auth(opts: &ClientOptions, signers: &[Arc<dyn Signer>], soc
     let verifier = opts.host.verifier();
     let recording = Arc::new(RecordingVerifier { inner: verifier.clone(), rejected: Mutex::new(None) });
     let cc = transport::client_config(transport::client_tls(recording.clone())?, &opts.limits)?;
-    let mut ep = Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, socket, Arc::new(TokioRuntime))?;
-    ep.set_default_client_config(cc);
-    let conn = match ep.connect(transport::to_v6(opts.server_addr), "ssh3-rs")?.await {
+    let ep = match &opts.path {
+        Some(mgr) => mgr.endpoint_or_init(|sock| Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, sock, Arc::new(TokioRuntime)))?,
+        None => Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, socket, Arc::new(TokioRuntime))?,
+    };
+    let conn = match ep.connect_with(cc, transport::to_v6(opts.server_addr), "ssh3-rs")?.await {
         Ok(c) => c,
         Err(e) => {
             // A handshake that failed because known_hosts refused the key is
@@ -268,6 +275,11 @@ impl ClientSession {
         });
         let roamer = tokio::spawn(roam(Arc::downgrade(&inner)));
         Ok(Self { shared, inner, roamer })
+    }
+
+    /// The path manager this session's endpoint runs on, if any.
+    pub fn path(&self) -> Option<Arc<ssh3_path::PathManager>> {
+        self.inner.opts.path.clone()
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -429,6 +441,12 @@ impl ClientInner {
 
     /// Move the carrier to a fresh socket (QUIC migration, SPEC §5.1).
     fn rebind(&self) -> std::io::Result<()> {
+        if let Some(mgr) = &self.opts.path {
+            // The path manager owns the socket: it moves the shared endpoint
+            // and restarts every peer path (SPEC §7.2 "One route owner").
+            let io = udp_socket(transport::dual_stack_socket(transport::unspecified_dual()).map_err(std::io::Error::other)?).map_err(std::io::Error::other)?;
+            return mgr.rebind(io);
+        }
         let sock = (self.opts.sockets)()?;
         match self.endpoint.lock().unwrap().as_ref() {
             Some(ep) => ep.rebind_abstract(sock),

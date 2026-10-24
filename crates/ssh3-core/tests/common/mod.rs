@@ -101,7 +101,13 @@ pub fn current_user() -> String {
     std::env::var("USER").expect("USER is set")
 }
 
-pub fn env_with_session(limits: Limits, mut session: ssh3_core::ServerSessionEnv) -> Env {
+pub fn env_with_session(limits: Limits, session: ssh3_core::ServerSessionEnv) -> Env {
+    env_bind(limits, session, |o| Server::bind(o, dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap())
+}
+
+/// As `env_with_session`, with the server made by `bind` (e.g. on a path
+/// manager over a simulated network).
+pub fn env_bind(limits: Limits, mut session: ssh3_core::ServerSessionEnv, bind: impl FnOnce(ServerOptions) -> Server) -> Env {
     init();
     let dir = PathBuf::from(std::env::var("HOME").unwrap())
         .join("scratch/ssh-udp/core-tests")
@@ -113,7 +119,7 @@ pub fn env_with_session(limits: Limits, mut session: ssh3_core::ServerSessionEnv
     let authorized_keys = dir.join("authorized_keys");
     std::fs::write(&authorized_keys, format!("{}\n", key.public_key().to_openssh().unwrap())).unwrap();
     let ak = authorized_keys.clone();
-    let server = Server::bind(
+    let server = bind(
         ServerOptions {
             tls: ssh3_core::transport::server_tls(&host).unwrap(),
             // Every account uses the same file: one key may serve several
@@ -122,10 +128,9 @@ pub fn env_with_session(limits: Limits, mut session: ssh3_core::ServerSessionEnv
             limits: limits.clone(),
             keys: EndpointKeys::random(),
             session: Some(session),
+            rendezvous: true,
         },
-        dual_stack_socket("[::]:0".parse().unwrap()).unwrap(),
-    )
-    .unwrap();
+    );
     let known_hosts = dir.join("known_hosts");
     ssh3_keys::known_hosts::append(&known_hosts, "127.0.0.1", server.local_addr().port(), host.public_key(), false).unwrap();
     Env { dir, host, key, authorized_keys, known_hosts, server, limits }
@@ -166,6 +171,7 @@ impl Env {
             user: "tester".into(),
             limits: self.limits.clone(),
             sockets: ssh3_core::client::dual_stack_factory(),
+            path: None,
         }
     }
     pub async fn client(&self) -> ClientSession {

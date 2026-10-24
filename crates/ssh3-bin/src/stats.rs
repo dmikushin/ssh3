@@ -40,6 +40,8 @@ pub fn to_json(s: &ServerStats) -> Value {
         retract_timeouts,
         pty_screen_bytes,
         pty_redraws,
+        peers_registered,
+        relay_routes,
     } = *s;
     json!({
         "conns_accepted": conns_accepted,
@@ -75,5 +77,7 @@ pub fn to_json(s: &ServerStats) -> Value {
         "retract_timeouts": retract_timeouts,
         "pty_screen_bytes": pty_screen_bytes,
         "pty_redraws": pty_redraws,
+        "peers_registered": peers_registered,
+        "relay_routes": relay_routes,
     })
 }

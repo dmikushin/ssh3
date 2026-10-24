@@ -14,6 +14,14 @@
 //! authorized_keys = "%h/.ssh/authorized_keys"      # %h home, %u user, %% percent;
 //!                                                  # relative paths are relative to %h
 //! stats_socket = "/run/ssh3/stats.sock"     # optional; one JSON object per connection
+//! rendezvous = false                        # act as a gateway for registered peers (SPEC §7.1)
+//!
+//! [register]                                # optional: be reachable as a peer at a gateway
+//! gateway = "gw.example.org:443"            # the gateway's ssh3-server
+//! name = "home"                             # clients reach us as `ssh3 -J gw home`
+//! user = "peer"                             # account at the gateway
+//! identity = "/etc/ssh3/peer_ed25519"       # private key (OpenSSH format)
+//! known_hosts = "/etc/ssh3/gateway_known_hosts"   # the gateway's host key
 //!
 //! [session]                                 # sshd_config analogues, all optional
 //! accept_env = ["LANG", "LC_*"]             # AcceptEnv
@@ -50,6 +58,24 @@ pub struct ServerConfig {
     pub session: SessionOverrides,
     #[serde(default)]
     pub limits: LimitsOverrides,
+    #[serde(default)]
+    pub rendezvous: bool,
+    pub register: Option<Register>,
+}
+
+/// Registration at a gateway (SPEC §7.1): the server keeps a client session
+/// to the gateway from its own UDP socket and re-registers whenever that
+/// session is lost for good (e.g. the gateway restarted).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Register {
+    pub gateway: String,
+    pub name: String,
+    pub user: String,
+    pub identity: PathBuf,
+    pub known_hosts: PathBuf,
+    /// known_hosts lookup name; default: the gateway host as written.
+    pub host_key_alias: Option<String>,
 }
 
 fn default_authorized_keys() -> String {

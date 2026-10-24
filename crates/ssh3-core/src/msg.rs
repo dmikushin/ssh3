@@ -57,6 +57,12 @@ pub enum ChannelKind {
     DirectUdp { host: String, port: u16 },
     /// -R UDP: one flow from `origin` to the server's UDP listener.
     ForwardedUdp { bind_host: String, bind_port: u16, origin_host: String, origin_port: u16 },
+    /// Client → gateway (SPEC §7.2): relay datagrams to the peer registered
+    /// as `name` (inner QUIC packets, end-to-end fragmented).
+    JumpPeer { name: String },
+    /// Gateway → registered peer: the other end of a JumpPeer relay; `from`
+    /// is the jumping client's address as the gateway observes it.
+    PeerRelay { from: String },
 }
 
 /// A request on a session channel (RFC 4254 §6, carried as events).
@@ -158,10 +164,19 @@ pub enum Message {
     /// Client → server, event log: the client ends the session on purpose;
     /// the server destroys it at once (SPEC §5 "Deliberate end").
     SessionEnd,
+    /// Client → gateway, event log (SPEC §7.1): register this session as the
+    /// peer `name`; answered by ListenOk (port 0) / ListenFail.
+    Register { req_id: u64, name: String },
+    /// Server → client, control stream, after every attach: the client's
+    /// address as the server observes it (server-reflexive, SPEC §7.3).
+    Observed { addr: String },
+    /// Inner connection, control stream: an encoded ssh3-path signal
+    /// (candidates, nomination; SPEC §7.3).
+    PathSignal { bytes: Vec<u8> },
 }
 
 /// Number of variants of `Message`; a wire type ≥ this is unknown.
-pub const MESSAGE_TYPES: u32 = 28;
+pub const MESSAGE_TYPES: u32 = 31;
 
 /// Channel id of the session event log (lane 0).
 pub const EVENT_CHANNEL: u64 = 0;
