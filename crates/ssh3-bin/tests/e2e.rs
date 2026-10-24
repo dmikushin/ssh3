@@ -146,6 +146,22 @@ impl Env {
         env
     }
 
+    /// Kill the server (by its own PID) and start it again on the same port
+    /// with the same config, host key and endpoint keys — a process restart:
+    /// every session the old process held is gone.
+    fn restart(&mut self) {
+        let _ = self.server.child.kill();
+        let _ = self.server.child.wait();
+        let conf = self.dir.join("server.toml");
+        let text = std::fs::read_to_string(&conf).unwrap().replace("listen = \"[::]:0\"", &format!("listen = \"[::]:{}\"", self.port));
+        std::fs::write(&conf, text).unwrap();
+        let log = std::fs::OpenOptions::new().append(true).open(self.dir.join("server.log")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ssh3-server")).arg("-f").arg(&conf).stdout(Stdio::piped()).stderr(log).spawn().unwrap();
+        let out = lines(child.stdout.take().unwrap());
+        self.server = Proc { child, name: "ssh3-server" };
+        expect_line(&out, "'listening on' after restart", |l| l.contains("listening on"));
+    }
+
     fn client_config(&self, identity: &str) -> PathBuf {
         let p = self.dir.join(format!("ssh_config.{identity}"));
         std::fs::write(
@@ -176,6 +192,14 @@ impl Env {
             .unwrap();
         let err = lines(child.stderr.take().unwrap());
         (Proc { child, name: "ssh3" }, err)
+    }
+
+    /// Stats, or None while the stats socket is not up yet (just started).
+    fn try_stats(&self) -> Option<serde_json::Value> {
+        let mut s = std::os::unix::net::UnixStream::connect(self.dir.join("stats.sock")).ok()?;
+        let mut body = String::new();
+        s.read_to_string(&mut body).ok()?;
+        serde_json::from_str(&body).ok()
     }
 
     fn stats(&self) -> serde_json::Value {
@@ -918,4 +942,118 @@ fn registered_peer_reached_by_name_through_gateway() {
     let o = run(jcmd(&cfg, &["peer", "cat"]), &data);
     assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
     assert_eq!(sha(&o.stdout), sha(&data));
+}
+
+/// `-W host:port`: stdin/stdout bridged to a direct-tcp channel (the
+/// building block of ProxyCommand chains); ends when the far side closes.
+#[test]
+fn stdio_forward_dash_w() {
+    let env = Env::new();
+    let echo = echo_server();
+    let data: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+    let o = run(env.cmd("user_key", &["-W", &format!("127.0.0.1:{echo}"), "t"]), &data);
+    assert_eq!(o.code, Some(0), "stderr: {}", o.stderr);
+    assert_eq!(sha(&o.stdout), sha(&data), "{} bytes back", o.stdout.len());
+}
+
+/// The gateway process is killed and restarted mid-transfer. The registered
+/// peer registers again, the client reconnects to the gateway and moves its
+/// relay onto the new session by itself, and the inner session continues
+/// (or resumes) end to end: the transfer completes with its SHA intact, with
+/// no user action.
+#[test]
+fn gateway_restart_mid_transfer_is_survived() {
+    let mut gw = Env::build("rendezvous = true\n", "", |_| String::new());
+    let gwd = gw.dir.clone();
+    let gw_port = gw.port;
+    let target = Env::build("", "", move |_| {
+        format!(
+            "[register]\ngateway = \"127.0.0.1:{gw_port}\"\nname = \"B\"\nuser = \"{u}\"\nidentity = \"{g}/user_key\"\nknown_hosts = \"{g}/known_hosts\"\n",
+            u = me(),
+            g = gwd.display()
+        )
+    });
+    let registered = |gw: &Env| {
+        let end = Instant::now() + DEADLINE;
+        while gw.try_stats().and_then(|s| s["peers_registered"].as_u64()) != Some(1) {
+            assert!(Instant::now() < end, "target not registered: {:?}", gw.try_stats());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    registered(&gw);
+    let kh = target.dir.join("known_hosts.peer");
+    let host_pub = std::fs::read_to_string(target.dir.join("host_key.pub")).unwrap();
+    std::fs::write(&kh, format!("[b]:443 {host_pub}")).unwrap();
+    let cfg = target.dir.join("ssh_config.peer");
+    // DirectPath no: the data must go over the relay, so it can only survive
+    // the restart if the client moves the relay onto a new gateway session.
+    let alive = "  ServerAliveInterval 1\n  ServerAliveCountMax 3\n  DirectPath no\n";
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host gw\n  HostName 127.0.0.1\n  Port {gp}\n  User {u}\n  IdentityFile {g}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {g}/known_hosts\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}Host peer\n  HostName B\n  Port 443\n  ProxyJump gw\n  User {u}\n  IdentityFile {t}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {kh}\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n{alive}",
+            gp = gw.port,
+            u = me(),
+            g = gw.dir.display(),
+            t = target.dir.display(),
+            kh = kh.display()
+        ),
+    )
+    .unwrap();
+    let data: Vec<u8> = (0..2u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 5) as u8).collect();
+    let half = data.len() / 2;
+    let mut child = jcmd(&cfg, &["peer", "cat"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let d2 = data.clone();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&d2[..half]).unwrap();
+        go_rx.recv().unwrap();
+        stdin.write_all(&d2[half..]).unwrap();
+    });
+    let got = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut so = child.stdout.take().unwrap();
+    let g2 = got.clone();
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match so.read(&mut buf) {
+                Ok(0) | Err(_) => return v,
+                Ok(n) => {
+                    v.extend_from_slice(&buf[..n]);
+                    g2.store(v.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    });
+    let mut se = child.stderr.take().unwrap();
+    let err = std::thread::spawn(move || {
+        let mut v = String::new();
+        let _ = se.read_to_string(&mut v);
+        v
+    });
+    let mut p = Proc { child, name: "ssh3" };
+    let end = Instant::now() + DEADLINE;
+    while got.load(std::sync::atomic::Ordering::Relaxed) < half {
+        assert!(Instant::now() < end, "first half not echoed: {} bytes", got.load(std::sync::atomic::Ordering::Relaxed));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    gw.restart();
+    registered(&gw);
+    go_tx.send(()).unwrap();
+    // Bounded first: if the transfer does not finish, wait_exit fails and the
+    // dropped Proc kills ssh3, which unblocks the pipe threads.
+    let st = p.wait_exit(DEADLINE * 2);
+    writer.join().unwrap();
+    let out = reader.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert_eq!(st.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(sha(&out), sha(&data), "{} of {} bytes back; stderr: {stderr}", out.len(), data.len());
+    // The client's own account of it (its supervisor warns at the default
+    // log level), and the new gateway process holds its jump session.
+    assert!(stderr.contains("lost the session to jump host"), "client did not notice the gateway restart: {stderr}");
+    let gs = gw.stats();
+    assert_eq!(gs["sessions"].as_u64(), Some(1), "only the target's registration should remain after the client ended: {gs}");
+    assert!(gs["conns_accepted"].as_u64().unwrap() >= 2, "{gs}");
 }

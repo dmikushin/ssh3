@@ -70,7 +70,10 @@ pub struct JumpPath {
     pub chan_id: u64,
     /// The gateway session (for its observed address, our reflexive
     /// candidate); replaced with the relay carrier.
-    gateway: std::sync::Mutex<Weak<SessionShared>>,
+    gateway: Arc<std::sync::Mutex<Weak<SessionShared>>>,
+    /// What the relay channel asks the gateway for (reopened as is on
+    /// carrier replacement).
+    kind: ChannelKind,
 }
 
 impl JumpPath {
@@ -95,10 +98,32 @@ impl JumpPath {
     /// Start the direct-path upgrade (SPEC §7.3) for `inner`, the session
     /// dialled over this path. Only meaningful for a jump to a registered
     /// peer (both ends run the machinery); the dialing side controls.
+    ///
+    /// The machinery belongs to one QUIC connection: after every resume of
+    /// `inner` it is started again on the new connection, so the upgrade
+    /// happens again (SPEC §7.3).
     pub fn start_direct_path(&self, inner: &ClientSession, cfg: PathConfig) -> Result<Arc<PeerPath>> {
-        let (conn, _) = inner.shared.current_conn().ok_or(Error::CarrierLost)?;
+        let d = DirectParams { mgr: self.mgr.clone(), route: self.route, link: self.link.clone(), gateway: self.gateway.clone(), cfg };
+        let p = d.start(&inner.shared)?;
+        inner.set_direct(d);
+        Ok(p)
+    }
+}
+
+/// What restarting an inner session's direct-path machinery needs.
+pub(crate) struct DirectParams {
+    mgr: Arc<PathManager>,
+    route: RouteId,
+    link: Arc<ChannelLink>,
+    gateway: Arc<std::sync::Mutex<Weak<SessionShared>>>,
+    cfg: PathConfig,
+}
+
+impl DirectParams {
+    pub(crate) fn start(&self, inner: &Arc<SessionShared>) -> Result<Arc<PeerPath>> {
+        let (conn, _) = inner.current_conn().ok_or(Error::CarrierLost)?;
         let observed = self.gateway.lock().unwrap().upgrade().map(|g| g.observed.subscribe());
-        crate::rendezvous::start_path(&self.mgr, self.route, self.link.clone(), &conn, &inner.shared, true, observed, cfg)
+        crate::rendezvous::start_path(&self.mgr, self.route, self.link.clone(), &conn, inner, true, observed, self.cfg.clone())
             .ok_or_else(|| Error::Tls("inner connection has no TLS exporter".into()))
     }
 }
@@ -119,11 +144,11 @@ impl ClientSession {
         let s = &self.shared;
         let (tx, rx) = mpsc::channel::<Bytes>(s.limits.udp_queue);
         let ext = crate::sesschan::ChanExt::Udp(UdpExt::new(tx, s.stats.clone()));
-        let ch = s.open_channel(kind, 0, Completion::Manual, Some(ext)).await?;
+        let ch = s.open_channel(kind.clone(), 0, Completion::Manual, Some(ext)).await?;
         let link = Arc::new(ChannelLink::new(Arc::downgrade(s), ch.chan_id));
         let (route, virt) = mgr.add_relay_route(link.clone());
         pump(&ch, rx, &mgr, route);
-        Ok(JumpPath { mgr, route, virt, link, chan_id: ch.chan_id, gateway: std::sync::Mutex::new(Arc::downgrade(s)) })
+        Ok(JumpPath { mgr, route, virt, link, chan_id: ch.chan_id, gateway: Arc::new(std::sync::Mutex::new(Arc::downgrade(s))), kind })
     }
 
     /// Carrier replacement (SPEC §7.2): this session is a NEW gateway
@@ -132,11 +157,16 @@ impl ClientSession {
     /// The inner connection keeps its virtual address; resume it (or let it
     /// recover) over the new relay.
     pub async fn rejump_peer(&self, path: &JumpPath, name: &str) -> Result<()> {
-        self.rejump(path, ChannelKind::JumpPeer { name: name.to_string() }).await
+        self.rejump_kind(path, ChannelKind::JumpPeer { name: name.to_string() }).await
     }
 
-    /// As `rejump_peer`, for a jump to `host:port`.
-    pub async fn rejump(&self, path: &JumpPath, kind: ChannelKind) -> Result<()> {
+    /// Carrier replacement for `path`, asking this (new) gateway session for
+    /// the same relay as the original jump.
+    pub async fn rejump(&self, path: &JumpPath) -> Result<()> {
+        self.rejump_kind(path, path.kind.clone()).await
+    }
+
+    async fn rejump_kind(&self, path: &JumpPath, kind: ChannelKind) -> Result<()> {
         let s = &self.shared;
         let (tx, rx) = mpsc::channel::<Bytes>(s.limits.udp_queue);
         let ext = crate::sesschan::ChanExt::Udp(UdpExt::new(tx, s.stats.clone()));

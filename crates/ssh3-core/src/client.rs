@@ -135,6 +135,9 @@ struct ClientInner {
     roam: RoamStats,
     /// true once automatic resume gave up.
     gave_up: tokio::sync::watch::Sender<bool>,
+    /// Direct-path machinery to restart after every resume (inner session
+    /// through a jump to a registered peer).
+    direct: Mutex<Option<crate::jump::DirectParams>>,
 }
 
 pub struct ClientSession {
@@ -272,9 +275,14 @@ impl ClientSession {
             linger: Duration::from_secs(info.linger_secs),
             roam: RoamStats::default(),
             gave_up: tokio::sync::watch::channel(false).0,
+            direct: Mutex::new(None),
         });
         let roamer = tokio::spawn(roam(Arc::downgrade(&inner)));
         Ok(Self { shared, inner, roamer })
+    }
+
+    pub(crate) fn set_direct(&self, d: crate::jump::DirectParams) {
+        *self.inner.direct.lock().unwrap() = Some(d);
     }
 
     /// The path manager this session's endpoint runs on, if any.
@@ -347,6 +355,16 @@ impl ClientSession {
     /// Open a session channel (shell / exec / subsystem, optional pty).
     pub async fn open_session(&self, spec: crate::sesschan::SessionSpec) -> Result<crate::sesschan::SessionChannel> {
         self.shared.open_session(spec).await
+    }
+
+    /// `-W host:port`: a direct-tcp channel whose local ends are a reader
+    /// and a writer (stdin/stdout). Resolves once the channel is open; the
+    /// writer is shut down and dropped when the server's side ends.
+    pub async fn open_direct_stream<W>(&self, r: Box<dyn tokio::io::AsyncRead + Send + Unpin>, w: W, host: &str, port: u16) -> Result<u64>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        self.shared.open_direct_stream(r, w, host.to_string(), port).await
     }
 
     pub async fn open_direct_tcp(&self, tcp: tokio::net::TcpStream, host: &str, port: u16) -> Result<u64> {
@@ -424,6 +442,12 @@ impl ClientInner {
         let old = self.endpoint.lock().unwrap().replace(ep);
         drop(old);
         self.shared.reopen_lanes().await?;
+        // The direct-path machinery was bound to the old connection.
+        if let Some(d) = self.direct.lock().unwrap().as_ref()
+            && let Err(e) = d.start(&self.shared)
+        {
+            tracing::info!("direct path not restarted after resume: {e}");
+        }
         self.roam.resumes.fetch_add(1, Ordering::Relaxed);
         Ok(epoch)
     }

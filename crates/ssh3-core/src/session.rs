@@ -609,6 +609,21 @@ impl SessionShared {
         self.open_tcp_channel(tcp, ChannelKind::DirectTcp { host, port }).await
     }
 
+    pub(crate) async fn open_direct_stream<W>(self: &Arc<Self>, r: Box<dyn tokio::io::AsyncRead + Send + Unpin>, w: W, host: String, port: u16) -> Result<u64>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let ch = self.open_channel(ChannelKind::DirectTcp { host, port }, 1, Completion::AllLanes, None).await?;
+        let chan_id = ch.chan_id;
+        self.start_io(&ch, 0, r, w);
+        if self.role == Role::Client
+            && let Err(e) = self.open_lane(&ch.lanes[0]).await
+        {
+            tracing::debug!(chan = chan_id, "lane not opened now ({e}); the next resume will");
+        }
+        Ok(chan_id)
+    }
+
     /// Open a channel for a local TCP connection and bridge it once the peer
     /// accepts. Lane streams are always opened by the client.
     async fn open_tcp_channel(self: &Arc<Self>, tcp: TcpStream, kind: ChannelKind) -> Result<u64> {

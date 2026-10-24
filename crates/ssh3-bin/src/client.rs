@@ -12,12 +12,14 @@
 //! gateway only relays inner ciphertext. Exit status: the remote command's, 128+n for a remote
 //! signal n, 255 for ssh3's own failures — as ssh(1).
 //!
-//! ssh3 extension in ssh_config: `ContactWarn <duration>` (default 6500ms):
+//! ssh3 extensions in ssh_config: `ContactWarn <duration>` (default 6500ms):
 //! after this long without hearing the server, a terminal shows "Last
-//! contact N s ago" (SPEC §5).
+//! contact N s ago" (SPEC §5). `DirectPath yes|no` (default yes): for a host
+//! reached through a jump, try the direct-path upgrade (SPEC §7.3); `no`
+//! keeps the connection on the gateway's relay.
 //!
 //! What it refuses, by name, instead of silently ignoring (a missing
-//! feature must never look like a working one): -W, Unix-socket forwards,
+//! feature must never look like a working one): Unix-socket forwards,
 //! dynamic -R, ProxyCommand, -f, and configuration
 //! options whose enforcement the user may rely on for security but which
 //! ssh3 would not apply (`SECURITY_OPTIONS`).
@@ -55,6 +57,18 @@ fn contact_warn(c: &ClientConfig) -> Result<Duration, String> {
     match c.unknown.iter().find(|o| o.keyword == "contactwarn") {
         Some(o) => crate::duration::parse(o.args.first().map_or("", String::as_str)).map_err(|e| format!("{}:{}: ContactWarn: {e}", o.file, o.line)),
         None => Ok(CONTACT_WARN),
+    }
+}
+
+/// `DirectPath` from ssh_config (an ssh3 keyword), default yes.
+fn direct_path(c: &ClientConfig) -> Result<bool, String> {
+    match c.unknown.iter().find(|o| o.keyword == "directpath") {
+        Some(o) => match o.args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("yes") => Ok(true),
+            Some("no") => Ok(false),
+            _ => Err(format!("{}:{}: DirectPath: expected yes or no", o.file, o.line)),
+        },
+        None => Ok(true),
     }
 }
 
@@ -144,9 +158,6 @@ pub fn refusals(c: &ClientConfig) -> Result<(), String> {
     if c.proxy_command.is_some() {
         why.push("ProxyCommand is not supported by ssh3 (it never runs proxy commands)".into());
     }
-    if c.stdio_forward.is_some() {
-        why.push("-W is not implemented yet".into());
-    }
     if c.fork_after_authentication {
         why.push("-f is not implemented yet".into());
     }
@@ -168,6 +179,9 @@ pub fn refusals(c: &ClientConfig) -> Result<(), String> {
         }
     }
     if let Err(e) = contact_warn(c) {
+        why.push(e);
+    }
+    if let Err(e) = direct_path(c) {
         why.push(e);
     }
     if why.is_empty() { Ok(()) } else { Err(why.join("\nssh3: ")) }
@@ -337,21 +351,87 @@ const MAX_JUMP_DEPTH: usize = 8;
 /// the relay paths through them) must live as long as the destination's
 /// session; they are ended after it, innermost first.
 struct Chain {
-    hops: Vec<(ClientSession, ssh3_core::jump::JumpPath)>,
+    hops: Vec<Arc<Hop>>,
     sess: ClientSession,
+    /// One per hop: replaces the hop's gateway session when it is lost.
+    supervisors: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// One jump hop: its configuration, its current session (replaced when the
+/// gateway loses it), the relay path through it to the next host, and where
+/// the hop itself is dialled (direct, or the previous hop's path).
+struct Hop {
+    cfg: ClientConfig,
+    sess: std::sync::Mutex<Arc<ClientSession>>,
+    path: ssh3_core::jump::JumpPath,
+    via: Option<SocketAddr>,
+    mgr: Arc<ssh3_core::path::PathManager>,
+}
+
+impl Hop {
+    fn current(&self) -> Arc<ClientSession> {
+        self.sess.lock().unwrap().clone()
+    }
 }
 
 impl Chain {
     async fn end(self, gave_up: bool) {
+        for t in &self.supervisors {
+            t.abort();
+        }
         // Every way out except a given-up resume is a deliberate end
         // (SPEC §5): the server destroys the session instead of lingering.
         if !gave_up {
             self.sess.end(END_BOUND).await;
         }
         drop(self.sess);
-        for (hop, path) in self.hops.into_iter().rev() {
-            hop.end(END_BOUND).await;
-            drop(path);
+        for hop in self.hops.into_iter().rev() {
+            hop.current().end(END_BOUND).await;
+        }
+    }
+}
+
+const REJUMP_RETRY_MIN: Duration = Duration::from_millis(250);
+const REJUMP_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Keep hop `i` alive: when its gateway session is lost for good (resume
+/// refused — the gateway restarted — or its linger passed), dial the gateway
+/// again and move the relay path to the next host onto the new session
+/// (carrier replacement, SPEC §7.2). The next session then resumes over the
+/// same path by itself; no user action.
+async fn supervise_hop(hops: Vec<Arc<Hop>>, i: usize) {
+    loop {
+        let cur = hops[i].current();
+        cur.gave_up().await;
+        drop(cur);
+        let hop = &hops[i];
+        tracing::warn!("lost the session to jump host {}; reconnecting", hop.cfg.hostname);
+        let mut wait = REJUMP_RETRY_MIN;
+        loop {
+            let addrs = match hop.via {
+                Some(v) => Ok(vec![v]),
+                None => resolve_addrs(&hop.cfg).await,
+            };
+            let r = match addrs {
+                Ok(a) => dial_one(&hop.cfg, a, dual_stack_factory(), Some(hop.mgr.clone())).await,
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok(s) => match s.rejump(&hop.path).await {
+                    Ok(()) => {
+                        tracing::info!("jump host {} reconnected; relay moved onto the new session", hop.cfg.hostname);
+                        *hop.sess.lock().unwrap() = Arc::new(s);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("jump host {}: relay not reopened: {e}", hop.cfg.hostname);
+                        s.end(END_BOUND).await;
+                    }
+                },
+                Err(e) => tracing::warn!("jump host {}: {e}", hop.cfg.hostname),
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(REJUMP_RETRY_MAX);
         }
     }
 }
@@ -426,49 +506,53 @@ async fn dial_one(c: &ClientConfig, addrs: Vec<SocketAddr>, sockets: SocketFacto
 /// each next connection carried end to end over a relay path through the
 /// previous session (SPEC §7.2).
 async fn connect(c: &ClientConfig, jumps: &Jumps) -> Result<Chain, String> {
-    let hops = hop_configs(c, jumps, 0)?;
-    let Some(first) = hops.first() else {
+    let cfgs = hop_configs(c, jumps, 0)?;
+    let Some(first) = cfgs.first() else {
         let sess = dial_one(c, resolve_addrs(c).await?, dual_stack_factory(), None).await?;
-        return Ok(Chain { hops: Vec::new(), sess });
+        return Ok(Chain { hops: Vec::new(), sess, supervisors: Vec::new() });
     };
     // One path manager (one UDP socket) for the whole chain: the first hop
     // observes the NAT mapping the direct-path punches then reuse (§7.3).
     let io = dual_stack_factory()().map_err(|e| format!("ssh3: socket: {e}"))?;
     let mgr = ssh3_core::path::PathManager::new(io);
-    let mut prev = dial_one(first, resolve_addrs(first).await?, dual_stack_factory(), Some(mgr)).await?;
-    let mut chain = Vec::new();
-    for next in hops[1..].iter().chain(std::iter::once(c)) {
+    let mut prev = dial_one(first, resolve_addrs(first).await?, dual_stack_factory(), Some(mgr.clone())).await?;
+    let mut prev_cfg = first.clone();
+    let mut via = None;
+    let mut hops: Vec<Arc<Hop>> = Vec::new();
+    let fail = |hops: Vec<Arc<Hop>>, last: ClientSession, e: String| async move {
+        Chain { hops, sess: last, supervisors: Vec::new() }.end(false).await;
+        Err(e)
+    };
+    for next in cfgs[1..].iter().chain(std::iter::once(c)) {
         // The gateway resolves the next host itself (as `ssh -W %h:%p`).
         let path = match prev.jump(&next.hostname, next.port).await {
             Ok(p) => p,
-            Err(e) => {
-                let held = Chain { hops: chain, sess: prev };
-                held.end(false).await;
-                return Err(format!("ssh3: jump to {} port {}: {e}", next.hostname, next.port));
-            }
+            Err(e) => return fail(hops, prev, format!("ssh3: jump to {} port {}: {e}", next.hostname, next.port)).await,
         };
-        match dial_one(next, vec![path.virt], dual_stack_factory(), Some(path.mgr.clone())).await {
+        let virt = path.virt;
+        match dial_one(next, vec![virt], dual_stack_factory(), Some(mgr.clone())).await {
             Ok(s) => {
                 // If `next` is a peer registered at `prev` (SPEC §7.1), both
                 // ends upgrade to a direct path when the NATs allow; a plain
                 // server ignores the path signals and the relay stays.
-                if let Err(e) = path.start_direct_path(&s, ssh3_core::path::PathConfig::default()) {
+                if direct_path(next).expect("validated by refusals()")
+                    && let Err(e) = path.start_direct_path(&s, ssh3_core::path::PathConfig::default())
+                {
                     tracing::info!("no direct-path upgrade to {}: {e}", next.hostname);
                 }
-                chain.push((prev, path));
+                hops.push(Arc::new(Hop { cfg: prev_cfg, sess: std::sync::Mutex::new(Arc::new(prev)), path, via, mgr: mgr.clone() }));
                 prev = s;
+                prev_cfg = next.clone();
+                via = Some(virt);
             }
             Err(e) => {
-                chain.push((prev, path));
-                let (last, path) = chain.pop().expect("just pushed");
                 drop(path);
-                let held = Chain { hops: chain, sess: last };
-                held.end(false).await;
-                return Err(e);
+                return fail(hops, prev, e).await;
             }
         }
     }
-    Ok(Chain { hops: chain, sess: prev })
+    let supervisors = (0..hops.len()).map(|i| tokio::spawn(supervise_hop(hops.clone(), i))).collect();
+    Ok(Chain { hops, sess: prev, supervisors })
 }
 
 /// Where a local listener binds, as ssh(1): loopback unless GatewayPorts or
@@ -582,7 +666,11 @@ async fn run(c: ClientConfig, jumps: Jumps) -> ExitCode {
             return fail(&e);
         }
     };
-    let code = if c.session_type == SessionType::None { forward_only(&c, sess).await } else { session(&c, sess).await };
+    let code = match &c.stdio_forward {
+        Some((h, p)) => stdio_forward(&c, sess, h, *p).await,
+        None if c.session_type == SessionType::None => forward_only(&c, sess).await,
+        None => session(&c, sess).await,
+    };
     for t in tasks {
         t.abort();
     }
@@ -607,6 +695,54 @@ fn status_watch(c: &ClientConfig, sess: &ClientSession, line: StatusLine) -> Opt
 
 fn gave_up_message(c: &ClientConfig) -> String {
     format!("connection to {} lost and the session could not be resumed", c.hostname)
+}
+
+/// stdout for `-W`: says when it is dropped — the channel's sink ends when
+/// the far side closes (or the channel is torn down).
+struct DoneOnDrop {
+    inner: tokio::io::Stdout,
+    tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        if let Some(t) = self.tx.take() {
+            let _ = t.send(());
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for DoneOnDrop {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, b: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// `-W host:port` (stdio forwarding, as ssh(1) for ProxyCommand chains):
+/// stdin and stdout are bridged to a direct-tcp channel to `host:port`; it
+/// ends when the far side closes, on a signal, or when resume gives up.
+async fn stdio_forward(c: &ClientConfig, sess: &ClientSession, host: &str, port: u16) -> ExitCode {
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()), signal(SignalKind::hangup())) else {
+        return fail("cannot install signal handlers");
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let out = DoneOnDrop { inner: tokio::io::stdout(), tx: Some(tx) };
+    if let Err(e) = sess.open_direct_stream(Box::new(tokio::io::stdin()), out, host, port).await {
+        return fail(&format!("stdio forwarding to {host}:{port} failed: {e}"));
+    }
+    tokio::select! {
+        _ = rx => ExitCode::SUCCESS,
+        _ = term.recv() => ExitCode::SUCCESS,
+        _ = int.recv() => ExitCode::SUCCESS,
+        _ = hup.recv() => ExitCode::SUCCESS,
+        _ = sess.gave_up() => fail(&gave_up_message(c)),
+    }
 }
 
 /// `-N`: until a signal, or until automatic resume gives up.
@@ -847,8 +983,7 @@ mod tests {
         let e = refusals(&cfg(&["-N", "-J", "j", "-R", "1080", "h"], "")).unwrap_err();
         assert!(e.contains("dynamic remote forward"), "{e}");
         assert!(!e.contains("ProxyJump"), "ProxyJump is implemented: {e}");
-        let e = refusals(&cfg(&["-W", "a:1", "h"], "")).unwrap_err();
-        assert!(e.contains("-W"), "{e}");
+        assert!(refusals(&cfg(&["-W", "a:1", "h"], "")).is_ok(), "-W is implemented");
         let e = refusals(&cfg(&["-N", "h"], "ProxyCommand nc %h %p\n")).unwrap_err();
         assert!(e.contains("ProxyCommand"), "{e}");
     }

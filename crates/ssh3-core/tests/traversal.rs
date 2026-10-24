@@ -186,3 +186,24 @@ async fn gateway_restart_inner_session_survives_via_resume() {
     assert_eq!((ts.sessions, ts.resumes_accepted), (1, 1), "{ts:?}");
     assert_eq!(gw2.server.stats().peers_registered, 1);
 }
+
+/// The direct-path machinery belongs to one QUIC connection: after an inner
+/// resume it starts again (on relay) and upgrades again — the relay goes
+/// silent once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_path_upgrades_again_after_inner_resume() {
+    let w = World::new("port-restricted-cone", "port-restricted-cone").await;
+    let (_c, path, inner) = w.connect().await;
+    wait_mode(&inner, |m| matches!(m, PathMode::Direct(_)), "first direct path").await;
+    tokio::time::timeout(BOUND, inner.resume(path.socket())).await.expect("inner resume timed out").unwrap();
+    // A fresh machine for the new connection: it starts on the relay.
+    assert_eq!(inner.path_status().unwrap().switches_direct, 0, "{:?}", inner.path_status());
+    wait_mode(&inner, |m| matches!(m, PathMode::Direct(_)), "direct path after resume").await;
+    let relayed = path.relayed();
+    let echo = echo_server().await;
+    let l = forward(&inner, echo).await;
+    let data = Arc::new(pattern(4 << 20, 86));
+    assert_same(&echo_roundtrip(l, data.clone()).await, &data);
+    let more = path.relayed() - relayed;
+    assert!(more < 16, "{more} packets still went over the relay after the second switch");
+}
