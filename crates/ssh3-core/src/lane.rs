@@ -458,44 +458,48 @@ impl Lane {
     /// read is dropped by the epoch guard. Do not describe RetractAck or detach
     /// as the established cause of removed backing storage.
     ///
-    /// Regardless of the trigger, this fix makes the commit atomic: every tail
-    /// is acquired first, and only once storage for the whole chunk is in hand
-    /// is anything committed to the ring. A shortfall then surfaces as a clean
-    /// error with the ring's accounting left intact instead of corrupted.
+    /// Regardless of the trigger, this fix makes the commit atomic with FULL
+    /// rollback: all storage is acquired before anything is committed, and on a
+    /// shortfall every acquired resource is returned to EXACTLY where it came
+    /// from — the pre-existing tail is restored to the ring unchanged, each
+    /// reservation-derived chunk is folded back into `st.reserve` (not leaked
+    /// to the shared budget, where a concurrent lane could take it), and floor
+    /// chunks are released (their `rfloor` counter decremented on drop). After
+    /// a shortfall error the ring bytes, `received`/`delivered`, `reserve`,
+    /// `free_cover`, `tail_space`, `rfloor` and all budgets are bit-for-bit
+    /// what they were on entry (consultant control
+    /// `reviewer_existing_tail_rollback`).
     fn recv_commit(&self, st: &mut LaneState, data: &[u8]) -> Result<()> {
         let n = data.len();
         if n == 0 {
             return Ok(());
         }
-        // Phase 1: acquire storage for the whole copy without mutating the
-        // ring. The existing tail (if any) is taken out and refilled first;
-        // the rest comes from fresh chunks.
-        let mut tails: Vec<Tail> = Vec::new();
-        if let Some(t) = st.rbuf.take_tail() {
-            tails.push(t);
-        }
-        let mut have: usize = tails.iter().map(Tail::space).sum();
+        // Phase 1: acquire storage for the whole copy without committing
+        // anything. The pre-existing tail is taken out separately so it can be
+        // restored byte-for-byte on a shortfall; fresh chunks go in `extra`.
+        let prev_tail = st.rbuf.take_tail();
+        let mut have: usize = prev_tail.as_ref().map_or(0, Tail::space);
+        let mut extra: Vec<Tail> = Vec::new();
         while have < n {
             match self.recv_chunk(st) {
                 Some(t) => {
                     have += t.space();
-                    tails.push(t);
+                    extra.push(t);
                 }
                 None => {
-                    // Shortfall: report the error. Dropping `tails` returns
-                    // every acquired permit.
-                    //
-                    // PENDING (flagged for consultant acc0's measured verdict,
-                    // do NOT change logic here yet): an earlier comment claimed
-                    // this path returns the pre-existing tail "so the ring is
-                    // exactly as it was". It does NOT — a tail taken via
-                    // `take_tail` above is in `tails` and is dropped here, so a
-                    // pre-existing (possibly non-floor) tail chunk is released
-                    // rather than restored. `received`/`delivered` and the ring
-                    // contents are unchanged (nothing was committed), so the
-                    // accounting invariant still holds; only the spare tail
-                    // capacity differs. Whether that spare should be restored
-                    // awaits the consultant's tail-behaviour review.
+                    // Shortfall: roll back to the entry state exactly.
+                    //  * fold each reservation-derived chunk back into reserve
+                    //    (merge keeps it out of the shared budget);
+                    //  * floor chunks are released by dropping them (rfloor--);
+                    //  * restore the pre-existing tail unchanged.
+                    for t in extra {
+                        if let Some(p) = t.into_reserve_permit() {
+                            st.reserve.merge(p);
+                        }
+                    }
+                    if let Some(t) = prev_tail {
+                        st.rbuf.restore_tail(t);
+                    }
                     return Err(Error::Protocol(format!(
                         "lane {}/{}: internal: credit granted without storage",
                         self.chan_id, self.lane
@@ -504,9 +508,11 @@ impl Lane {
             }
         }
         // Phase 2: storage for all `n` bytes is in hand; commit it. This
-        // cannot fail, so the ring and `received` advance together.
+        // cannot fail, so the ring and `received` advance together. The
+        // pre-existing tail (if any) is filled first, then the fresh chunks.
         let mut off = 0;
-        for mut tail in tails {
+        let all = prev_tail.into_iter().chain(extra);
+        for mut tail in all {
             if off >= n {
                 // Spare capacity beyond the copy: give the unused tail back to
                 // the ring as the new tail (0 bytes committed keeps it spare).
@@ -1833,4 +1839,91 @@ mod tests {
             );
         }
     }
+}
+
+/// Independent consultant (acc0c9a35e4c366c9) controls for the receive-commit
+/// FULL ROLLBACK requirement: after a storage shortfall, `recv_commit` must
+/// leave the lane bit-for-bit as it was on entry — ring bytes, received,
+/// delivered, reserve amount, free_cover, rfloor, and the recv/floor budgets.
+/// The first two tests are copied VERBATIM from the consultant harness
+/// (~/scratch/ssh-udp/consult-ring-review); the last two are the requested
+/// reservation-backed and mixed-tail failure controls.
+#[cfg(test)]
+mod consultant_review {
+ use super::*;
+ fn env() -> LaneEnv {
+  let (events,_rx)=mpsc::channel(16);
+  LaneEnv {cap:8<<20,floor:CH,ack_bytes:CH,credit_idle:Duration::ZERO,ack_interval:Duration::from_millis(50),stats:Arc::new(Stats::default()),acks:Arc::new(AckQueue::default()),recv_budget:Budget::new("recv",64<<20),send_budget:Budget::new("send",64<<20),floor_budget:Budget::new("floor",u64::MAX),events}
+ }
+ fn snap(l:&Lane,s:&LaneState)->(usize,u64,u64,u64,u64,u32,u64,u64,u64) {
+ (s.rbuf.len(),s.received,s.delivered,s.reserve.amount(),l.free_cover(s),s.rfloor.load(Ordering::Acquire),l.env.recv_budget.used(),l.env.floor_budget.used(),l.env.stats.recv_ring_bytes.load(Ordering::Relaxed))
+ }
+ #[test]
+ fn reviewer_partial_storage_atomicity() {
+  let l=Lane::new(2,0,env()); let mut s=l.st.lock().unwrap();
+  s.limit=2*CH+1;
+  let before=snap(&l,&s);
+  assert!(l.recv_commit(&mut s,&vec![0x61;2*CHUNK+1]).is_err());
+  let after=snap(&l,&s); println!("EMPTY before={before:?} after={after:?}");
+  assert_eq!(before,after,"failed commit mutated accounting/storage");
+ }
+ #[test]
+ fn reviewer_existing_tail_rollback() {
+  let l=Lane::new(2,0,env()); let mut s=l.st.lock().unwrap();
+  s.limit=3*CH;
+  l.recv_commit(&mut s,&[0x62;17]).unwrap();
+  let before=snap(&l,&s); let tail_before=s.rbuf.tail_space();
+  assert!(l.recv_commit(&mut s,&vec![0x63;2*CHUNK]).is_err());
+  let after=snap(&l,&s); println!("TAIL before={before:?} after={after:?} tail={tail_before}->{}",s.rbuf.tail_space());
+  assert_eq!(&*s.rbuf.peek(0,17).unwrap(),&[0x62;17]);
+  assert_eq!(before,after,"rollback lost preexisting tail backing");
+ }
+
+ /// Control A — reservation-backed shortfall: the lane holds a real
+ /// reservation (not just floor). A read that exceeds reserve + floor must
+ /// roll back with the reservation amount folded back into `st.reserve`
+ /// (merge), NOT leaked to the shared recv budget, and the pre-existing tail
+ /// restored. Every snapshot field must match on entry.
+ #[test]
+ fn reviewer_reservation_backed_rollback() {
+  let l=Lane::new(2,0,env()); let mut s=l.st.lock().unwrap();
+  // Grant credit so recompute_limit reserves storage from the recv budget.
+  s.granted=4*CH; s.last_arrival=Instant::now(); l.recompute_limit(&mut s);
+  assert!(s.reserve.amount()>=CH,"precondition: a real reservation exists");
+  // Seed a small tail so there is a pre-existing non-floor tail to restore.
+  l.recv_commit(&mut s,&[0x64;17]).unwrap();
+  let before=snap(&l,&s);
+  let recv_used_before=l.env.recv_budget.used();
+  // Request more than the whole advertised credit can store: force shortfall.
+  let huge=(s.limit - s.received) as usize + CHUNK;
+  assert!(l.recv_commit(&mut s,&vec![0x65;huge]).is_err());
+  let after=snap(&l,&s);
+  println!("RSV before={before:?} after={after:?}");
+  assert_eq!(before,after,"reservation-backed rollback mutated accounting/storage");
+  assert_eq!(l.env.recv_budget.used(),recv_used_before,"reservation leaked to shared budget instead of merge");
+  assert_eq!(&*s.rbuf.peek(0,17).unwrap(),&[0x64;17],"pre-existing tail bytes lost");
+ }
+
+ /// Control B — mixed tail + partial floor + shortfall: a non-floor tail
+ /// exists, the reservation is drained to pin floor chunks, and the final
+ /// request still overruns. Rollback must restore the tail and all counters.
+ #[test]
+ fn reviewer_mixed_tail_floor_rollback() {
+  let l=Lane::new(2,0,env()); let mut s=l.st.lock().unwrap();
+  s.granted=3*CH; s.last_arrival=Instant::now(); l.recompute_limit(&mut s);
+  // Seed a partial non-floor tail.
+  l.recv_commit(&mut s,&[0x66;100]).unwrap();
+  let before=snap(&l,&s);
+  let recv_used_before=l.env.recv_budget.used();
+  let floor_used_before=l.env.floor_budget.used();
+  // Overrun everything.
+  let huge=(s.limit - s.received) as usize + 2*CHUNK;
+  assert!(l.recv_commit(&mut s,&vec![0x67;huge]).is_err());
+  let after=snap(&l,&s);
+  println!("MIX before={before:?} after={after:?}");
+  assert_eq!(before,after,"mixed-tail rollback mutated accounting/storage");
+  assert_eq!(l.env.recv_budget.used(),recv_used_before,"recv budget changed by rollback");
+  assert_eq!(l.env.floor_budget.used(),floor_used_before,"floor budget changed by rollback");
+  assert_eq!(&*s.rbuf.peek(0,100).unwrap(),&[0x66;100],"pre-existing tail bytes lost");
+ }
 }

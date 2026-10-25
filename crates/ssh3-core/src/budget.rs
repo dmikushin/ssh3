@@ -88,6 +88,18 @@ impl Permit {
         self.amount -= n;
         Permit { budget: self.budget.clone(), amount: n }
     }
+    /// Fold `other` back into `self` (the inverse of `split`): the budget total
+    /// is unchanged, and `other` is consumed without returning its amount to
+    /// the budget. Both must share the same budget. Used to roll back a
+    /// reservation-derived permit after an aborted acquisition without briefly
+    /// returning its bytes to the shared budget (where a concurrent lane could
+    /// take them, defeating the rollback).
+    pub fn merge(&mut self, mut other: Permit) {
+        assert!(Arc::ptr_eq(&self.budget, &other.budget), "merge across budgets");
+        self.amount += other.amount;
+        // Neutralise `other`'s Drop so it does not give its amount back.
+        other.amount = 0;
+    }
     /// Take exactly `n` from the budget or nothing.
     pub fn try_new(budget: &Arc<Budget>, n: u64) -> Option<Permit> {
         let mut p = Permit::empty(budget.clone());

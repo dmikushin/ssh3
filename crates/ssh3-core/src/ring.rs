@@ -58,6 +58,25 @@ impl Tail {
     pub(crate) fn is_floor(&self) -> bool {
         self.owner.floor.is_some()
     }
+    /// Reclaim the reservation-derived `Permit` from a never-committed tail,
+    /// so an aborted acquisition can fold it back into the lane reserve
+    /// instead of returning it to the shared budget. Returns `None` for a
+    /// floor tail (whose storage is the floor pool, not a budget permit) and
+    /// for a tail whose chunk was already shared (committed), which never
+    /// happens on the rollback path. On `Some`, the chunk's floor counter — if
+    /// any — is released by dropping the leftover `ChunkPermit`.
+    pub(crate) fn into_reserve_permit(self) -> Option<Permit> {
+        // A fresh tail from `recv_chunk`/`take_tail` is the sole owner.
+        let mut owner = Arc::try_unwrap(self.owner).ok()?;
+        if owner.floor.is_some() {
+            return None; // floor chunk: dropping `owner` decrements rfloor
+        }
+        // Move the permit out, leaving a zero-amount permit on the same budget
+        // so `owner`'s Drop (floor is None) is a no-op. The returned permit
+        // carries the full CH charge to be folded back into the lane reserve.
+        let budget = owner._permit.budget().clone();
+        Some(std::mem::replace(&mut owner._permit, Permit::empty(budget)))
+    }
 }
 
 /// Bytes of one chunk together with the chunk's permit. Deliberately offers
@@ -95,6 +114,14 @@ impl Ring {
     /// Take the tail out to read into it without holding the lane lock.
     pub(crate) fn take_tail(&mut self) -> Option<Tail> {
         self.tail.take()
+    }
+    /// Put a previously-taken tail back UNCHANGED (no bytes committed). Used to
+    /// roll back an aborted acquisition: the ring must end exactly as it was,
+    /// including the tail's spare capacity. There must be no current tail (the
+    /// acquisition took it out first).
+    pub(crate) fn restore_tail(&mut self, t: Tail) {
+        debug_assert!(self.tail.is_none(), "restore_tail over an existing tail");
+        self.tail = Some(t);
     }
     /// Put a tail back after `n` bytes were read into its front.
     pub(crate) fn commit(&mut self, mut t: Tail, n: usize) {
