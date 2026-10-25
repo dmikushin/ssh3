@@ -1,61 +1,58 @@
-=== INDEPENDENT CONSULTANT BLOCKER — verbatim points (exact 6d0fb2c) ===
-Status: NO push as-is. Fix on a NEW commit atop 6d0fb2c, do NOT amend, preserve
-57bd5d5 production unchanged.
+=== INDEPENDENT CONSULTANT re-review of e0a6a62 — verbatim points ===
+Status: still blockers; correct on a NEW commit atop e0a6a62, no amend. Stop
+claiming checks not implemented. Four precise fixes only.
 
-(1) Test observes only ONE park/read, leaves barrier disarmed line 144;
-    module/report claim TWO consecutive reads unproven. Force TWO explicit
-    Notify parks on same lane, assert read sequence index / held lengths,
-    define detach at second park after measured partial sink drain.
+(1) hashing_sink must send a completion Result via oneshot or retained
+    JoinHandle; success ONLY on read returning 0, propagate read errors
+    distinctly. wait_eof must await that actual completion, then compare
+    COMPLETE stream hash + exact length, rejecting trailing bytes. Add a cheap
+    control sink stream that emits expected prefix then extra byte, which MUST
+    fail, and expected prefix then read error MUST fail.
 
-(2) counting_sink throws bytes away: exact count isn't payload/order; collect
-    expected small bounded byte stream or SHA+length and wait EOF, assert exact
-    equality. Use distinguishable per-chunk payload to catch equal-length
-    loss/dup.
+(2) while reader still parked, after detach wait actual per-lane snapshot and
+    assert epoch increased, reserve+free_cover>=limit-received,
+    ring_len==received-delivered, outstanding to intended floor; show snapshot
+    log before release.
 
-(3) expose cfg-hook per-lane snapshot of epoch, received, delivered, ring
-    length, reserve, free_cover, tail-space, floor/shared budgets; assert
-    backing/ring invariants at each boundary and epoch increment, not aggregate
-    credit. Ensure first committed partial drain and actual unread tail at
-    detach via observed state.
+(3) rename prose/test to TWO TARGETED reads, not consecutive (unarmed reads
+    allowed).
 
-(4) tests/dial_multiread_repro.rs imports feature-only hooks unconditionally;
-    add file #![cfg(feature="test-hooks")] or required-features. Verify both
-    `cargo test --locked -p ssh3-core --test dial_multiread_repro --no-run`
-    WITHOUT feature compiles, and featured exact finite OLD/NEW experiment
-    executes nonzero tests.
+(4) claim unread buffered bytes only, NOT partially used allocated tail unless
+    tail_space asserted.
 
-Update prose to only actual proven schedule; no broad class exclusion.
-Copy consultant review points verbatim into local checklist artifact (this file).
-Targeted only; no full suite/load/remote. Send new SHA/logs/snapshots to
-coordinator + acc0 for independent re-review.
+Consultant also: e0 wait_eof only polls len and NO EOF/join; post-detach only
+aggregate stats. Field trigger NOT solved. Targeted only, no full/load/remote.
 
-=== RESOLUTION STATUS ===
-(1) DONE. Two explicit Notify parks on lane (2,0): park_index asserted ==1 then
-    ==2; held lengths asserted >0 for each; p2.received > p1.received proves two
-    CONSECUTIVE reads advanced the stream; detach is forced at the SECOND park,
-    after a measured partial sink drain. Observed (NEW): PARK#1 held_n=1423
-    ring_len=0; PARK#2 received=192538 delivered=176928 ring_len=15610 held_n=1420.
-(2) DONE. hashing_sink() computes an order-sensitive SHA-256 + length; payload is
-    distinguishable() (each 8-byte word encodes its index). After resume the test
-    waits for EOF (length==total) and asserts the SHA-256 equals the sent stream,
-    so an equal-length loss/dup/reorder is caught. No byte-count-only check.
-(3) DONE. cfg-hook LaneSnapshot exposes epoch, received, delivered, ring_len,
-    reserve, free_cover, tail_space, rfloor, floor_budget_used, recv_budget_used,
-    limit. Captured under the lock at each park (before commit) and also on demand
-    via lane_snapshot(). Asserted at each boundary: ring_len == received-delivered,
-    received>=delivered, reserve+free_cover >= limit-received (backing, NOT
-    aggregate credit), epoch unchanged before detach. First committed partial
-    drain (delivered>0) and actual unread tail (ring_len>0) confirmed from the
-    park-#2 snapshot; the sink is paused to force the tail.
-(4) DONE. File begins with #![cfg(feature = "test-hooks")]. Verified:
-    `cargo test --locked -p ssh3-core --test dial_multiread_repro --no-run`
-    WITHOUT the feature compiles and runs 0 tests; WITH --features test-hooks it
-    compiles and executes 1 test (nonzero).
+=== RESOLUTION (exact e0a6a62 -> this) ===
+(1) DONE. spawn_sink() runs a task reporting SinkDone over a oneshot:
+    Eof{hash,len} ONLY when the socket read returns 0; ReadError(String) on a
+    read error (distinct path). await_done() awaits the oneshot (bounded
+    deadline), NOT a length poll. The interleaving test asserts Eof with
+    len==total AND hash==expected over the COMPLETE stream, so trailing/dup
+    bytes after total are rejected. Controls (connect straight to the sink):
+      control_trailing_byte_is_rejected        — prefix + 1 extra byte: len & hash
+                                                  differ from prefix. PASS.
+      control_read_error_or_short_is_rejected  — prefix then RST (SO_LINGER 0):
+                                                  must NOT be accepted as the full
+                                                  stream (ReadError or short Eof). PASS.
+(2) DONE. After the detach stats-wait, while the reader is STILL PARKED,
+    wait_snapshot_epoch_above() captures the per-lane snapshot; the test logs it
+    (POST-DETACH ...) BEFORE release and asserts epoch > epoch1,
+    ring_len==received-delivered, received>=delivered,
+    reserve+free_cover>=limit-received, and limit-received backed to the floor.
+    Observed NEW: epoch 0->1, limit-received=16384 backed. OLD: epoch 0->1.
+(3) DONE. Test renamed detach_at_second_targeted_read_loses_no_bytes; prose says
+    TWO TARGETED reads (barrier armed twice; unarmed reads between run normally).
+    No "consecutive" claim.
+(4) DONE. ring_len>0 is described as "unread buffered bytes"; tail_space is a
+    separate snapshot field and no claim is made about a partially-used tail.
 
-PROSE: updated to the actual proven schedule (two reads, detach at second park,
-measured drain + unread tail, exact payload). NO broad class exclusion — only
-THIS schedule is excluded, on both OLD and NEW. Field trigger remains unresolved.
+RESULT: explicit bounded NEGATIVE result for THIS schedule only (no class claim).
+All 3 tests PASS on NEW (parent e0a6a62 -> 57bd5d5 production) and on a sibling
+leaky-recv_commit OLD variant (ring-async4-OLD). The epoch bump on detach fences
+the parked read before commit; nothing leaks on either build. Field trigger
+remains UNRESOLVED and is not claimed solved.
 
-RESULT: explicit bounded NEGATIVE result. detach_at_second_park_loses_no_bytes
-PASSES on NEW (57bd5d5) and on the leaky-recv_commit OLD variant. The epoch bump
-on detach fences the parked read before it commits, so no leak on either build.
+Feature gating (point 4) re-verified: WITHOUT the feature `--no-run` compiles and
+runs 0 tests; WITH --features test-hooks runs 3 tests. Default production build
+clean. No production fix. No full suite / load / remote.
