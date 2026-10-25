@@ -42,3 +42,15 @@ pub async fn relay(server: SocketAddr, rtt: Duration) -> SocketAddr {
     pipe(back, front.clone(), cli, None, rtt / 2);
     front.local_addr().unwrap()
 }
+
+/// A relay whose forwarding can be cut: `dest` set to None makes the
+/// returned address a dead one (the server "moved away" from it).
+pub async fn switchable_relay(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Option<SocketAddr>>>) {
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let srv = Arc::new(Mutex::new(Some(server)));
+    let cli = Arc::new(Mutex::new(None));
+    pipe(front.clone(), back.clone(), srv.clone(), Some(cli.clone()), Duration::ZERO);
+    pipe(back, front.clone(), cli, None, Duration::ZERO);
+    (front.local_addr().unwrap(), srv)
+}

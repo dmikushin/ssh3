@@ -337,6 +337,16 @@ async fn resolve_addrs(c: &ClientConfig) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
+/// The destination's name, re-resolved before every automatic resume
+/// attempt (its address may have changed while we were away).
+fn resolver(c: &ClientConfig) -> ssh3_core::client::Resolver {
+    let c = c.clone();
+    Arc::new(move || {
+        let c = c.clone();
+        Box::pin(async move { resolve_addrs(&c).await.map_err(std::io::Error::other) })
+    })
+}
+
 /// ServerAliveInterval / ServerAliveCountMax mean what they mean in ssh(1):
 /// the server is declared dead after interval × count of silence. Here that
 /// is the liveness probe period and the QUIC idle timeout (which also bounds
@@ -352,8 +362,8 @@ fn client_limits(c: &ClientConfig) -> Limits {
     l
 }
 
-async fn dial(c: &ClientConfig, addr: SocketAddr, host: &HostCheck, signers: &[Arc<dyn Signer>], sockets: SocketFactory, path: Option<Arc<ssh3_core::path::PathManager>>) -> Result<ClientSession, Error> {
-    let opts = ClientOptions { server_addr: addr, host: host.clone(), signers: signers.to_vec(), user: c.user.clone(), limits: client_limits(c), sockets, path };
+async fn dial(c: &ClientConfig, addrs: Vec<SocketAddr>, resolve: Option<ssh3_core::client::Resolver>, host: &HostCheck, signers: &[Arc<dyn Signer>], sockets: SocketFactory, path: Option<Arc<ssh3_core::path::PathManager>>) -> Result<ClientSession, Error> {
+    let opts = ClientOptions { server_addrs: addrs, resolve, host: host.clone(), signers: signers.to_vec(), user: c.user.clone(), limits: client_limits(c), sockets, path };
     let sock = (opts.sockets)().map_err(Error::Io)?;
     let fut = ClientSession::connect(opts, sock);
     match c.connect_timeout {
@@ -440,7 +450,7 @@ async fn supervise_hop(hops: Vec<Arc<Hop>>, i: usize) {
                 None => resolve_addrs(&hop.cfg).await,
             };
             let r = match addrs {
-                Ok(a) => dial_one(&hop.cfg, a, dual_stack_factory(), Some(hop.mgr.clone())).await,
+                Ok(a) => dial_one(&hop.cfg, a, hop.via.is_none(), dual_stack_factory(), Some(hop.mgr.clone())).await,
                 Err(e) => Err(e),
             };
             match r {
@@ -507,26 +517,27 @@ fn hop_configs(c: &ClientConfig, jumps: &Jumps, depth: usize) -> Result<Vec<Clie
 /// One authenticated connection to `c` at `addr` over `sockets`, every key
 /// offered in order on it (core stops at MaxAuthTries), with ssh(1)'s
 /// messages for the two refusals the user must be able to tell apart.
-async fn dial_one(c: &ClientConfig, addrs: Vec<SocketAddr>, sockets: SocketFactory, path: Option<Arc<ssh3_core::path::PathManager>>) -> Result<ClientSession, String> {
+/// `by_name`: `c.hostname` is what was resolved to `addrs` (re-resolved on
+/// automatic resumes); false for a jump path's fixed virtual address.
+async fn dial_one(c: &ClientConfig, addrs: Vec<SocketAddr>, by_name: bool, sockets: SocketFactory, path: Option<Arc<ssh3_core::path::PathManager>>) -> Result<ClientSession, String> {
     let host = host_check(c);
     let signers = signers(c);
     let denied = format!("{}@{}: Permission denied (publickey).", c.user, c.hostname);
     if signers.is_empty() {
         return Err(denied);
     }
-    let mut last = String::new();
-    for addr in addrs {
-        match dial(c, addr, &host, &signers, sockets.clone(), path.clone()).await {
-            Ok(sess) => return Ok(sess),
-            Err(Error::Auth(why)) => {
-                tracing::info!("authentication refused: {why}");
-                return Err(denied);
-            }
-            Err(Error::HostKey(why)) => return Err(format!("{why}\nHost key verification failed.")),
-            Err(e) => last = format!("ssh3: connect to host {} port {}: {e}", c.hostname, c.port),
+    // One dial: core races every address (RFC 8305) and names each one it
+    // tried in the error.
+    let resolve = by_name.then(|| resolver(c));
+    match dial(c, addrs, resolve, &host, &signers, sockets, path).await {
+        Ok(sess) => Ok(sess),
+        Err(Error::Auth(why)) => {
+            tracing::info!("authentication refused: {why}");
+            Err(denied)
         }
+        Err(Error::HostKey(why)) => Err(format!("{why}\nHost key verification failed.")),
+        Err(e) => Err(format!("ssh3: connect to host {} port {}: {e}", c.hostname, c.port)),
     }
-    Err(last)
 }
 
 /// Connect to the destination: directly, or through every jump hop in turn,
@@ -535,14 +546,14 @@ async fn dial_one(c: &ClientConfig, addrs: Vec<SocketAddr>, sockets: SocketFacto
 async fn connect(c: &ClientConfig, jumps: &Jumps) -> Result<Chain, String> {
     let cfgs = hop_configs(c, jumps, 0)?;
     let Some(first) = cfgs.first() else {
-        let sess = dial_one(c, resolve_addrs(c).await?, dual_stack_factory(), None).await?;
+        let sess = dial_one(c, resolve_addrs(c).await?, true, dual_stack_factory(), None).await?;
         return Ok(Chain { hops: Vec::new(), sess, supervisors: Vec::new() });
     };
     // One path manager (one UDP socket) for the whole chain: the first hop
     // observes the NAT mapping the direct-path punches then reuse (§7.3).
     let io = dual_stack_factory()().map_err(|e| format!("ssh3: socket: {e}"))?;
     let mgr = ssh3_core::path::PathManager::new(io);
-    let mut prev = dial_one(first, resolve_addrs(first).await?, dual_stack_factory(), Some(mgr.clone())).await?;
+    let mut prev = dial_one(first, resolve_addrs(first).await?, true, dual_stack_factory(), Some(mgr.clone())).await?;
     let mut prev_cfg = first.clone();
     let mut via = None;
     let mut hops: Vec<Arc<Hop>> = Vec::new();
@@ -557,7 +568,7 @@ async fn connect(c: &ClientConfig, jumps: &Jumps) -> Result<Chain, String> {
             Err(e) => return fail(hops, prev, format!("ssh3: jump to {} port {}: {e}", next.hostname, next.port)).await,
         };
         let virt = path.virt;
-        match dial_one(next, vec![virt], dual_stack_factory(), Some(mgr.clone())).await {
+        match dial_one(next, vec![virt], false, dual_stack_factory(), Some(mgr.clone())).await {
             Ok(s) => {
                 // If `next` is a peer registered at `prev` (SPEC §7.1), both
                 // ends upgrade to a direct path when the NATs allow; a plain

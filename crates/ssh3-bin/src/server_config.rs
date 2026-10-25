@@ -23,6 +23,7 @@
 //! user = "peer"                             # account at the gateway
 //! identity = "/etc/ssh3/peer_ed25519"       # private key (OpenSSH format)
 //! known_hosts = "/etc/ssh3/gateway_known_hosts"   # the gateway's host key
+//! address_family = "any"                  # any (IPv6 and IPv4 raced, RFC 8305) | inet | inet6
 //!
 //! [session]                                 # sshd_config analogues, all optional
 //! accept_env = ["LANG", "LC_*"]             # AcceptEnv
@@ -84,6 +85,29 @@ pub struct Register {
     pub known_hosts: PathBuf,
     /// known_hosts lookup name; default: the gateway host as written.
     pub host_key_alias: Option<String>,
+    /// Which of the gateway's addresses to use, as ssh_config AddressFamily:
+    /// "any" (default; IPv6 and IPv4 raced, RFC 8305), "inet", "inet6".
+    #[serde(default)]
+    pub address_family: AddressFamily,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressFamily {
+    #[default]
+    Any,
+    Inet,
+    Inet6,
+}
+
+impl AddressFamily {
+    pub fn admits(self, a: &std::net::SocketAddr) -> bool {
+        match self {
+            AddressFamily::Any => true,
+            AddressFamily::Inet => a.is_ipv4(),
+            AddressFamily::Inet6 => a.is_ipv6(),
+        }
+    }
 }
 
 fn default_authorized_keys() -> String {
@@ -209,6 +233,7 @@ pub struct LimitsOverrides {
     pty_linger: Option<OptDur>,
     probe_interval: Option<OptDur>,
     probe_timeout_min: Option<Dur>,
+    connect_attempt_delay: Option<Dur>,
     auto_resume: Option<bool>,
     resume_backoff_initial: Option<Dur>,
     resume_backoff_max: Option<Dur>,
@@ -259,6 +284,7 @@ impl LimitsOverrides {
             pty_linger,
             probe_interval,
             probe_timeout_min,
+            connect_attempt_delay,
             auto_resume,
             resume_backoff_initial,
             resume_backoff_max,
@@ -307,6 +333,7 @@ impl LimitsOverrides {
             pty_linger: self.pty_linger.map_or(pty_linger, |p| p.0),
             probe_interval: self.probe_interval.map_or(probe_interval, |p| p.0),
             probe_timeout_min: dur(self.probe_timeout_min, probe_timeout_min),
+            connect_attempt_delay: dur(self.connect_attempt_delay, connect_attempt_delay),
             auto_resume: self.auto_resume.unwrap_or(auto_resume),
             resume_backoff_initial: dur(self.resume_backoff_initial, resume_backoff_initial),
             resume_backoff_max: dur(self.resume_backoff_max, resume_backoff_max),

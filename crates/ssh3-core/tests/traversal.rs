@@ -56,7 +56,7 @@ fn host(name: &str, port: u16, env: &Env) -> HostCheck {
 }
 
 fn opts(env: &Env, addr: SocketAddr, host: HostCheck, path: Option<Arc<PathManager>>) -> ClientOptions {
-    ClientOptions { server_addr: addr, host, path, ..env.opts(&env.key) }
+    ClientOptions { server_addrs: vec![addr], host, path, ..env.opts(&env.key) }
 }
 
 impl World {

@@ -35,7 +35,7 @@ async fn relay_counters_balance() {
     // No direct-path machinery on the client: everything stays on the relay.
     let path = c.jump("box.peer", 443).await.unwrap();
     let mut o = peer.opts(&peer.key);
-    o.server_addr = path.virt;
+    o.server_addrs = vec![path.virt];
     let inner = tokio::time::timeout(BOUND, ClientSession::connect(path.inner_opts(o), path.socket())).await.expect("inner connect timed out").unwrap();
     let echo = echo_server().await;
     let local = forward(&inner, echo).await;

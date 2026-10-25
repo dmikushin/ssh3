@@ -39,6 +39,10 @@ pub enum Error {
     CarrierLost,
     #[error("timed out: {0}")]
     Deadline(String),
+    /// Every address of the server was tried and none completed a
+    /// handshake; names each address with its error.
+    #[error("no address reachable: {0}")]
+    Unreachable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

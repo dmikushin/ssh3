@@ -36,7 +36,7 @@ async fn pump_until(fwd: std::net::SocketAddr, what: &str, mut done: impl FnMut(
 async fn client_via(env: &Env, rtt: Duration) -> ClientSession {
     let front = delay::relay(env.server_addr(), rtt).await;
     let mut opts = env.opts(&env.key);
-    opts.server_addr = front;
+    opts.server_addrs = vec![front];
     ClientSession::connect(opts, udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap()
 }
 

@@ -44,6 +44,13 @@ impl HostCheck {
     }
 }
 
+/// Re-resolves the server's name: called before every automatic resume
+/// attempt, so a server reached by name is found again after its address
+/// changed (dynamic DNS, a restarted container). A failure is transient — the
+/// attempt is retried with the resume backoff — because during a network
+/// change name resolution fails as often as connecting does.
+pub type Resolver = Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> + Send + Sync>;
+
 /// Makes a fresh UDP socket for a rebind or a resume.
 pub type SocketFactory = Arc<dyn Fn() -> std::io::Result<Arc<dyn AsyncUdpSocket>> + Send + Sync>;
 
@@ -93,7 +100,16 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
 
 #[derive(Clone)]
 pub struct ClientOptions {
-    pub server_addr: SocketAddr,
+    /// Every address the server's name resolved to (or one literal / jump
+    /// path virtual address). A dial races them RFC 8305 style
+    /// (`connect_attempt_delay` apart, families interleaved, IPv6 first):
+    /// the first completed handshake wins, the others are closed before any
+    /// authentication.
+    pub server_addrs: Vec<SocketAddr>,
+    /// Where automatic resumes find the server again; None = always
+    /// `server_addrs` (literal addresses, or a jump path's virtual address,
+    /// which never changes).
+    pub resolve: Option<Resolver>,
     pub host: HostCheck,
     /// Keys offered in order on one connection until one is accepted or the
     /// server stops (MaxAuthTries), as OpenSSH (board R4).
@@ -116,6 +132,8 @@ pub struct RoamStats {
     pub rebinds: AtomicU64,
     pub resume_attempts: AtomicU64,
     pub resumes: AtomicU64,
+    /// Resume attempts whose name resolution failed (retried, not fatal).
+    pub resolve_failures: AtomicU64,
     /// Set when automatic resume gave up (session refused or linger over).
     pub gave_up: AtomicBool,
 }
@@ -124,6 +142,8 @@ struct ClientInner {
     shared: Arc<SessionShared>,
     opts: ClientOptions,
     endpoint: Mutex<Option<Endpoint>>,
+    /// The server address the current (or last) carrier went to.
+    addr: Mutex<SocketAddr>,
     /// The verified host key of the first connect: the session's target
     /// identity. A resume must present the same key.
     host_key: PublicKey,
@@ -179,28 +199,130 @@ struct Dialed {
     signer: Arc<dyn Signer>,
 }
 
-async fn connect_and_auth(opts: &ClientOptions, signers: &[Arc<dyn Signer>], socket: Arc<dyn AsyncUdpSocket>, intent: Intent) -> Result<Dialed> {
-    if signers.is_empty() {
-        return Err(Error::Auth("no identities to offer".into()));
-    }
+/// One QUIC handshake to `addr`, host key verified (not yet committed).
+struct Handshaken {
+    ep: Endpoint,
+    conn: Connection,
+    verifier: Arc<KnownHostsVerifier>,
+}
+
+async fn handshake(opts: &ClientOptions, addr: SocketAddr, socket: Option<Arc<dyn AsyncUdpSocket>>) -> Result<Handshaken> {
+    // A fresh verifier per attempt: no pending state is shared between racers.
     let verifier = opts.host.verifier();
     let recording = Arc::new(RecordingVerifier { inner: verifier.clone(), rejected: Mutex::new(None) });
     let cc = transport::client_config(transport::client_tls(recording.clone())?, &opts.limits)?;
     let ep = match &opts.path {
         Some(mgr) => mgr.endpoint_or_init(|sock| Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, sock, Arc::new(TokioRuntime)))?,
-        None => Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, socket, Arc::new(TokioRuntime))?,
-    };
-    let conn = match ep.connect_with(cc, transport::to_v6(opts.server_addr), "ssh3-rs")?.await {
-        Ok(c) => c,
-        Err(e) => {
-            // A handshake that failed because known_hosts refused the key is
-            // a host-key failure, not a network one.
-            if let Some(why) = recording.rejected.lock().unwrap().take() {
-                return Err(Error::HostKey(why));
-            }
-            return Err(e.into());
+        None => {
+            let socket = match socket {
+                Some(s) => s,
+                None => (opts.sockets)()?,
+            };
+            Endpoint::new_with_abstract_socket(transport::endpoint_config(&EndpointKeys::random()), None, socket, Arc::new(TokioRuntime))?
         }
     };
+    match ep.connect_with(cc, transport::to_v6(addr), "ssh3-rs")?.await {
+        Ok(conn) => Ok(Handshaken { ep, conn, verifier }),
+        // A handshake that failed because known_hosts refused the key is a
+        // host-key failure, not a network one.
+        Err(e) => match recording.rejected.lock().unwrap().take() {
+            Some(why) => Err(Error::HostKey(why)),
+            None => Err(e.into()),
+        },
+    }
+}
+
+/// RFC 8305 §4 order: duplicates removed, address families interleaved,
+/// IPv6 first (an IPv4-mapped address counts as IPv4).
+pub fn attempt_order(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut seen = Vec::new();
+    for a in addrs {
+        if !seen.contains(a) {
+            seen.push(*a);
+        }
+    }
+    let is_v6 = |a: &SocketAddr| matches!(a, SocketAddr::V6(v) if v.ip().to_ipv4_mapped().is_none());
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) = seen.into_iter().partition(is_v6);
+    let mut out = Vec::with_capacity(v6.len() + v4.len());
+    let (mut a, mut b) = (v6.into_iter(), v4.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return out,
+            (x, y) => out.extend(x.into_iter().chain(y)),
+        }
+    }
+}
+
+/// Race handshakes to `addrs` (RFC 8305 "Happy Eyeballs" connection
+/// attempts): the next address is tried `connect_attempt_delay` after the
+/// previous one started, or at once when it failed; the first completed
+/// handshake wins and every other attempt is aborted (closed before any
+/// authentication, so the server never sees a second session). Each
+/// attempt's outcome is logged; the error names every address tried.
+async fn race_handshake(opts: &ClientOptions, addrs: &[SocketAddr], socket: Arc<dyn AsyncUdpSocket>) -> Result<(Handshaken, SocketAddr)> {
+    let order = attempt_order(addrs);
+    if order.is_empty() {
+        return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address to connect to")));
+    }
+    let mut set: tokio::task::JoinSet<(SocketAddr, Result<Handshaken>)> = tokio::task::JoinSet::new();
+    let mut first = Some(socket);
+    let mut next = 0usize;
+    let mut tried: Vec<String> = Vec::new();
+    let delay = opts.limits.connect_attempt_delay;
+    let start = |set: &mut tokio::task::JoinSet<_>, i: usize, first: &mut Option<Arc<dyn AsyncUdpSocket>>| {
+        let (addr, opts, sock) = (order[i], opts.clone(), first.take());
+        tracing::debug!("connecting to {addr}");
+        set.spawn(async move { (addr, handshake(&opts, addr, sock).await) });
+    };
+    start(&mut set, 0, &mut first);
+    next += 1;
+    let tick = tokio::time::sleep(delay);
+    tokio::pin!(tick);
+    loop {
+        tokio::select! {
+            Some(j) = set.join_next() => {
+                let (addr, r) = j.map_err(|e| Error::Io(std::io::Error::other(format!("connection attempt task: {e}"))))?;
+                match r {
+                    Ok(h) => {
+                        set.abort_all();
+                        if !tried.is_empty() {
+                            tracing::info!("connected to {addr} after: {}", tried.join("; "));
+                        }
+                        return Ok((h, addr));
+                    }
+                    // A host-key verdict is about the server, not the path:
+                    // trying other addresses of the same name cannot fix it.
+                    Err(Error::HostKey(why)) => {
+                        set.abort_all();
+                        return Err(Error::HostKey(why));
+                    }
+                    Err(e) => {
+                        tracing::info!("tried {addr}: {e}");
+                        tried.push(format!("tried {addr}: {e}"));
+                        if next < order.len() {
+                            start(&mut set, next, &mut first);
+                            next += 1;
+                            tick.as_mut().reset(tokio::time::Instant::now() + delay);
+                        } else if set.is_empty() {
+                            return Err(Error::Unreachable(tried.join("; ")));
+                        }
+                    }
+                }
+            }
+            _ = &mut tick, if next < order.len() => {
+                start(&mut set, next, &mut first);
+                next += 1;
+                tick.as_mut().reset(tokio::time::Instant::now() + delay);
+            }
+        }
+    }
+}
+
+async fn connect_and_auth(opts: &ClientOptions, addrs: &[SocketAddr], signers: &[Arc<dyn Signer>], socket: Arc<dyn AsyncUdpSocket>, intent: Intent) -> Result<(Dialed, SocketAddr)> {
+    if signers.is_empty() {
+        return Err(Error::Auth("no identities to offer".into()));
+    }
+    let (Handshaken { ep, conn, verifier }, addr) = race_handshake(opts, addrs, socket).await?;
     // The handshake is confirmed (proof of possession done): only now may
     // the host key be committed — and before we sign anything for this host.
     let host_key = match verifier.commit() {
@@ -234,7 +356,7 @@ async fn connect_and_auth(opts: &ClientOptions, signers: &[Arc<dyn Signer>], soc
             break;
         }
         match frame::read_message(&mut recv, MAX_FRAME).await {
-            Ok(Some(Message::AuthOk { session: info })) => return Ok(Dialed { ep, conn, send, recv, info, host_key, signer: signer.clone() }),
+            Ok(Some(Message::AuthOk { session: info })) => return Ok((Dialed { ep, conn, send, recv, info, host_key, signer: signer.clone() }, addr)),
             Ok(Some(Message::AuthFail { reason })) => refusals.push(format!("{}: {reason}", signer.public_key().fingerprint(ssh_key::HashAlg::Sha256))),
             Ok(Some(m)) => return Err(Error::Protocol(format!("expected AuthOk/AuthFail, got {m:?}"))),
             // The server stopped taking attempts (MaxAuthTries).
@@ -248,7 +370,7 @@ async fn connect_and_auth(opts: &ClientOptions, signers: &[Arc<dyn Signer>], soc
 impl ClientSession {
     pub async fn connect(opts: ClientOptions, socket: Arc<dyn AsyncUdpSocket>) -> Result<Self> {
         opts.limits.validate().map_err(Error::Config)?;
-        let Dialed { ep, conn, send, recv, info, host_key, signer } = connect_and_auth(&opts, &opts.signers, socket, Intent::New).await?;
+        let (Dialed { ep, conn, send, recv, info, host_key, signer }, addr) = connect_and_auth(&opts, &opts.server_addrs, &opts.signers, socket, Intent::New).await?;
         let info = info.ok_or_else(|| Error::Protocol("AuthOk for a new session carries no session info".into()))?;
         let shared = SessionShared::new(
             info.session_id,
@@ -268,6 +390,7 @@ impl ClientSession {
         }
         let inner = Arc::new(ClientInner {
             shared: shared.clone(),
+            addr: Mutex::new(addr),
             opts,
             endpoint: Mutex::new(Some(ep)),
             host_key,
@@ -349,7 +472,13 @@ impl ClientSession {
     /// Reattach the session over a new connection from `socket` (any local
     /// address or family). SPEC §5 "Resume".
     pub async fn resume(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<u64> {
-        self.inner.resume(socket).await
+        let addrs = self.inner.with_current_first(self.inner.opts.server_addrs.clone());
+        self.inner.resume(socket, &addrs).await
+    }
+
+    /// The server address the current (or last) carrier went to.
+    pub fn server_addr(&self) -> SocketAddr {
+        *self.inner.addr.lock().unwrap()
     }
 
     /// The server's verified host key (the session's target identity).
@@ -423,11 +552,11 @@ impl ClientSession {
 }
 
 impl ClientInner {
-    async fn resume(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<u64> {
+    async fn resume(&self, socket: Arc<dyn AsyncUdpSocket>, addrs: &[SocketAddr]) -> Result<u64> {
         let _g = self.shared.attach_lock.lock().await;
         self.shared.detach(close::SUPERSEDED, b"client resuming");
         let ours = self.shared.snapshot_lanes();
-        let Dialed { ep, conn, mut send, mut recv, host_key, .. } = connect_and_auth(&self.opts, std::slice::from_ref(&self.auth_signer), socket, Intent::Resume).await?;
+        let (Dialed { ep, conn, mut send, mut recv, host_key, .. }, addr) = connect_and_auth(&self.opts, addrs, std::slice::from_ref(&self.auth_signer), socket, Intent::Resume).await?;
         if !ssh3_keys::spki::same_key(&host_key, &self.host_key) {
             conn.close(close::SHUTDOWN.into(), b"host key changed");
             return Err(Error::HostKey(format!(
@@ -457,8 +586,35 @@ impl ClientInner {
         {
             tracing::info!("direct path not restarted after resume: {e}");
         }
+        *self.addr.lock().unwrap() = addr;
         self.roam.resumes.fetch_add(1, Ordering::Relaxed);
         Ok(epoch)
+    }
+
+    /// `addrs` with the current carrier's address moved to the front (it
+    /// worked last; RFC 8305 still races the rest behind it).
+    fn with_current_first(&self, mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        let current = *self.addr.lock().unwrap();
+        if let Some(i) = addrs.iter().position(|a| *a == current) {
+            addrs.remove(i);
+            addrs.insert(0, current);
+        }
+        addrs
+    }
+
+    /// Where the next resume attempt goes: what the name resolves to now, or
+    /// `server_addrs` when there is no resolver; the current address first
+    /// if it is still among them. A resolution failure is an attempt failure.
+    async fn resume_targets(&self) -> Result<Vec<SocketAddr>> {
+        let Some(resolve) = &self.opts.resolve else { return Ok(self.with_current_first(self.opts.server_addrs.clone())) };
+        match resolve().await {
+            Ok(addrs) if addrs.is_empty() => Err(Error::Io(std::io::Error::other("the server's name resolves to no address"))),
+            Ok(addrs) => Ok(self.with_current_first(addrs)),
+            Err(e) => {
+                self.roam.resolve_failures.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Io(std::io::Error::new(e.kind(), format!("resolving the server's name: {e}"))))
+            }
+        }
     }
 
     /// One liveness probe: Ping, then wait for its Pong for
@@ -546,12 +702,18 @@ async fn roam(inner: std::sync::Weak<ClientInner>) {
             // R6): an unreachable server must not hold one attempt for the
             // whole QUIC idle timeout past the session's end.
             let remaining = c.linger.saturating_sub(lost_at.elapsed());
-            let r = match (c.opts.sockets)() {
-                Ok(sock) => match tokio::time::timeout(remaining, c.resume(sock)).await {
-                    Ok(r) => r,
-                    Err(_) => Err(Error::Deadline(format!("resume attempt outlived the remaining linger {remaining:?}"))),
-                },
-                Err(e) => Err(Error::Io(e)),
+            // Resolution, socket and handshake are all part of the attempt:
+            // any of them failing (name not resolvable, no route, ECONNREFUSED
+            // during a network change) is retried; only the server's refusal
+            // of the session ends the loop.
+            let attempt = async {
+                let addrs = c.resume_targets().await?;
+                let sock = (c.opts.sockets)().map_err(Error::Io)?;
+                c.resume(sock, &addrs).await
+            };
+            let r = match tokio::time::timeout(remaining, attempt).await {
+                Ok(r) => r,
+                Err(_) => Err(Error::Deadline(format!("resume attempt outlived the remaining linger {remaining:?}"))),
             };
             match r {
                 Ok(epoch) => {

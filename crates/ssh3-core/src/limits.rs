@@ -75,6 +75,10 @@ pub struct Limits {
     pub probe_interval: Option<Duration>,
     /// A probe is lost if unanswered within max(3·RTT, this).
     pub probe_timeout_min: Duration,
+    /// RFC 8305 "Connection Attempt Delay": how long a dial waits for one
+    /// address before also trying the next (families interleaved, IPv6
+    /// first). Applies to every dial: connect, resume, jump hops, register.
+    pub connect_attempt_delay: Duration,
     /// Resume automatically after a carrier death.
     pub auto_resume: bool,
     pub resume_backoff_initial: Duration,
@@ -134,6 +138,7 @@ impl Default for Limits {
             pty_linger: None,
             probe_interval: Some(Duration::from_secs(1)),
             probe_timeout_min: Duration::from_secs(1),
+            connect_attempt_delay: Duration::from_millis(250),
             auto_resume: true,
             resume_backoff_initial: Duration::from_millis(200),
             resume_backoff_max: Duration::from_secs(10),

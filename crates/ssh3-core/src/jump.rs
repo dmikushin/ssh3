@@ -64,7 +64,7 @@ impl RelayLink for ChannelLink {
 pub struct JumpPath {
     pub mgr: Arc<PathManager>,
     pub route: RouteId,
-    /// The address the inner connection dials (`ClientOptions::server_addr`).
+    /// The address the inner connection dials (`ClientOptions::server_addrs`).
     pub virt: SocketAddr,
     pub link: Arc<ChannelLink>,
     pub chan_id: u64,
@@ -87,7 +87,7 @@ impl JumpPath {
     /// user, limits) dialled at the virtual address on the path manager's
     /// endpoint.
     pub fn inner_opts(&self, base: ClientOptions) -> ClientOptions {
-        ClientOptions { server_addr: self.virt, path: Some(self.mgr.clone()), ..base }
+        ClientOptions { server_addrs: vec![self.virt], resolve: None, path: Some(self.mgr.clone()), ..base }
     }
 
     /// Packets sent over the relay route so far.

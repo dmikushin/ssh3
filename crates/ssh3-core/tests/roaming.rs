@@ -2,7 +2,9 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::blackhole::Blackhole;
@@ -138,4 +140,91 @@ async fn resume_attempts_are_bounded_by_the_linger() {
     let lost = std::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(4), c.gave_up()).await.expect("never gave up");
     assert!(lost.elapsed() < Duration::from_secs(2), "gave up only after {:?}: an attempt outlived the linger", lost.elapsed());
+}
+
+/// What the test resolver answers: addresses, or "name does not resolve".
+type Answer = Arc<Mutex<Option<Vec<SocketAddr>>>>;
+
+fn test_resolver(answer: Answer) -> ssh3_core::client::Resolver {
+    Arc::new(move || {
+        let a = answer.lock().unwrap().clone();
+        Box::pin(async move { a.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "test resolver: name does not resolve")) })
+    })
+}
+
+/// A name-resolution failure during automatic resume is transient: retried
+/// with the backoff, never fatal. And the name is re-resolved on every
+/// attempt: when it finally resolves to a NEW address (the old one is dead),
+/// the session resumes there and the transfer completes intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_re_resolves_and_survives_an_unresolvable_name() {
+    let env = env_with(roaming(Limits { idle_timeout: Duration::from_millis(300), auto_resume: true, ..fast_limits() }));
+    let (old_addr, old_route) = common::delay::switchable_relay(env.server_addr()).await;
+    let net = Arc::new(AtomicBool::new(false));
+    let answer: Answer = Arc::new(Mutex::new(Some(vec![old_addr])));
+    let mut opts = env.opts(&env.key);
+    opts.server_addrs = vec![old_addr];
+    opts.resolve = Some(test_resolver(answer.clone()));
+    opts.sockets = network_factory(net.clone());
+    let c = ClientSession::connect(opts.clone(), (opts.sockets)().unwrap()).await.unwrap();
+    let echo = echo_server().await;
+    let fwd = forward(&c, echo).await;
+    let data = Arc::new(pattern(4 << 20, 53));
+    let rt = tokio::spawn(echo_roundtrip(fwd, data.clone()));
+    wait_until("transfer under way", Duration::from_secs(20), || c.shared.stats.lane_bytes_sent.load(Ordering::Relaxed) > 1 << 20, || format!("{:?}", env.server.stats())).await;
+    net.store(true, Ordering::SeqCst);
+    c.carrier_lost().await;
+    wait_until("server detached", Duration::from_secs(10), || env.server.stats().detached == 1, || format!("{:?}", env.server.stats())).await;
+    // The network is back, but the name does not resolve and the old
+    // address is dead.
+    *answer.lock().unwrap() = None;
+    *old_route.lock().unwrap() = None;
+    net.store(false, Ordering::SeqCst);
+    wait_until("resolution failures retried", Duration::from_secs(10), || c.roam_stats().resolve_failures.load(Ordering::Relaxed) >= 3, || format!("{:?}", c.roam_stats())).await;
+    assert!(!c.roam_stats().gave_up.load(Ordering::Relaxed), "a resolution failure ended the session");
+    assert_eq!(c.roam_stats().resumes.load(Ordering::Relaxed), 0);
+    // The name resolves again — to the server's new address.
+    *answer.lock().unwrap() = Some(vec![env.server_addr()]);
+    let out = tokio::time::timeout(Duration::from_secs(15), rt)
+        .await
+        .unwrap_or_else(|_| panic!("transfer did not resume at the new address: {:?}", c.roam_stats()))
+        .unwrap();
+    assert_same(&out, &data);
+    assert_eq!(c.server_addr(), env.server_addr(), "the session did not move to the re-resolved address");
+    assert!(c.roam_stats().resumes.load(Ordering::Relaxed) >= 1);
+    assert_eq!(env.server.stats().resumes_accepted, c.roam_stats().resumes.load(Ordering::Relaxed));
+}
+
+fn erroring_factory(errno: Arc<AtomicI32>) -> ssh3_core::client::SocketFactory {
+    Arc::new(move || Ok(Blackhole::on_network_err(dual_stack_socket("[::]:0".parse().unwrap()).unwrap(), None, Some(errno.clone())) as Arc<dyn quinn::AsyncUdpSocket>))
+}
+
+/// A laptop whose network is down answers sends with ENETUNREACH /
+/// EHOSTUNREACH, a refusing path with ECONNREFUSED: every one of them is a
+/// transient resume failure, retried until the network is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_retries_through_send_errors() {
+    for (name, errno) in [("ENETUNREACH", libc::ENETUNREACH), ("EHOSTUNREACH", libc::EHOSTUNREACH), ("ECONNREFUSED", libc::ECONNREFUSED)] {
+        let env = env_with(roaming(Limits { idle_timeout: Duration::from_millis(300), auto_resume: true, ..fast_limits() }));
+        let err = Arc::new(AtomicI32::new(0));
+        let mut opts = env.opts(&env.key);
+        opts.sockets = erroring_factory(err.clone());
+        let c = ClientSession::connect(opts.clone(), (opts.sockets)().unwrap()).await.unwrap();
+        let echo = echo_server().await;
+        let fwd = forward(&c, echo).await;
+        let data = Arc::new(pattern(1 << 20, 54));
+        err.store(errno, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), c.carrier_lost())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: carrier not declared lost while every send fails: {:?}", c.roam_stats()));
+        wait_until(&format!("{name}: attempts fail and are retried"), Duration::from_secs(10), || c.roam_stats().resume_attempts.load(Ordering::Relaxed) >= 3, || format!("{:?}", c.roam_stats())).await;
+        assert!(!c.roam_stats().gave_up.load(Ordering::Relaxed), "{name} ended the session");
+        assert_eq!(c.roam_stats().resumes.load(Ordering::Relaxed), 0, "{name}: resumed while every send failed");
+        err.store(0, Ordering::SeqCst);
+        let out = tokio::time::timeout(Duration::from_secs(15), echo_roundtrip(fwd, data.clone()))
+            .await
+            .unwrap_or_else(|_| panic!("{name}: no resume after the network came back: {:?}", c.roam_stats()));
+        assert_same(&out, &data);
+        assert!(c.roam_stats().resumes.load(Ordering::Relaxed) >= 1, "{name}");
+    }
 }

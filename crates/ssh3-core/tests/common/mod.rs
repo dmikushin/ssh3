@@ -165,7 +165,8 @@ impl Env {
     }
     pub fn opts(&self, key: &Arc<TestKey>) -> ClientOptions {
         ClientOptions {
-            server_addr: self.server_addr(),
+            server_addrs: vec![self.server_addr()],
+            resolve: None,
             host: self.host_check(),
             signers: vec![key.clone() as Arc<dyn ssh3_core::auth::Signer>],
             user: "tester".into(),

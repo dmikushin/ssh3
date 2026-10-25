@@ -191,11 +191,12 @@ pub struct RegisterSpec {
     identity: PathBuf,
     known_hosts: PathBuf,
     alias: Option<String>,
+    family: crate::server_config::AddressFamily,
 }
 
 impl crate::server_config::Register {
     fn clone_spec(&self) -> RegisterSpec {
-        RegisterSpec { gateway: self.gateway.clone(), name: self.name.clone(), user: self.user.clone(), identity: self.identity.clone(), known_hosts: self.known_hosts.clone(), alias: self.host_key_alias.clone() }
+        RegisterSpec { gateway: self.gateway.clone(), name: self.name.clone(), user: self.user.clone(), identity: self.identity.clone(), known_hosts: self.known_hosts.clone(), alias: self.host_key_alias.clone(), family: self.address_family }
     }
 }
 
@@ -229,10 +230,21 @@ async fn register_once(server: &Server, r: &RegisterSpec) -> Result<ssh3_core::C
         Some((h, p)) => (h.trim_start_matches('[').trim_end_matches(']').to_string(), p.parse::<u16>().map_err(|e| format!("gateway {:?}: port: {e}", r.gateway))?),
         None => (r.gateway.clone(), 443),
     };
-    let addr = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| format!("resolve {host}: {e}"))?.next().ok_or_else(|| format!("resolve {host}: no address"))?;
+    let family = r.family;
+    let lookup = move |h: String| async move {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((h.as_str(), port)).await?.filter(|a| family.admits(a)).collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{h}: no address of address family {family:?}")));
+        }
+        Ok(addrs)
+    };
+    let addrs = lookup(host.clone()).await.map_err(|e| format!("resolve {host}: {e}"))?;
     let signer: Arc<dyn ssh3_core::auth::Signer> = Arc::new(ssh3_keys::signer::FileSigner::load(&r.identity).map_err(|e| format!("identity {}: {e}", r.identity.display()))?);
+    let name = host.clone();
+    let resolve: ssh3_core::client::Resolver = Arc::new(move || Box::pin(lookup(name.clone())));
     let opts = ssh3_core::ClientOptions {
-        server_addr: addr,
+        server_addrs: addrs,
+        resolve: Some(resolve),
         host: ssh3_core::client::HostCheck {
             name: r.alias.clone().unwrap_or(host),
             port,

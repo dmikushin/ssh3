@@ -104,6 +104,11 @@ impl Env {
     /// `top`: extra top-level config lines; `sections`: extra sections,
     /// made from the new server's directory.
     fn build(top: &str, limits: &str, sections: impl FnOnce(&Path) -> String) -> Self {
+        Self::build_at("[::]:0", top, limits, sections)
+    }
+
+    /// As `build`, listening on `listen` (e.g. IPv4 only).
+    fn build_at(listen: &str, top: &str, limits: &str, sections: impl FnOnce(&Path) -> String) -> Self {
         let dir = PathBuf::from(std::env::var("HOME").unwrap())
             .join("scratch/ssh-udp/bins-tests")
             .join(format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
@@ -121,7 +126,7 @@ impl Env {
         std::fs::write(
             &conf,
             format!(
-                "listen = \"[::]:0\"\nhost_key = \"{d}/host_key\"\nendpoint_keys = \"{d}/endpoint-keys\"\nauthorized_keys = \"{d}/authorized_keys\"\nstats_socket = \"{d}/stats.sock\"\n{top}[session]\nset_env = {{ HOME = \"{d}\", XDG_CONFIG_HOME = \"{d}/.config\" }}\n[limits]\nlogin_grace = \"5s\"\n{limits}\n{extra}",
+                "listen = \"{listen}\"\nhost_key = \"{d}/host_key\"\nendpoint_keys = \"{d}/endpoint-keys\"\nauthorized_keys = \"{d}/authorized_keys\"\nstats_socket = \"{d}/stats.sock\"\n{top}[session]\nset_env = {{ HOME = \"{d}\", XDG_CONFIG_HOME = \"{d}/.config\" }}\n[limits]\nlogin_grace = \"5s\"\n{limits}\n{extra}",
                 d = dir.display(),
                 extra = sections(&dir)
             ),
@@ -1433,4 +1438,49 @@ fn healthy_link_shows_no_status_line() {
         }
     }
     assert!(!screen.text.contains("Last contact"), "status line on a healthy link: {:?}", screen.text);
+}
+
+/// RFC 8305 through the real resolver: `localhost` has an IPv6 and an IPv4
+/// address (/etc/hosts). The server listens on IPv4 only and the IPv6 port
+/// is a silent socket — a filtered path, as the oracle gateway's AAAA was.
+/// The client must reach IPv4 in well under a handshake timeout, and with
+/// AddressFamily inet6 fail naming the address it tried.
+#[test]
+fn filtered_ipv6_is_raced_with_ipv4() {
+    use std::net::ToSocketAddrs;
+    let env = Env::build_at("127.0.0.1:0", "", "", |_| String::new());
+    let addrs: Vec<std::net::SocketAddr> = ("localhost", env.port).to_socket_addrs().unwrap().collect();
+    assert!(
+        addrs.iter().any(|a| a.is_ipv6()) && addrs.iter().any(|a| a.is_ipv4()),
+        "precondition: localhost must resolve to both ::1 and 127.0.0.1 here, got {addrs:?}"
+    );
+    let _filtered = std::net::UdpSocket::bind(("::1", env.port)).unwrap();
+    let host_pub = std::fs::read_to_string(env.dir.join("host_key.pub")).unwrap();
+    std::fs::write(env.dir.join("known_hosts.lh"), format!("[localhost]:{} {host_pub}", env.port)).unwrap();
+    let cfg = env.dir.join("ssh_config.lh");
+    std::fs::write(
+        &cfg,
+        format!(
+            "Host lh\n  HostName localhost\n  Port {port}\n  User {user}\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {d}/known_hosts.lh\n  GlobalKnownHostsFile none\n  StrictHostKeyChecking yes\n  ServerAliveInterval 1\n  ServerAliveCountMax 2\n",
+            port = env.port,
+            user = me(),
+            d = env.dir.display()
+        ),
+    )
+    .unwrap();
+    let run = |extra: &[&str]| {
+        let t = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_ssh3")).arg("-F").arg(&cfg).args(extra).arg("lh").arg("echo raced-ok").output().unwrap();
+        (out, t.elapsed())
+    };
+    let (out, took) = run(&[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "raced-ok");
+    assert!(took < Duration::from_secs(1), "took {took:?}: the filtered IPv6 address was waited for");
+    let (out, took) = run(&["-o", "AddressFamily=inet6"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{err}");
+    assert!(err.contains(&format!("tried [::1]:{}", env.port)), "the error does not name the address: {err}");
+    assert!(!err.contains("127.0.0.1"), "inet6 tried IPv4: {err}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
 }

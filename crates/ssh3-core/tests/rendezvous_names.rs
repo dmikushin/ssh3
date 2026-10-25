@@ -138,7 +138,7 @@ async fn registrations_do_not_shadow_dns_names() {
     let path = c.jump("localhost", target.server.local_addr().port()).await.unwrap();
     // The inner connection must reach the real `target`, verified by its key.
     let mut o = target.opts(&target.key);
-    o.server_addr = path.virt;
+    o.server_addrs = vec![path.virt];
     let inner = tokio::time::timeout(BOUND, ClientSession::connect(path.inner_opts(o), path.socket())).await.expect("inner connect timed out");
     let _inner = inner.expect("inner connect over the jump");
     // Every test env shares one host key, so the key check cannot tell the
@@ -148,7 +148,7 @@ async fn registrations_do_not_shadow_dns_names() {
     // And the peer is reachable only through its own namespace.
     let path = c.jump("LocalHost.Peer", 22).await.unwrap();
     let mut o = p.opts(&p.key);
-    o.server_addr = path.virt;
+    o.server_addrs = vec![path.virt];
     let _inner = tokio::time::timeout(BOUND, ClientSession::connect(path.inner_opts(o), path.socket())).await.expect("inner connect timed out").expect("inner connect to the peer");
     assert_eq!(p.server.stats().sessions, 1, "`localhost.peer` must reach the registered peer");
 }
@@ -211,7 +211,7 @@ async fn peer_connection_is_permitted_by_label_peer_port_0() {
     let c = ClientSession::connect(gw.opts(&kc), ssh3_core::udp_socket(dual_stack_socket("[::]:0".parse().unwrap()).unwrap()).unwrap()).await.unwrap();
     let path = c.jump("box.peer", 443).await.expect("permitopen=\"box.peer:0\" allows a jump to box.peer with Port 443");
     let mut o = p.opts(&p.key);
-    o.server_addr = path.virt;
+    o.server_addrs = vec![path.virt];
     let _inner = tokio::time::timeout(BOUND, ClientSession::connect(path.inner_opts(o), path.socket())).await.expect("inner connect timed out").expect("inner connect to the peer");
     // Any other target stays refused: another peer, a real host.
     for (h, port) in [("other.peer", 443), ("localhost", 443)] {
