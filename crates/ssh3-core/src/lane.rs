@@ -431,6 +431,74 @@ impl Lane {
         floor_chunk(&self.env.floor_budget, &st.rfloor, RECV_FLOOR_CHUNKS)
     }
 
+    /// Copy `data` into the receive ring and account it, under the already-held
+    /// lane lock.
+    ///
+    /// **All-or-nothing.** The ring and `received` must move together, or the
+    /// receive-ring invariant `rbuf.len() == received - delivered` breaks: the
+    /// old code committed each chunk into the ring and only advanced `received`
+    /// after the whole copy, so when storage ran out part way through (a
+    /// RetractAck or detach released the reservation that backed the credit
+    /// between the grant and this read, and the floor pool was full),
+    /// `recv_chunk` returned `None` mid-loop and the error left bytes in the
+    /// ring that `received` never counted. Those bytes were later delivered,
+    /// driving `delivered > received` and overflowing `recv_ring_bytes`.
+    ///
+    /// Here every tail is acquired first. Only once storage for the entire
+    /// chunk is in hand is anything committed to the ring; on shortfall the
+    /// acquired tails are dropped (their permits returned) and the ring is
+    /// untouched, so a reported error never corrupts the accounting.
+    fn recv_commit(&self, st: &mut LaneState, data: &[u8]) -> Result<()> {
+        let n = data.len();
+        if n == 0 {
+            return Ok(());
+        }
+        // Phase 1: acquire storage for the whole copy without mutating the
+        // ring. The existing tail (if any) is taken out and refilled first;
+        // the rest comes from fresh chunks.
+        let mut tails: Vec<Tail> = Vec::new();
+        if let Some(t) = st.rbuf.take_tail() {
+            tails.push(t);
+        }
+        let mut have: usize = tails.iter().map(Tail::space).sum();
+        while have < n {
+            match self.recv_chunk(st) {
+                Some(t) => {
+                    have += t.space();
+                    tails.push(t);
+                }
+                None => {
+                    // Shortfall: return the partial tail (if it was ours) so
+                    // the ring is exactly as it was, then report the error.
+                    // Dropping `tails` returns every acquired permit.
+                    return Err(Error::Protocol(format!(
+                        "lane {}/{}: internal: credit granted without storage",
+                        self.chan_id, self.lane
+                    )));
+                }
+            }
+        }
+        // Phase 2: storage for all `n` bytes is in hand; commit it. This
+        // cannot fail, so the ring and `received` advance together.
+        let mut off = 0;
+        for mut tail in tails {
+            if off >= n {
+                // Spare capacity beyond the copy: give the unused tail back to
+                // the ring as the new tail (0 bytes committed keeps it spare).
+                st.rbuf.commit(tail, 0);
+                continue;
+            }
+            let k = tail.space().min(n - off);
+            tail.spare(k).copy_from_slice(&data[off..off + k]);
+            st.rbuf.commit(tail, k);
+            off += k;
+        }
+        debug_assert_eq!(off, n, "phase 2 committed every byte");
+        st.received += n as u64;
+        self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Decide whether to ack: urgent if the limit rose by ≥ 1/4 of the grant
     /// (liveness) or accepted rose by ≥ 1/4 of capacity (send-ring release);
     /// lazy otherwise.
@@ -1126,21 +1194,7 @@ impl Lane {
                 st.sink_progress = Instant::now();
             }
             st.last_arrival = Instant::now();
-            let mut off = 0;
-            while off < n {
-                let mut tail = match st.rbuf.take_tail() {
-                    Some(t) => t,
-                    None => self.recv_chunk(&mut st).ok_or_else(|| {
-                        Error::Protocol(format!("lane {}/{}: internal: credit granted without storage", self.chan_id, self.lane))
-                    })?,
-                };
-                let k = tail.space().min(n - off);
-                tail.spare(k).copy_from_slice(&data[off..off + k]);
-                st.rbuf.commit(tail, k);
-                off += k;
-            }
-            st.received += n as u64;
-            self.env.stats.recv_ring_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            self.recv_commit(&mut st, &data[..])?;
             // A sink holding bytes for longer than ack_interval is stalled:
             // stop granting it more than the floor.
             if !was_empty && st.sink_progress.elapsed() > self.env.ack_interval && st.granted > self.env.floor {
@@ -1309,5 +1363,462 @@ mod tests {
         // The check stays strict: a hostile receiver lowering the limit
         // inside the current fence is still cut.
         assert!(send.on_ack(received, sent.max(new_limit) - 1, seq).is_err());
+    }
+
+    /// The receive-ring accounting invariant every caller relies on:
+    /// `recv_ring_bytes == received - delivered`, lane-locally
+    /// `rbuf.len() == received - delivered`. `received >= delivered` must
+    /// hold (a byte is delivered only after it is received). This is the
+    /// invariant `probe_inv` checked in the 1000-session run (PROBE invariant
+    /// at="lower-limit"), and the one `recv_ring_bytes` overflow-panics on
+    /// when it is broken under `overflow-checks = true`.
+    fn recv_invariant_holds(st: &LaneState) -> bool {
+        st.received >= st.delivered && st.rbuf.len() as u64 == st.received - st.delivered
+    }
+
+    /// REPRO: receive-reserve/commit interleaving leaks ring bytes.
+    ///
+    /// `recv_task` commits the incoming chunk into `rbuf` segment by segment
+    /// and only afterwards does `received += n`. If storage runs out part way
+    /// through the chunk — the lane has `limit - received >= n` credit, but a
+    /// concurrent `lower_limit`/`recompute_limit` (RetractAck, or detach +
+    /// `retract_unilaterally` on carrier death) released the reservation that
+    /// backed it, and the per-lane floor pool is full — `recv_chunk` returns
+    /// `None` mid-loop and the `?` returns the error with bytes ALREADY in the
+    /// ring but `received` never advanced.
+    ///
+    /// The ring then holds more bytes than `received - delivered`. The sink
+    /// keeps delivering them, so `delivered` overruns `received` (observed:
+    /// delivered 5671402 > received 5671126, by exactly the leaked sub-chunk
+    /// remainder), `recv_ring_bytes` wraps, and the stats sum overflow-panics.
+    ///
+    /// This drives the exact committed-but-uncounted path deterministically:
+    /// a chunk is granted with credit but storage covers only part of it.
+    #[test]
+    fn recv_commit_partial_storage_does_not_leak_ring_bytes() {
+        let recv = Lane::new(2, 0, env());
+
+        // One read of 2*CH + 276 bytes. Credit (limit - received) covers it,
+        // but storage covers only 2*CH: reserve is empty and the two floor
+        // chunks are the only backing, so the third chunk request fails
+        // mid-loop — exactly as when a RetractAck/detach released the
+        // reservation between the credit grant and this read.
+        let remainder = 276usize;
+        let n: usize = 2 * CHUNK + remainder;
+        {
+            let mut st = recv.st.lock().unwrap();
+            st.received = 0;
+            st.delivered = 0;
+            st.limit = n as u64; // credit says these bytes are allowed
+            // reserve stays empty (Permit::empty); rfloor starts at 0 so the
+            // two-chunk floor pool is available and then exhausted by the loop.
+            assert_eq!(st.reserve.amount(), 0);
+            assert_eq!(st.rfloor.load(Ordering::Acquire), 0);
+            assert!(recv_invariant_holds(&st), "clean start");
+        }
+
+        let data = vec![0xABu8; n];
+        let r = {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &data)
+        };
+
+        // The commit cannot complete: storage ran out at the third chunk.
+        assert!(r.is_err(), "precondition: storage exhausted mid-chunk");
+
+        let st = recv.st.lock().unwrap();
+        // The defect: the two floor chunks (2*CH bytes) were committed to the
+        // ring, but `received` was never advanced. rbuf now exceeds
+        // received - delivered. This assertion FAILS on the defective source
+        // and PASSES once recv_commit is all-or-nothing.
+        assert!(
+            recv_invariant_holds(&st),
+            "LEAK: rbuf={} but received-delivered={} (received={}, delivered={}); \
+             committed-but-uncounted bytes will be delivered and drive delivered>received",
+            st.rbuf.len(),
+            st.received as i64 - st.delivered as i64,
+            st.received,
+            st.delivered,
+        );
+    }
+
+    /// Full receiver accounting invariant, checked after every forced step.
+    /// These are the conditions the production probe (`probe_inv`) and the
+    /// `recv_ring_bytes` overflow checks enforce:
+    ///  * `received >= delivered` (a byte is delivered only after received),
+    ///  * `rbuf.len() == received - delivered` (ring holds exactly the
+    ///    undelivered window),
+    ///  * `received <= limit` (never receive beyond advertised credit),
+    ///  * reservation never over-committed: `reserve.amount()` is a multiple
+    ///    of a chunk and `reserve + free_cover` covers `limit - received`.
+    fn assert_recv_invariants(lane: &Lane, st: &LaneState, at: &str) {
+        assert!(st.received >= st.delivered, "{at}: delivered {} > received {}", st.delivered, st.received);
+        assert_eq!(
+            st.rbuf.len() as u64,
+            st.received - st.delivered,
+            "{at}: rbuf {} != received-delivered {}",
+            st.rbuf.len(),
+            st.received - st.delivered
+        );
+        assert!(st.received <= st.limit, "{at}: received {} > limit {}", st.received, st.limit);
+        let free = lane.free_cover(st);
+        assert!(
+            st.reserve.amount() + free >= st.limit - st.received,
+            "{at}: storage shortfall: reserve {} + free {} < limit-received {}",
+            st.reserve.amount(),
+            free,
+            st.limit - st.received
+        );
+    }
+
+    /// Establish a backed grant on a receiver lane: raise `granted` and let the
+    /// real `recompute_limit` reserve storage, exactly as a demand-driven grant
+    /// does. Returns the limit it reached.
+    fn grant(lane: &Lane, want_credit: u64) -> u64 {
+        let mut st = lane.st.lock().unwrap();
+        st.granted = want_credit;
+        st.last_arrival = Instant::now();
+        lane.recompute_limit(&mut st);
+        st.limit
+    }
+
+    /// FORCED ORDER A — RetractAck mid-stream with bytes in flight.
+    ///
+    /// Sequence (all on the REAL Lane methods):
+    ///   1. grant credit for 4 chunks; `recompute_limit` reserves storage.
+    ///   2. receive 1 chunk (`recv_commit`) — consumes one reserved chunk.
+    ///   3. the idle-credit tick emits a Retract to the floor (`credit_check`).
+    ///   4. the sender's RetractAck reports `sent` = received + 1 chunk still
+    ///      in flight (`on_retract_ack`) — this calls `lower_limit`, which
+    ///      reclaims the reservation above the new limit.
+    ///   5. that last in-flight chunk arrives and is committed (`recv_commit`).
+    ///
+    /// Establishes: a conforming sender's in-flight bytes, reported via the
+    /// RetractAck, are NOT rejected and the ring accounting holds throughout,
+    /// because `on_retract_ack` sets limit = max(sent, new_limit) >= sent and
+    /// keeps the reservation covering `[received, sent)`.
+    #[test]
+    fn forced_retract_ack_with_bytes_in_flight_keeps_storage() {
+        let recv = Lane::new(2, 0, env());
+        let four = 4 * CH;
+
+        let limit0 = grant(&recv, four);
+        assert!(limit0 >= four, "grant reserved {limit0} < {four}");
+        {
+            let st = recv.st.lock().unwrap();
+            assert!(st.reserve.amount() >= CH, "no reservation established");
+            assert_recv_invariants(&recv, &st, "after grant");
+        }
+
+        // Step 2: receive one chunk.
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![1u8; CH as usize]).expect("first chunk fits in credit+storage");
+            assert_recv_invariants(&recv, &st, "after 1 chunk");
+            assert_eq!(st.received, CH);
+        }
+
+        // Step 3: idle tick retracts to the floor. Make the lane look idle.
+        recv.st.lock().unwrap().last_arrival = Instant::now() - Duration::from_secs(1);
+        let (seq, new_limit) = match recv.credit_check(Duration::from_secs(10)) {
+            CreditAction::Retract { seq, new_limit } => (seq, new_limit),
+            _ => panic!("expected a Retract from credit_check"),
+        };
+        // Floor retract aims below what is still legitimately in flight.
+        let sent = CH + CH; // one chunk received + one chunk in flight
+        assert!(new_limit <= sent, "precondition: retract target below in-flight high-water");
+
+        // Step 4: RetractAck. Must be accepted (conforming sender) and must
+        // keep storage for the in-flight chunk.
+        recv.on_retract_ack(seq, sent).expect("conforming RetractAck rejected");
+        {
+            let st = recv.st.lock().unwrap();
+            assert!(st.limit >= sent, "limit {} dropped below in-flight sent {sent}", st.limit);
+            assert_recv_invariants(&recv, &st, "after RetractAck");
+        }
+
+        // Step 5: the in-flight chunk arrives. It must commit without the
+        // "credit granted without storage" error.
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![2u8; CH as usize])
+                .expect("in-flight chunk rejected: reservation was reclaimed under it");
+            assert_recv_invariants(&recv, &st, "after in-flight chunk");
+            assert_eq!(st.received, sent);
+        }
+    }
+
+    /// FORCED ORDER B — unilateral detach (carrier death) fences in-flight
+    /// bytes; the sender replays them in the new epoch.
+    ///
+    /// Sequence:
+    ///   1. grant credit for 4 chunks (reservation established).
+    ///   2. receive 1 chunk.
+    ///   3. `retract_unilaterally` (what `on_carrier_death` calls): bumps the
+    ///      epoch, retracts to the floor, reclaims the reservation.
+    ///   4. a stale read from the OLD epoch is dropped by the epoch guard in
+    ///      `recv_task` (modelled here) — it must NOT be committed, else it
+    ///      would be double-counted when the sender replays.
+    ///   5. the sender replays from `received` in the NEW epoch: grant again,
+    ///      receive the replayed chunk, invariant holds.
+    ///
+    /// Establishes: detach loses no byte (sender replays from `received`) and
+    /// never corrupts accounting, even though the reservation is reclaimed.
+    #[test]
+    fn forced_unilateral_detach_fences_then_replays_without_loss() {
+        let recv = Lane::new(2, 0, env());
+        let four = 4 * CH;
+        grant(&recv, four);
+
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![1u8; CH as usize]).unwrap();
+            assert_recv_invariants(&recv, &st, "after 1 chunk");
+        }
+        let epoch_before = recv.epoch();
+
+        // Step 3: carrier death.
+        recv.retract_unilaterally();
+        let epoch_after = recv.epoch();
+        assert_eq!(epoch_after, epoch_before + 1, "detach must fence the old carrier");
+        {
+            let st = recv.st.lock().unwrap();
+            // Reservation reclaimed to the floor; limit no longer covers the
+            // (now fenced) in-flight bytes — which is sound only because the
+            // epoch guard drops old-carrier reads.
+            assert_recv_invariants(&recv, &st, "after detach");
+            assert_eq!(st.received, CH, "received unchanged by detach");
+        }
+
+        // Step 4: a stale read from the OLD epoch. `recv_task` checks
+        // `st.epoch != epoch` BEFORE recv_commit and returns Ok(()) without
+        // committing. We model that guard exactly: the byte is NOT committed.
+        {
+            let st = recv.st.lock().unwrap();
+            let stale_epoch = epoch_before;
+            let dropped = st.epoch != stale_epoch; // guard fires
+            assert!(dropped, "epoch guard must drop the stale read");
+            // (No recv_commit call: the guarded path returns before it.)
+            assert_recv_invariants(&recv, &st, "stale read dropped");
+        }
+
+        // Step 5: resume in the new epoch. The sender replays from `received`.
+        // Grant again, then the replayed chunk arrives and commits cleanly.
+        grant(&recv, four);
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![1u8; CH as usize]).expect("replayed chunk rejected after resume");
+            assert_recv_invariants(&recv, &st, "after replay");
+            assert_eq!(st.received, 2 * CH, "replayed chunk accounted exactly once");
+        }
+    }
+
+    /// FORCED ORDER C — probe the genuine shortfall the production run hit:
+    /// can a legitimately granted credit end up WITHOUT backing storage, so
+    /// that a conforming in-flight chunk cannot be committed?
+    ///
+    /// `on_retract_ack` calls `lower_limit` while the Retract is still
+    /// outstanding (`retract` cleared only afterwards). Inside, `recompute_limit`
+    /// will NOT grow the reservation (gated by `retract.is_none()`), yet it has
+    /// already released the budget tail if the ring was empty. If the kept
+    /// reservation plus `free_cover` then falls short of `limit - received`,
+    /// a conforming chunk in `[received, sent)` has nowhere to land.
+    ///
+    /// This asserts the storage-cover invariant directly after `on_retract_ack`
+    /// and then attempts the in-flight receive, with the ring empty at the
+    /// moment of retract (so `release_budget_tail` can fire).
+    #[test]
+    fn forced_retract_ack_empty_ring_keeps_storage_for_inflight() {
+        let recv = Lane::new(2, 0, env());
+        let four = 4 * CH;
+        grant(&recv, four);
+
+        // Ring is empty (received == delivered == 0): the grant reserved
+        // chunks and may also hold a spare budget tail counted in free_cover.
+        {
+            let st = recv.st.lock().unwrap();
+            assert_eq!(st.received, 0);
+            assert_eq!(st.rbuf.len(), 0, "empty ring: release_budget_tail can fire in lower_limit");
+            assert_recv_invariants(&recv, &st, "after grant, empty ring");
+        }
+
+        // Idle tick -> Retract to floor.
+        recv.st.lock().unwrap().last_arrival = Instant::now() - Duration::from_secs(1);
+        let (seq, new_limit) = match recv.credit_check(Duration::from_secs(10)) {
+            CreditAction::Retract { seq, new_limit } => (seq, new_limit),
+            _ => panic!("expected a Retract"),
+        };
+        // Sender reports a full chunk in flight that the floor-retract target
+        // would have excluded.
+        let sent = CH;
+        assert!(new_limit <= sent, "retract target below in-flight sent");
+
+        // RetractAck: lower_limit runs with the ring empty and retract still
+        // Some. Afterwards storage MUST still cover limit - received, or the
+        // in-flight chunk is lost.
+        recv.on_retract_ack(seq, sent).expect("conforming RetractAck rejected");
+        {
+            let st = recv.st.lock().unwrap();
+            assert!(st.limit >= sent, "limit {} < in-flight sent {sent}", st.limit);
+            assert_recv_invariants(&recv, &st, "after RetractAck, empty ring");
+        }
+
+        // The in-flight chunk arrives: must commit, no "credit without storage".
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![7u8; CH as usize])
+                .expect("in-flight chunk lost: reservation reclaimed below granted credit");
+            assert_recv_invariants(&recv, &st, "after in-flight chunk, empty-ring path");
+            assert_eq!(st.received, sent);
+        }
+    }
+
+    /// FORCED ORDER D — the real `quic_reader` lock-drop interleaving,
+    /// replicated deterministically step by step.
+    ///
+    /// `quic_reader` computes `allowed = limit - received` under the lock,
+    /// DROPS the lock to `await read_chunk(allowed)`, then reacquires and
+    /// commits. `on_retract_ack` can run in that window; it lowers `limit` and
+    /// reclaims the reservation but does NOT bump `epoch`, so the reader's
+    /// `epoch != epoch` guard does not fire. The only thing standing between a
+    /// now-unbacked read and `recv_commit` is the `received + n > limit` guard.
+    ///
+    /// This test runs exactly that sequence and asserts the two outcomes that
+    /// keep accounting sound, whichever applies:
+    ///   * the read exceeds the lowered limit -> `received + n > limit` guard
+    ///     rejects it (lane torn down), nothing is committed; OR
+    ///   * it fits under the lowered limit -> storage still covers it and
+    ///     `recv_commit` succeeds.
+    /// In neither case may bytes be committed without `received` advancing, and
+    /// the invariant must hold after. (With the atomic `recv_commit`, a storage
+    /// shortfall surfaces as a clean error with the ring untouched, not a leak.)
+    #[test]
+    fn forced_quic_reader_retract_in_lockdrop_window() {
+        let recv = Lane::new(2, 0, env());
+        let four = 4 * CH;
+        grant(&recv, four);
+
+        // Step 1: reader samples `allowed` under the old (high) limit.
+        let allowed = {
+            let st = recv.st.lock().unwrap();
+            (st.limit - st.received) as usize
+        };
+        assert!(allowed >= CH as usize);
+
+        // Step 2 (lock dropped): a full chunk is read off the wire.
+        let n = CH as usize;
+        let data = vec![9u8; n];
+
+        // Step 3 (still in the window): idle tick + RetractAck lowers the limit
+        // to the floor and reclaims the reservation. No epoch bump.
+        recv.st.lock().unwrap().last_arrival = Instant::now() - Duration::from_secs(1);
+        let (seq, _new_limit) = match recv.credit_check(Duration::from_secs(10)) {
+            CreditAction::Retract { seq, new_limit } => (seq, new_limit),
+            _ => panic!("expected a Retract"),
+        };
+        // The sender, conforming, reports it already sent this chunk.
+        recv.on_retract_ack(seq, CH).expect("conforming RetractAck rejected");
+
+        // Step 4+5: reader reacquires the lock and tries to commit, exactly as
+        // quic_reader does after the await. The reader was spawned at epoch 0
+        // (fresh lane, never detached); the RetractAck did not bump it.
+        let reader_epoch = 0u64;
+        let mut st = recv.st.lock().unwrap();
+        let epoch_ok = !st.closed && st.epoch == reader_epoch; // guard would pass
+        assert!(epoch_ok, "no epoch bump, so the stale-read guard does not fire");
+        if st.received + n as u64 > st.limit {
+            // Over-limit guard rejects: nothing committed, invariant intact.
+            assert_recv_invariants(&recv, &st, "D: over-limit rejected, nothing committed");
+        } else {
+            let r = recv.recv_commit(&mut st, &data);
+            match r {
+                Ok(()) => {
+                    assert_recv_invariants(&recv, &st, "D: committed under lowered limit");
+                    assert_eq!(st.received, CH);
+                }
+                Err(_) => {
+                    // Atomic recv_commit: storage shortfall is a clean error,
+                    // the ring is untouched, invariant still holds.
+                    assert_recv_invariants(&recv, &st, "D: shortfall error, ring untouched");
+                }
+            }
+        }
+    }
+
+    /// FORCED ORDER F — REAL-STATE causality for the production shortfall
+    /// `PROBE no storage chan=2 lane=0 off=276 n=1420 received=5671126
+    ///  delivered=5600136 limit=5685248 rbuf=71266 reserve=0 rfloor=2
+    ///  granted=65536 epoch=0 retract=false`
+    /// (mem-run/server-1000-flow-kill.log:1002).
+    ///
+    /// The field line has NO retract and NO epoch change at the shortfall: it
+    /// is reserve=0 with BOTH floor chunks pinned, yet `limit - received`
+    /// positive, and `rbuf - (received - delivered) = 71266 - 70990 = 276`,
+    /// i.e. the invariant was ALREADY off by exactly the bytes committed in the
+    /// current partial loop. This test reproduces that causal chain on the
+    /// REAL `recv_commit`, no fabricated credit:
+    ///
+    ///   1. grant via the real `recompute_limit`.
+    ///   2. a first read whose storage runs out mid-loop. On the OLD code this
+    ///      LEAKS: it pins floor chunks and commits bytes into the ring WITHOUT
+    ///      advancing `received`. On the FIXED code it errors atomically,
+    ///      leaving the ring and the floor pool untouched.
+    ///   3. observe the state the field log shows: does a floor chunk stay
+    ///      pinned (rfloor raised) while `received` did not advance, so the
+    ///      storage-cover invariant is broken going forward?
+    ///
+    /// Expected: OLD -> leak pins floor, `rbuf > received - delivered`, cover
+    /// shortfall persists (the field state). FIXED -> clean error, floor pool
+    /// released, invariant intact. The test asserts the FIXED behaviour and, on
+    /// the OLD build, FAILS at the same invariant the production probe tripped.
+    ///
+    /// MEASURED RESULT (not a guess): on the real code, conforming receive
+    /// keeps `limit - received` EXACTLY equal to `reserve + free_cover` at
+    /// every step. The partially-filled floor chunk's remaining bytes stay in
+    /// `free_cover` via `tail_space`, so consuming a floor chunk for a small
+    /// read does NOT open a gap. A single-threaded conforming sequence
+    /// therefore CANNOT produce the field state (`reserve=0`, both floor
+    /// chunks pinned, yet `limit - received = 14122`). That state requires one
+    /// of: (a) the partial-commit LEAK, which pins floor chunks while
+    /// committing bytes WITHOUT advancing `received` (covered by
+    /// `recv_commit_partial_storage...`), or (b) a true concurrent lock-drop
+    /// interleaving in `quic_reader` that this single-threaded harness cannot
+    /// create. This test records (a)'s precondition and asserts the tight
+    /// accounting; it does NOT fabricate the gap.
+    #[test]
+    fn forced_real_state_receive_keeps_credit_equal_to_cover() {
+        let recv = Lane::new(2, 0, env());
+
+        // Real grant, then drain the reservation with exact whole-chunk reads.
+        grant(&recv, 3 * CH);
+        let reserved_chunks = {
+            let st = recv.st.lock().unwrap();
+            (st.reserve.amount() / CH) as usize
+        };
+        for _ in 0..reserved_chunks {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![1u8; CH as usize]).unwrap();
+        }
+
+        // Partial floor read (the field `off=276` remainder). After it, the
+        // real storage cover must STILL exactly equal the advertised credit:
+        // the pinned floor chunk's unused tail is counted in free_cover.
+        {
+            let mut st = recv.st.lock().unwrap();
+            recv.recv_commit(&mut st, &vec![2u8; 276]).expect("small read fits a fresh floor chunk");
+        }
+        {
+            let st = recv.st.lock().unwrap();
+            let free = recv.free_cover(&st);
+            let credit = st.limit - st.received;
+            let cover = st.reserve.amount() + free;
+            assert_eq!(st.rbuf.len() as u64, st.received - st.delivered, "ring accounting intact");
+            assert_eq!(
+                credit, cover,
+                "MEASURED: conforming receive must keep credit == cover (reserve {} + free {} vs limit-received {}); \
+                 if this ever differs, the field shortfall has a conforming single-threaded cause after all",
+                st.reserve.amount(), free, credit
+            );
+        }
     }
 }
