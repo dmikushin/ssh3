@@ -75,7 +75,7 @@ def trusted_directory(path,owner=0,test_anchor=None):
         s=directory.lstat()
         if not stat.S_ISDIR(s.st_mode) or s.st_uid!=owner or s.st_mode&0o022:raise ValueError('untrusted directory ancestor')
 
-def trusted_ssh(config,owner=0,test_anchor=None):
+def trusted_ssh(config,owner=0,test_anchor=None,agent_approval=None):
     config=Path(config)
     if not config.is_absolute():raise ValueError('explicit absolute SSH config required')
     trusted_directory(config.parent,owner,test_anchor)
@@ -92,19 +92,42 @@ def trusted_ssh(config,owner=0,test_anchor=None):
         key,sep,value=line.partition(' ')
         if not sep or key.lower() in fields:raise ValueError('ambiguous SSH config')
         fields[key.lower()]=value.strip()
-    required={'host':'oracle-management-read','hostname':'gateway.mikush.in','port':'2221','user':'marcusmae','batchmode':'yes','stricthostkeychecking':'yes','identityagent':'none','identitiesonly':'yes','proxycommand':'none','proxyjump':'none'}
+    if type(agent_approval) is not dict:raise ValueError('explicit existing agent approval required')
+    for field in ('socket_uid','device','inode'):
+        if type(agent_approval.get(field)) is not int or agent_approval[field] < (1 if field=='inode' else 0):raise ValueError('invalid agent socket identity')
+    for field in ('socket_path','public_identity_path','public_fingerprint','agent_listing'):
+        if type(agent_approval.get(field)) is not str:raise ValueError('missing agent approval field '+field)
+    spec=importlib.util.spec_from_file_location('agent_policy',B/'management-agent-policy.py');policy=importlib.util.module_from_spec(spec);spec.loader.exec_module(policy)
+    socket_path=agent_approval['socket_path']
+    metadata=policy.socket_policy(socket_path,agent_approval['socket_uid'],socket_path,test_anchor)
+    if any(metadata[k]!=agent_approval[k] for k in ('device','inode')):raise ValueError('approved agent socket identity changed')
+    required={'host':'oracle-management-read','hostname':'gateway.mikush.in','port':'2221','user':'marcusmae','batchmode':'yes','stricthostkeychecking':'yes','identityagent':socket_path,'identitiesonly':'yes','forwardagent':'no','proxycommand':'none','proxyjump':'none'}
     if any(fields.get(k)!=v for k,v in required.items()):raise ValueError('pinned management route missing')
     if set(fields)-set(required)-{'identityfile','userknownhostsfile'}:raise ValueError('unreviewed SSH directive')
     for key in ('identityfile','userknownhostsfile'):
         path=Path(fields.get(key,''))
         if not path.is_absolute():raise ValueError('explicit identity/pin file required')
-        trusted_directory(path.parent,owner,test_anchor)
+        path_owner=agent_approval['socket_uid'] if key=='identityfile' else owner
+        if key=='identityfile':
+            parents=[*reversed(path.parent.parents),path.parent] if test_anchor is None else [Path(test_anchor)]+[Path(test_anchor).joinpath(*path.parent.relative_to(test_anchor).parts[:i]) for i in range(1,len(path.parent.relative_to(test_anchor).parts)+1)]
+            for parent in parents:
+                entry=parent.lstat()
+                if not stat.S_ISDIR(entry.st_mode) or entry.st_uid not in (0,path_owner) or entry.st_mode&0o022:raise ValueError('untrusted public identity ancestor')
+        else:trusted_directory(path.parent,owner,test_anchor)
         st=path.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_uid!=owner or st.st_mode&0o022:raise ValueError('untrusted identity/pin path')
-        if key=='identityfile' and (path.suffix=='.pub' or st.st_mode&0o077):raise ValueError('private root identity required with IdentityAgent none')
+        if not stat.S_ISREG(st.st_mode) or st.st_uid!=path_owner or st.st_mode&0o022:raise ValueError('untrusted identity/pin path')
+        if key=='identityfile':
+            if path.suffix!='.pub' or str(path)!=agent_approval['public_identity_path']:raise ValueError('explicit public identity selector required')
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                info=os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size>16384:raise ValueError('bounded public identity required')
+                public=os.read(fd,16385).decode('ascii')
+            finally:os.close(fd)
+            policy.match_agent_identity(public,agent_approval['agent_listing'],agent_approval['public_fingerprint'])
     return ['/usr/bin/ssh','-F',str(config),'oracle-management-read']
 
-def collect(request,host_exit,root,output,ports,expected_boot,rollback,owner=0,reader=None,ssh_config=None,test_anchor=None):
+def collect(request,host_exit,root,output,ports,expected_boot,rollback,owner=0,reader=None,ssh_config=None,test_anchor=None,agent_approval=None):
     """host_exit is independently signed-off immutable HOST evidence, not Oracle PID."""
     try:
         api.observer.port_set(ports)
@@ -118,7 +141,7 @@ def collect(request,host_exit,root,output,ports,expected_boot,rollback,owner=0,r
             if type(evidence.get(k)) is not type(req[k]) or evidence[k]!=req[k]:raise ValueError('host exit belongs to another transaction')
         if evidence.get('host_verified_client_exit') is not True:raise ValueError('host client exit not verified')
         if ssh_config is None:raise ValueError('trusted SSH config missing')
-        argv=trusted_ssh(ssh_config,owner,test_anchor)+['bash','-s','--',*ports]
+        argv=trusted_ssh(ssh_config,owner,test_anchor,agent_approval)+['bash','-s','--',*ports]
         started=time.time_ns()
         if started<req['go_exit_ns']:raise ValueError('collection predates client exit')
         data=(reader or bounded_read)(argv,(B/'collect-oracle-ports.sh').read_bytes())

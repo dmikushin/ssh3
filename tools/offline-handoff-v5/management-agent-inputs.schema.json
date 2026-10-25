@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["socket_path", "socket_uid", "socket_device", "socket_inode", "public_identity_path", "public_fingerprint", "agent_identity_listing_receipt", "tcp2221_known_hosts_path"],
+  "properties": {
+    "socket_path": {"type": "string", "pattern": "^/"},
+    "socket_uid": {"type": "integer", "minimum": 0},
+    "socket_device": {"type": "integer", "minimum": 0},
+    "socket_inode": {"type": "integer", "minimum": 1},
+    "public_identity_path": {"const": "/home/marcusmae/.ssh/keys/id_rsa.oracle.pub"},
+    "public_fingerprint": {"type": "string", "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"},
+    "agent_identity_listing_receipt": {"type": "string", "pattern": "^/"},
+    "tcp2221_known_hosts_path": {"type": "string", "pattern": "^/"}
+  }
+}

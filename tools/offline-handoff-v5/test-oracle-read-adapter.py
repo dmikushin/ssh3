@@ -1,12 +1,12 @@
 from pathlib import Path
-import importlib.util,tempfile,os,subprocess,json
+import importlib.util,tempfile,os,subprocess,json,socket,base64
 B=Path(__file__).parent
 s=importlib.util.spec_from_file_location('collector',B/'oracle-read-adapter.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
 s=importlib.util.spec_from_file_location('writer',B/'request-writer-v5.py');w=importlib.util.module_from_spec(s);s.loader.exec_module(w)
 boot='a'*8+'-'+'b'*4+'-'+'c'*4+'-'+'d'*4+'-'+'e'*12
 valid=f'SSH3_PORT_SNAPSHOT_V1\nHOST glazomer.io\nBOOT {boot}\nBEGIN t64070\nRC 0\nEND t64070\nCOMPLETE\n'.encode()
 for case in ('valid','truncated','nonzero','malformed','occupied','boot-race','oversize','wrong-host-exit'):
- with tempfile.TemporaryDirectory(dir=B,prefix='collector-') as d:
+ with tempfile.TemporaryDirectory(dir=Path.home()/'scratch',prefix='ca-') as d:
   p=Path(d);root=p/'trusted';root.mkdir(mode=0o700);req=w.write_request(p/'request',123,'77')
   evidence=dict(req,host_verified_client_exit=True)
   if case=='wrong-host-exit':evidence['old_pid']=124
@@ -18,12 +18,17 @@ for case in ('valid','truncated','nonzero','malformed','occupied','boot-race','o
   if case=='occupied':data=data.replace(b'END t64070',b'LISTEN 0 128 127.0.0.1:64070 0.0.0.0:*\nEND t64070')
   if case=='boot-race':data=data.replace(boot.encode(),b'f'*36)
   if case=='oversize':data=b'x'*65537
-  identity=p/'identity';identity.write_text('fixture-placeholder-NOT-a-real-key');identity.chmod(0o600)
+  kind=b'ssh-ed25519';blob=len(kind).to_bytes(4,'big')+kind+(32).to_bytes(4,'big')+b'q'*32
+  identity=p/'identity.pub';identity.write_text('ssh-ed25519 '+base64.b64encode(blob).decode());identity.chmod(0o400)
+  sockpath=p/'agent';sock=socket.socket(socket.AF_UNIX);sock.bind(str(sockpath));sockpath.chmod(0o600)
+  ps=importlib.util.spec_from_file_location('policy',B/'management-agent-policy.py');policy=importlib.util.module_from_spec(ps);ps.loader.exec_module(policy)
+  fp=policy.fingerprint(identity.read_text());st=sockpath.stat();approval=dict(socket_path=str(sockpath),socket_uid=os.getuid(),device=st.st_dev,inode=st.st_ino,public_identity_path=str(identity),public_fingerprint=fp,agent_listing='256 '+fp+' synthetic')
   pin=p/'pin';pin.write_text('fixture-placeholder-NOT-a-real-pin');pin.chmod(0o400)
-  config=p/'ssh-config';config.write_text(f'Host oracle-management-read\n HostName gateway.mikush.in\n Port 2221\n User marcusmae\n BatchMode yes\n StrictHostKeyChecking yes\n IdentityAgent none\n IdentitiesOnly yes\n ProxyCommand none\n ProxyJump none\n IdentityFile {identity}\n UserKnownHostsFile {pin}\n');config.chmod(0o400)
+  config=p/'ssh-config';config.write_text(f'Host oracle-management-read\n HostName gateway.mikush.in\n Port 2221\n User marcusmae\n BatchMode yes\n StrictHostKeyChecking yes\n IdentityAgent {sockpath}\n IdentitiesOnly yes\n ForwardAgent no\n ProxyCommand none\n ProxyJump none\n IdentityFile {identity}\n UserKnownHostsFile {pin}\n');config.chmod(0o400)
   calls=[];roll=[]
   def reader(argv,script):calls.append(argv);return data
-  ok=m.collect(p/'request',p/'exit',root,p/'receipt',['t64070'],boot,lambda:roll.append('rollback'),os.getuid(),reader,config,p)
+  ok=m.collect(p/'request',p/'exit',root,p/'receipt',['t64070'],boot,lambda:roll.append('rollback'),os.getuid(),reader,config,p,approval)
+  sock.close()
   assert ok==(case=='valid'),case
   assert roll==([] if ok else ['rollback']),case
   if case=='wrong-host-exit':assert not calls

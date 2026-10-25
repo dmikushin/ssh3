@@ -1,0 +1,15 @@
+# NON-RUNNABLE TEMPLATE. Coordinator must replace every @...@ after review.
+# TCP2221 OpenSSH pin is NOT the Rust UDP host pin.
+Host oracle-management-read
+    HostName gateway.mikush.in
+    Port 2221
+    User marcusmae
+    BatchMode yes
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    IdentityFile /home/marcusmae/.ssh/keys/id_rsa.oracle.pub
+    IdentityAgent @EXISTING_APPROVED_AGENT_SOCKET@
+    UserKnownHostsFile @ROOT_OWNED_TCP2221_KNOWN_HOSTS@
+    ForwardAgent no
+    ProxyCommand none
+    ProxyJump none

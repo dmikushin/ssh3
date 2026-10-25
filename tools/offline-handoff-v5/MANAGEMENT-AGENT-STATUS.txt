@@ -1,0 +1,13 @@
+BLOCKED_CREDENTIAL_AVAILABILITY_AND_ROOT_STAGING — LOCAL POLICY PREPARATION ONLY
+
+The existing public IdentityFile intentionally selects its matching private key in ssh-agent. Our previous management adapter's private-key-only/IdentityAgent none policy does NOT support that existing route. The mismatch is ours, not a defect in the user's SSH configuration.
+
+New template retains the existing .pub identity, requires an explicit coordinator-approved EXISTING socket, and prohibits remote forwarding (ForwardAgent no). No agent discovery, agent startup, key loading, configuration mutation, private key copying or network connection is implemented/performed here.
+
+Nine local controls pass using synthetic public bytes and an isolated owner-only Unix socket. This validates file/socket policy and fingerprint matching only; matching text is NOT live agent provenance, ability to sign, or working Oracle authentication.
+
+Missing exact inputs: original working agent socket path/uid/device/inode, approved selected public fingerprint, fresh bounded identity-list receipt from that exact live socket, distinct TCP2221 host pin and root-owned management staging. Coordinator reports original ssh-add probe Connection refused; no replacement socket chosen and no retry performed here. User-session reload implications cannot be determined without the exact socket/process identity; no guessed cause stated.
+
+The actual trusted_ssh entrypoint now requires explicit typed agent approval and the public selector; the wrong private-only path is removed, with no fallback. Five entrypoint controls plus nine policy controls pass. The original collector/parser12, bounded subprocess5 and trust-path4 expectations also pass after only auth-fixture adaptation (35 total). Schema is documentation, not a runtime JSON-schema validator. Socket metadata/listing checks are NOT signing/readiness proof. A path/device/inode recheck is not cryptographic agent identity; replacement after checking remains possible. No delegated-agent production admission is given.
+
+Existing SSH_AUTH_SOCK read once without connecting: /home/marcusmae/.ssh/ssh_auth_sock. This is an UNVERIFIED environment value, not a selected working replacement. No uid/inode/readiness inferred. Published historical commit1b5a57d remains immutable; this new source patch changes its prior policy only for the explicit management route.
