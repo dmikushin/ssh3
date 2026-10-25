@@ -1,0 +1,12 @@
+SOURCE EXTENSION ONLY — NOT DEPLOYMENT ADMISSION
+Frozen base checkpoint 0b016428 remains unchanged. New files implement an Oracle read-only shell collector and a Python transport API; there is no production CLI or staged privileged SSH configuration yet.
+
+Executed locally: 12 collector/parser controls, 5 actual subprocess deadline/cap controls, 4 trust-path/FIFO/UUID controls. No real network connections, production service changes, process signals or Oracle writes were performed in this extension task. Synthetic ss/hostname and explicit scratch-owner anchor injection are test-only.
+
+Collection queries only explicit canonical ports (max16), hostname and boot ID. Per-port cap16KiB; host stdout/stderr cap64KiB each. Nonblocking stdin/stdout/stderr share one deadline; subprocess cleanup addresses only owned child. A filtered ss failure/overflow cannot emit COMPLETE. Snapshot is point-in-time, NOT a reservation against later binds.
+
+The request old_pid is the CLIENT host's PID, NOT an Oracle PID. Adapter requires immutable matching independently verified host exit evidence. Oracle collector never claims to establish that process's exit. Separate collection-start/end timestamps are captured after host exit evidence validation.
+
+Privileged API requires explicit immutable trusted SSH config and /usr/bin/ssh -F, pinned gateway.mikush.in TCP2221 usermarcusmae, no agent/proxy directives. Every directory ancestor must be root owned, non-writable by others and nonsymlink. Config must be bounded immutable regular file opened O_NONBLOCK/O_NOFOLLOW. Existing identity/pin paths are checked, not copied or populated; real auth/pin correctness remains coordinator-reviewed. IdentityAgent none requires a private identity; this does not change general OpenSSH .pub + agent support. Global known_hosts defaults are not disabled; no real deployment policy validated.
+
+Missing admission: actual root-owned independent route/key/pin configuration, real Oracle boot identity, client-exit evidence producer, executable integration into host receipt wait/copyback, rollback invocation ownership, actual consumer routes and unknown UDP64446 mapping. Network collector API is implemented but has NOT been exercised against Oracle. No root filesystem adversarial race experiment or production handoff success is claimed.
