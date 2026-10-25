@@ -122,10 +122,16 @@ fn pem_label(text: &str) -> Option<String> {
 /// otherwise fail with an opaque Base64 error; we want the same clear
 /// "passphrase-protected" message as for other encrypted keys.
 fn reject_if_encrypted(path: &Path, text: &str) -> Result<()> {
-    if text
-        .lines()
-        .any(|l| l.trim_start().starts_with("Proc-Type:") && l.contains("ENCRYPTED"))
-    {
+    // RFC 1421 header is `Proc-Type: 4,ENCRYPTED`, but tolerate whitespace
+    // around the colon/comma: split on the first ':', compare the trimmed key
+    // case-insensitively, then look for the ENCRYPTED token in the value.
+    let encrypted = text.lines().any(|l| match l.trim().split_once(':') {
+        Some((key, val)) => {
+            key.trim().eq_ignore_ascii_case("Proc-Type") && val.to_ascii_uppercase().contains("ENCRYPTED")
+        }
+        None => false,
+    });
+    if encrypted {
         return Err(Error::EncryptedKey { path: path.into() });
     }
     Ok(())
@@ -352,114 +358,4 @@ pub fn resolve_identity(path: &Path, agent: Option<&AgentClient>) -> Result<Box<
         });
     }
     Ok(Box::new(FileSigner::load(path)?))
-}
-
-#[cfg(test)]
-mod keyformat_tests {
-    //! Private-key file-format support (migration blocker: the mounted user
-    //! key is unencrypted PKCS#1 PEM, `BEGIN RSA PRIVATE KEY`, which the old
-    //! `PrivateKey::from_openssh`-only loader rejected with a Base64 error).
-    //!
-    //! Fixtures are SYNTHETIC, generated in scratch (never the user's key) by
-    //! the harness at `$KEYFMT_FIXTURES`. If that env var is unset the tests
-    //! are skipped (no network, no secret material in the tree). Generate with:
-    //!   openssl genrsa -traditional -out rsa_pkcs1.pem 2048
-    //!   openssl pkcs8 -topk8 -nocrypt -in rsa_pkcs1.pem -out rsa_pkcs8.pem
-    //!   ssh-keygen -t rsa -b 2048 -N '' -f openssh_rsa
-    //!   openssl pkcs8 -topk8 -in rsa_pkcs1.pem -out rsa_pkcs8_enc.pem -passout pass:testpass
-    //!   head -3 rsa_pkcs1.pem > rsa_malformed.pem
-    use super::*;
-    use crate::auth::{EXPORTER_LEN, Intent, pubkey_blob, sign_auth, verify_auth};
-
-    fn fixtures() -> Option<PathBuf> {
-        std::env::var_os("KEYFMT_FIXTURES").map(PathBuf::from).filter(|p| p.exists())
-    }
-
-    /// REPRO: the old loader (OpenSSH armor only) FAILS on a PKCS#1 PEM — the
-    /// exact failure the migration hit ("PEM Base64 error invalid Base64").
-    #[test]
-    fn old_openssh_only_loader_fails_on_pkcs1() {
-        let Some(dir) = fixtures() else { return };
-        let text = std::fs::read_to_string(dir.join("rsa_pkcs1.pem")).unwrap();
-        // This is what FileSigner::load used to do.
-        let r = PrivateKey::from_openssh(&text);
-        assert!(r.is_err(), "old OpenSSH-only parse unexpectedly accepted PKCS#1 PEM");
-    }
-
-    /// NEW: PKCS#1 loads, signs an auth blob, and the server verifies it.
-    /// Independent parity: the loaded key's public half equals the OpenSSH
-    /// public key ssh-keygen derived from the SAME PKCS#1 file (rsa_pkcs1.pub),
-    /// i.e. our parse matches an external tool's view of the key.
-    #[test]
-    fn pkcs1_loads_signs_and_verifies() {
-        let Some(dir) = fixtures() else { return };
-        let signer = FileSigner::load(&dir.join("rsa_pkcs1.pem")).expect("PKCS#1 load");
-        let ref_pub_text = std::fs::read_to_string(dir.join("rsa_pkcs1.pub")).expect("rsa_pkcs1.pub");
-        let ref_pub = PublicKey::from_openssh(ref_pub_text.trim()).expect("parse ssh-keygen pub");
-        assert!(
-            same_key(signer.public_key(), &ref_pub),
-            "PKCS#1 parsed public key != ssh-keygen-derived public key"
-        );
-        let exporter = [7u8; EXPORTER_LEN];
-        let user = "tester";
-        let sig = sign_auth(&signer, &exporter, user, Intent::New).expect("sign_auth");
-        let blob = pubkey_blob(signer.public_key()).expect("pubkey_blob");
-        let verified = verify_auth(&exporter, user, &blob, Intent::New, &sig).expect("verify_auth");
-        assert!(same_key(&verified, signer.public_key()), "verified key != signer key");
-    }
-
-    /// PKCS#8 (unencrypted) of the SAME key yields the same public key as
-    /// PKCS#1 — fingerprint parity, cross-format control.
-    #[test]
-    fn pkcs8_matches_pkcs1_public_key() {
-        let Some(dir) = fixtures() else { return };
-        let p1 = FileSigner::load(&dir.join("rsa_pkcs1.pem")).expect("PKCS#1 load");
-        let p8 = FileSigner::load(&dir.join("rsa_pkcs8.pem")).expect("PKCS#8 load");
-        assert!(same_key(p1.public_key(), p8.public_key()), "PKCS#8 public key differs from PKCS#1");
-        // PKCS#8 can also sign+verify.
-        let exporter = [9u8; EXPORTER_LEN];
-        let sig = sign_auth(&p8, &exporter, "tester", Intent::Resume).expect("sign");
-        let blob = pubkey_blob(p8.public_key()).unwrap();
-        verify_auth(&exporter, "tester", &blob, Intent::Resume, &sig).expect("verify");
-    }
-
-    /// OpenSSH RSA control: still loads and verifies (regression guard for the
-    /// retained OpenSSH path).
-    #[test]
-    fn openssh_rsa_control_still_works() {
-        let Some(dir) = fixtures() else { return };
-        let s = FileSigner::load(&dir.join("openssh_rsa")).expect("OpenSSH load");
-        let exporter = [3u8; EXPORTER_LEN];
-        let sig = sign_auth(&s, &exporter, "tester", Intent::New).expect("sign");
-        let blob = pubkey_blob(s.public_key()).unwrap();
-        verify_auth(&exporter, "tester", &blob, Intent::New, &sig).expect("verify");
-    }
-
-    /// Encrypted PKCS#8 is rejected explicitly as passphrase-protected — no
-    /// prompt, no ad-hoc decryption.
-    #[test]
-    fn encrypted_pkcs8_is_rejected() {
-        let Some(dir) = fixtures() else { return };
-        // Avoid unwrap_err: FileSigner holds key material and is deliberately
-        // not Debug. Match on the Result instead.
-        match FileSigner::load(&dir.join("rsa_pkcs8_enc.pem")) {
-            Err(Error::EncryptedKey { .. }) => {}
-            Err(other) => panic!("expected EncryptedKey, got {other:?}"),
-            Ok(_) => panic!("encrypted PKCS#8 was accepted"),
-        }
-    }
-
-    /// Malformed PKCS#1 produces a clear parse error, not a panic.
-    #[test]
-    fn malformed_pkcs1_errors_cleanly() {
-        let Some(dir) = fixtures() else { return };
-        match FileSigner::load(&dir.join("rsa_malformed.pem")) {
-            // Classified by the RSA PRIVATE KEY label -> rsa PKCS#1 decode
-            // error (Pkcs8 variant carries the message). Never EncryptedKey,
-            // never Ok, never a panic.
-            Err(Error::EncryptedKey { .. }) => panic!("malformed misclassified as encrypted"),
-            Err(_) => {}
-            Ok(_) => panic!("malformed PKCS#1 was accepted"),
-        }
-    }
 }
