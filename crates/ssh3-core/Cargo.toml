@@ -6,6 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "ssh3-rs protocol core: QUIC transport, auth handshake, resumable channels"
 
+[features]
+# Test-only: exposes a deterministic re-armable barrier at the quic_reader
+# lock-drop boundary (crates/ssh3-core/src/lane.rs) so an integration test can
+# force multi-read detach/retract interleavings. OFF by default; no production
+# code path.
+test-hooks = []
+
 [dependencies]
 bytes = "1"
 libc = "0.2"

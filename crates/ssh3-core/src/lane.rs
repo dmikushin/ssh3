@@ -113,6 +113,71 @@ pub(crate) struct LaneEnv {
     pub events: mpsc::Sender<Message>,
 }
 
+/// Test-only deterministic barrier at the `quic_reader` lock-drop/relock
+/// boundary. It pauses `quic_reader` after it has read a chunk and dropped
+/// the lane lock, but BEFORE it reacquires the lock to commit, letting a test
+/// run `on_retract_ack` / `retract_unilaterally` on another task inside that
+/// exact window. Installed through a crate-global keyed by (chan_id, lane) so
+/// no production `LaneEnv` construction site is touched. Never armed in
+/// production: `reader_barrier_for` returns `None` unless a test installed one.
+/// Re-armable: a multi-read test arms it before each targeted read.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ReaderBarrier {
+    /// Armed for exactly one pass; disarmed after it fires once. The test
+    /// re-arms it before each read it wants to pause, so setup traffic and
+    /// untargeted reads flow freely.
+    pub armed: std::sync::atomic::AtomicBool,
+    /// Reader -> test: "I have read `n` bytes and dropped the lock".
+    pub arrived: Notify,
+    /// Test -> reader: "proceed to reacquire and commit".
+    pub release: Notify,
+    /// The chunk length the paused reader is holding (so the test sizes its
+    /// action against real in-flight bytes, not a fabricated number).
+    pub held_n: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ReaderBarrier {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: Notify::new(),
+            release: Notify::new(),
+            held_n: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static READER_BARRIERS: std::sync::Mutex<
+    Vec<((u64, u8), Arc<ReaderBarrier>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Install a re-armable barrier for lane `(chan_id, lane)`; returns the handle
+/// the test drives. Test-only (feature `test-hooks`).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn install_reader_barrier(chan_id: u64, lane: u8) -> Arc<ReaderBarrier> {
+    let b = ReaderBarrier::new();
+    READER_BARRIERS.lock().unwrap().push(((chan_id, lane), b.clone()));
+    b
+}
+
+/// Remove all installed barriers (test cleanup).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn clear_reader_barriers() {
+    READER_BARRIERS.lock().unwrap().clear();
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn reader_barrier_for(chan_id: u64, lane: u8) -> Option<Arc<ReaderBarrier>> {
+    READER_BARRIERS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| *k == (chan_id, lane))
+        .map(|(_, b)| b.clone())
+}
+
 /// A local source that can say "data is waiting" without a buffer, so an
 /// idle source does not pin a budget chunk while it waits (SPEC §4: the
 /// chunk is reserved before the read, so reserve only when a read will
@@ -1205,6 +1270,18 @@ impl Lane {
                 }
             };
             let n = data.len();
+            // Test-only: deterministically pause here — after the read, with
+            // the lock DROPPED — so a test can run on_retract_ack / detach on
+            // another task inside the real lock-drop window, then release us.
+            // Re-armable, so a multi-read test can pause each read in turn.
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(b) = reader_barrier_for(self.chan_id, self.lane)
+                && b.armed.swap(false, Ordering::AcqRel)
+            {
+                b.held_n.store(n as u64, Ordering::Release);
+                b.arrived.notify_waiters();
+                b.release.notified().await;
+            }
             let mut st = self.st.lock().unwrap();
             if st.closed || st.epoch != epoch {
                 return Ok(());
