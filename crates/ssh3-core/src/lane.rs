@@ -121,19 +121,46 @@ pub(crate) struct LaneEnv {
 /// no production `LaneEnv` construction site is touched. Never armed in
 /// production: `reader_barrier_for` returns `None` unless a test installed one.
 /// Re-armable: a multi-read test arms it before each targeted read.
+/// Per-lane receive-side snapshot captured at a reader park (consultant point
+/// 3). All fields are read under the lane lock at the park point, BEFORE the
+/// held read is committed, so a test can assert exact backing/ring invariants
+/// and epoch transitions at each boundary rather than aggregate credit.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneSnapshot {
+    pub epoch: u64,
+    pub received: u64,
+    pub delivered: u64,
+    pub ring_len: u64,
+    pub reserve: u64,
+    pub free_cover: u64,
+    pub tail_space: u64,
+    pub rfloor: u32,
+    pub floor_budget_used: u64,
+    pub recv_budget_used: u64,
+    pub limit: u64,
+    /// The chunk length the parked reader is holding (uncommitted).
+    pub held_n: u64,
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct ReaderBarrier {
     /// Armed for exactly one pass; disarmed after it fires once. The test
     /// re-arms it before each read it wants to pause, so setup traffic and
     /// untargeted reads flow freely.
     pub armed: std::sync::atomic::AtomicBool,
-    /// Reader -> test: "I have read `n` bytes and dropped the lock".
+    /// Reader -> test: "I have read a chunk, snapshotted, and dropped the lock".
     pub arrived: Notify,
     /// Test -> reader: "proceed to reacquire and commit".
     pub release: Notify,
-    /// The chunk length the paused reader is holding (so the test sizes its
-    /// action against real in-flight bytes, not a fabricated number).
+    /// The chunk length the most recent parked reader is holding.
     pub held_n: std::sync::atomic::AtomicU64,
+    /// Count of parks observed so far (read-sequence index: 1 after the first
+    /// park, 2 after the second, ...).
+    pub park_index: std::sync::atomic::AtomicU64,
+    /// One `LaneSnapshot` per park, in order. Captured under the lock at the
+    /// park point before the held read is committed.
+    pub parks: std::sync::Mutex<Vec<LaneSnapshot>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -144,7 +171,13 @@ impl ReaderBarrier {
             arrived: Notify::new(),
             release: Notify::new(),
             held_n: std::sync::atomic::AtomicU64::new(0),
+            park_index: std::sync::atomic::AtomicU64::new(0),
+            parks: std::sync::Mutex::new(Vec::new()),
         })
+    }
+    /// The snapshot recorded at park number `i` (1-based), if reached.
+    pub fn park(&self, i: usize) -> Option<LaneSnapshot> {
+        self.parks.lock().unwrap().get(i - 1).copied()
     }
 }
 
@@ -176,6 +209,49 @@ fn reader_barrier_for(chan_id: u64, lane: u8) -> Option<Arc<ReaderBarrier>> {
         .iter()
         .find(|(k, _)| *k == (chan_id, lane))
         .map(|(_, b)| b.clone())
+}
+
+/// Test-only registry of live lanes so a test can snapshot one by (chan_id,
+/// lane) on demand (e.g. to wait for an unread ring tail). A lane registers a
+/// `Weak` to itself when created; stale entries are skipped.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static TEST_LANES: std::sync::Mutex<Vec<(u64, u8, std::sync::Weak<Lane>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// On-demand per-lane snapshot for lane `(chan_id, lane)`, if it is live. In an
+/// in-process test BOTH the client and the server create a lane under the same
+/// `(chan_id, lane)`; this returns the snapshot of the live instance with the
+/// greatest `received`, i.e. the one actually receiving the forwarded stream
+/// (the server's). Test-only (feature `test-hooks`).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn lane_snapshot(chan_id: u64, lane: u8) -> Option<LaneSnapshot> {
+    let lanes = TEST_LANES.lock().unwrap();
+    let mut best: Option<LaneSnapshot> = None;
+    for (c, n, w) in lanes.iter() {
+        if *c != chan_id || *n != lane {
+            continue;
+        }
+        let Some(l) = w.upgrade() else { continue };
+        let st = l.st.lock().unwrap();
+        let snap = LaneSnapshot {
+            epoch: st.epoch,
+            received: st.received,
+            delivered: st.delivered,
+            ring_len: st.rbuf.len() as u64,
+            reserve: st.reserve.amount(),
+            free_cover: l.free_cover(&st),
+            tail_space: st.rbuf.tail_space() as u64,
+            rfloor: st.rfloor.load(Ordering::Acquire),
+            floor_budget_used: l.env.floor_budget.used(),
+            recv_budget_used: l.env.recv_budget.used(),
+            limit: st.limit,
+            held_n: 0, // no read is parked for an on-demand snapshot
+        };
+        if best.is_none_or(|b| snap.received > b.received) {
+            best = Some(snap);
+        }
+    }
+    best
 }
 
 /// A local source that can say "data is waiting" without a buffer, so an
@@ -341,7 +417,7 @@ impl Lane {
         let (attach_tx, attach_rx) = mpsc::unbounded_channel();
         let floor = env.floor;
         env.stats.credit_outstanding.fetch_add(floor, Ordering::Relaxed);
-        Arc::new(Self {
+        let lane_arc = Arc::new(Self {
             chan_id,
             lane,
             st: Mutex::new(LaneState {
@@ -385,7 +461,10 @@ impl Lane {
             done: Notify::new(),
             attach_tx,
             attach_rx: Mutex::new(Some(attach_rx)),
-        })
+        });
+        #[cfg(any(test, feature = "test-hooks"))]
+        TEST_LANES.lock().unwrap().push((chan_id, lane, Arc::downgrade(&lane_arc)));
+        lane_arc
     }
 
     /// Our send side is finished (all bytes accepted after EOF, or the peer
@@ -1278,6 +1357,29 @@ impl Lane {
             if let Some(b) = reader_barrier_for(self.chan_id, self.lane)
                 && b.armed.swap(false, Ordering::AcqRel)
             {
+                // Capture a per-lane snapshot under the lock BEFORE committing
+                // the held read, so the test sees the exact receive-side state
+                // at this boundary (consultant point 3). The read `epoch` this
+                // reader was spawned with is included separately via st.epoch.
+                let snap = {
+                    let st = self.st.lock().unwrap();
+                    LaneSnapshot {
+                        epoch: st.epoch,
+                        received: st.received,
+                        delivered: st.delivered,
+                        ring_len: st.rbuf.len() as u64,
+                        reserve: st.reserve.amount(),
+                        free_cover: self.free_cover(&st),
+                        tail_space: st.rbuf.tail_space() as u64,
+                        rfloor: st.rfloor.load(Ordering::Acquire),
+                        floor_budget_used: self.env.floor_budget.used(),
+                        recv_budget_used: self.env.recv_budget.used(),
+                        limit: st.limit,
+                        held_n: n as u64,
+                    }
+                };
+                b.parks.lock().unwrap().push(snap);
+                b.park_index.fetch_add(1, Ordering::AcqRel);
                 b.held_n.store(n as u64, Ordering::Release);
                 b.arrived.notify_waiters();
                 b.release.notified().await;
