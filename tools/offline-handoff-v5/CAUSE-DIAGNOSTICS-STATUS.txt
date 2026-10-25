@@ -1,0 +1,9 @@
+SCOPED_DIAGNOSTIC_CORRECTION_ONLY — NOT A HANDOFF FIX OR RETRY ADMISSION
+
+collect/decide previously discarded exception reasons and invocation reported only ROLLBACK_REQUIRED. They now report component, exception class and an allowlisted known operational reason; child returncode/bounded redacted stderr is retained. Arbitrary exception strings, private content and missing-file paths are intentionally withheld, with component/class available for localization. Replay fallback preserves known validator messages even when the installed older adapter lacks a redactor.
+
+Four local tests inject known failures through actual collect/decide catches, require exactly one rollback callback and verify sensitive/unknown exception data is withheld. A separate nonroot invoke control must emit its known root-required message and exit1 before any transport. No actual privileged replay is part of these tests.
+
+HISTORICAL FAILURE UNKNOWN. Main observed failed handoff followed by successful Go rollback and restored health; collection-state was empty. A later agent inode mismatch does not establish cause: reported replacement occurred about55s after approval, whereas original failure occurred about4.4s after approval. Lost historical exception may be unrecoverable. This patch must not relabel a later observation as the historical trigger.
+
+No production source replacement, SSH/agent query, replay retry, route mutation, process signal or handoff retry performed by these source tests. A future diagnostic-only root update requires exact adapter/offline/invoke hashes plus management-source and transaction input manifests updated together, backups and preservation of all failed-run evidence. It does not authorize a fresh handoff.

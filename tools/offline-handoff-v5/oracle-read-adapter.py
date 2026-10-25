@@ -165,5 +165,6 @@ def collect(request,host_exit,root,output,ports,expected_boot,rollback,owner=0,r
         observation=root/'collected-observation.json'
         api.observer.write_atomic(observation,obs)
         return api.decide(request,observation,root,output,ports,rollback,owner)
-    except (OSError,ValueError,TypeError,KeyError,subprocess.SubprocessError):
+    except (OSError,ValueError,TypeError,KeyError,subprocess.SubprocessError) as error:
+        api.report_failure('oracle_read_adapter.collect',error)
         rollback();return False

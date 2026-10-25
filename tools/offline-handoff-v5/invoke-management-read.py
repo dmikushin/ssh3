@@ -57,4 +57,12 @@ def invoke(request,exit_receipt,ports):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--request',required=True);p.add_argument('--host-exit',required=True);p.add_argument('--ports',nargs='+',required=True);x=p.parse_args()
-    raise SystemExit(invoke(x.request,x.host_exit,x.ports))
+    try:
+        result=invoke(x.request,x.host_exit,x.ports)
+    except (OSError,ValueError,TypeError,KeyError) as error:
+        # Safe fallback works even when module bootstrap failed before imports.
+        known=('approved agent socket identity changed','fresh explicit agent approval missing','fresh Oracle boot receipt required','approved identity policy mismatch','root read executor required','coordinator root dispatcher required')
+        message=str(error) if str(error) in known else 'unclassified failure; raw exception data withheld'
+        print('invoke_management_read: '+type(error).__name__+': '+message,file=__import__('sys').stderr,flush=True)
+        result=1
+    raise SystemExit(result)

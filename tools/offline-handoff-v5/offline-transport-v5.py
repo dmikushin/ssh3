@@ -4,7 +4,7 @@
 Production callers must use the fixed trusted observer root and root ownership.
 Tests explicitly inject an isolated root/current uid; observer logic is unchanged.
 """
-import importlib.util,os,stat,time
+import importlib.util,os,re,stat,sys,time
 from pathlib import Path
 B=Path(__file__).parent
 
@@ -38,11 +38,33 @@ def transfer(request,observation,root,output,ports,owner=0):
     receipt=observer.read_owned(root/'receipt.json',owner)
     observer.write_atomic(output,receipt)
 
+def failure_reason(component,error):
+    # Keep known operational validator messages, never arbitrary exception data.
+    known=('approved agent socket identity changed','explicit existing agent approval required','host client exit not verified','collection predates client exit','host barrier refused transferred receipt','required port remains bound','receipt already exists; refusing replacement','unexpected management host','Oracle boot changed','untrusted directory ancestor','pinned management route missing')
+    message=str(error)
+    if message in known:
+        reason=message
+    elif message.startswith('bounded_read: child process exited with returncode='):
+        # bounded_read has already redacted stderr; redact sensitive fragments
+        # again rather than trust a caller-injected arbitrary exception string.
+        reason=message[:8192]
+        reason=re.sub(r'(?i)((?:token|password|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+',r'\1[REDACTED]',reason)
+        reason=re.sub(r'-----BEGIN[\s\S]*PRIVATE KEY[\s\S]*', '[REDACTED PRIVATE KEY]',reason)
+        reason=re.sub(r'(?i)(https?://)[^\s/@]+(?::[^\s/@]*)?@',r'\1[REDACTED]@',reason)
+        reason=re.sub(r'(?i)(authorization\s*:\s*)(?:bearer|basic)\s+[^\r\n]+',r'\1[REDACTED]',reason)
+    else:
+        reason='unclassified failure; raw exception data withheld'
+    return f'{component}: {type(error).__name__}: {reason[:4096]}'
+
+def report_failure(component,error):
+    print(failure_reason(component,error),file=sys.stderr,flush=True)
+
 def decide(request,observation,root,output,ports,rollback,owner=0):
     try:
         transfer(request,observation,root,output,ports,owner)
         req=observer.read_owned(request,owner)
         if not barrier.validate(output,req,ports,time.time_ns(),owner):raise ValueError('host barrier refused transferred receipt')
-    except (OSError,ValueError,TypeError,KeyError):
+    except (OSError,ValueError,TypeError,KeyError) as error:
+        report_failure('offline_transport.decide',error)
         rollback();return False
     return True
