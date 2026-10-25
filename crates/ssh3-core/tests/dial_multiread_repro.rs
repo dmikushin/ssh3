@@ -55,8 +55,8 @@ enum SinkDone {
 
 /// A sink that hashes the ordered bytes it reads and reports a `SinkDone` on a
 /// oneshot when its read loop ends. It stops reading while `paused` so the
-/// server's receive ring accumulates an unread tail. `connected` fires once a
-/// client connects, so a control test can drive exactly one connection.
+/// server's receive ring accumulates unread buffered bytes. It accepts exactly
+/// one connection (the forwarded stream).
 struct Sink {
     addr: std::net::SocketAddr,
     paused: Arc<AtomicBool>,
@@ -276,17 +276,18 @@ async fn detach_at_second_targeted_read_loses_no_bytes() {
     .await;
 
     // While the reader is STILL PARKED, capture the per-lane snapshot and assert
-    // the epoch advanced and the per-lane backing/ring invariants hold (not just
+    // the epoch advanced and the per-lane ring/backing invariants hold (not just
     // aggregate stats). Log it before releasing the reader.
     let pd = wait_snapshot_epoch_above(2, 0, epoch1).await;
     eprintln!("POST-DETACH (reader still parked) {pd:?}");
     assert!(pd.epoch > epoch1, "detach did not advance the epoch");
     assert_eq!(pd.ring_len, pd.received - pd.delivered, "post-detach ring invariant");
     assert!(pd.received >= pd.delivered, "post-detach received>=delivered");
-    assert!(pd.reserve + pd.free_cover >= pd.limit - pd.received, "post-detach credit backed");
-    // Retracted to the intended floor: limit - received is at most the floor
-    // grant (lane_floor); allow the floor chunk budget as the ceiling.
-    assert!(pd.limit - pd.received <= pd.free_cover + pd.reserve, "post-detach limit not backed to floor");
+    // Backing preserved after the retract: the advertised credit the server
+    // still holds is covered by reserve + free_cover. (This asserts backing
+    // only; it does NOT claim the limit was bounded to the configured
+    // lane_floor — the detach-retract target is a separate concern.)
+    assert!(pd.reserve + pd.free_cover >= pd.limit - pd.received, "post-detach backing preserved");
 
     // Release the parked read #2: it reacquires, sees st.epoch != epoch, drops
     // the stale read. The connection must not be cut by a panic.
