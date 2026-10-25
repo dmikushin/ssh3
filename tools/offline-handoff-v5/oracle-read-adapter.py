@@ -33,6 +33,14 @@ def parse_snapshot(data,ports,expected_boot):
     if take()!='COMPLETE' or i!=len(lines):raise ValueError('incomplete/trailing snapshot')
     return sorted(set(bound))
 
+def redacted_stderr(data):
+    text=data.decode('utf-8',errors='replace')
+    text=re.sub(r'-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)', '[REDACTED PRIVATE KEY]', text)
+    text=re.sub(r'(?i)(https?://)[^\s/@]+(?::[^\s/@]*)?@', r'\1[REDACTED]@', text)
+    text=re.sub(r'(?i)(authorization\s*:\s*)(?:bearer|basic)\s+[^\r\n]+', r'\1[REDACTED]', text)
+    text=re.sub(r'(?i)((?:access[_-]?token|api[_-]?key|password|secret|token)\s*[=:]\s*)[^\s,;]+', r'\1[REDACTED]', text)
+    return text[:4096] + (' [stderr truncated]' if len(text)>4096 else '')
+
 def bounded_read(argv,script,seconds=5):
     p=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
@@ -53,7 +61,10 @@ def bounded_read(argv,script,seconds=5):
                 if not block:sel.unregister(key.fileobj);continue
                 streams[key.fileobj].extend(block)
                 if len(streams[key.fileobj])>65536:raise ValueError('SSH output cap exceeded')
-        if p.wait(timeout=max(.01,deadline-time.monotonic()))!=0:raise ValueError('SSH collector failed')
+        returncode=p.wait(timeout=max(.01,deadline-time.monotonic()))
+        if returncode!=0:
+            diagnostic=redacted_stderr(bytes(streams[p.stderr]))
+            raise ValueError(f'bounded_read: child process exited with returncode={returncode}; stderr={diagnostic!r}')
         return bytes(streams[p.stdout])
     finally:
         if p.poll() is None:p.kill();p.wait()
