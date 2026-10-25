@@ -1,0 +1,42 @@
+SOURCE_ONLY_PREPARATION_NOT_DEPLOYABLE
+
+Frozen source wrappers: stage-management-read.sh, invoke-management-read.py,
+copyback-management-receipt.py. Test: test-management-bootstrap.py. No actual
+approval/listing, TCP2221 host pin, boot observation or runtime identity included.
+The existing oracle-management-agent.conf.in remains a NON-RUNNABLE template;
+coordinator must use the explicitly approved resolved socket in new management
+config, not change the user's existing alias. No private key is copied.
+
+Before any root launch the coordinator must review and pin these scripts and
+all input ancestors/root ownership. Python wrappers validate fixed root/source
+parents and bounded immutable regular adapter modules BEFORE importing them.
+The wrapper interpreter and script themselves still need trusted root dispatch.
+
+STAGING.sha256 is NOT supplied: it must cover actual reviewed staging inputs,
+not fabricated credentials. Generate only in a reviewed root-owned input dir:
+
+sha256sum oracle-read-adapter.py offline-transport-v5.py \
+ observe-release-frozen-4bbe.py receipt-barrier-v5.py \
+ management-agent-policy.py collect-oracle-ports.sh management-read.conf \
+ invoke-management-read.py copyback-management-receipt.py \
+ tcp2221-known_hosts agent-approval.json oracle-boot.json > STAGING.sha256
+
+Those actual input files must be independently authenticated/pinned before
+trusting a generated checksum. Every listed filename is required exactly once.
+The stage script installs immutable source at
+/var/lib/ssh3-rs-management-read-20261025/source and wrappers invoke.py/copyback.py.
+Source dependencies already exist in this checkpoint. ROOT-STAGING-SOURCE.sha256
+records relative frozen source hashes, NOT runtime staging admission.
+
+The invocation deliberately refuses without root, immutable host request/exit
+evidence, fresh actual agent approval, fresh boot evidence and root-owned
+management config/pins. It reports ROLLBACK_REQUIRED on failure but does NOT
+execute host rollback; admitted controller orchestration must enforce it.
+Copyback validates the collected receipt against the actual host transaction
+before exclusive mode0400 publication. No genuine host exit has been supplied.
+
+Missing: actual root dispatcher/staging and source hash pins, request/client-exit
+producer and controller orchestration, independently collected current facts,
+unknown UDP64446 consumers and actual caller-route handoff. These are HARD
+BLOCKERS, not waived by bootstrap tests. No remote command, service/signal,
+production staging or network authentication is claimed by this checkpoint.
