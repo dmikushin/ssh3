@@ -434,20 +434,34 @@ impl Lane {
     /// Copy `data` into the receive ring and account it, under the already-held
     /// lane lock.
     ///
-    /// **All-or-nothing.** The ring and `received` must move together, or the
-    /// receive-ring invariant `rbuf.len() == received - delivered` breaks: the
-    /// old code committed each chunk into the ring and only advanced `received`
-    /// after the whole copy, so when storage ran out part way through (a
-    /// RetractAck or detach released the reservation that backed the credit
-    /// between the grant and this read, and the floor pool was full),
+    /// **All-or-nothing (atomicity).** The ring and `received` must move
+    /// together, or the receive-ring invariant `rbuf.len() == received -
+    /// delivered` breaks. The PROVEN defect is an atomicity failure: the old
+    /// code committed each chunk into the ring and advanced `received` only
+    /// after the whole copy, so IF storage ran out part way through,
     /// `recv_chunk` returned `None` mid-loop and the error left bytes in the
-    /// ring that `received` never counted. Those bytes were later delivered,
-    /// driving `delivered > received` and overflowing `recv_ring_bytes`.
+    /// ring that `received` never counted. The ring then exceeds `received -
+    /// delivered`; those bytes are later delivered, driving `delivered >
+    /// received` and overflowing `recv_ring_bytes`. This is demonstrated by
+    /// `recv_commit_partial_storage_does_not_leak_ring_bytes` (old FAIL / new
+    /// PASS).
     ///
-    /// Here every tail is acquired first. Only once storage for the entire
-    /// chunk is in hand is anything committed to the ring; on shortfall the
-    /// acquired tails are dropped (their permits returned) and the ring is
-    /// untouched, so a reported error never corrupts the accounting.
+    /// What triggers the mid-loop storage shortfall in the field is NOT
+    /// established. A storage shortfall was observed in the 1000-session run
+    /// (PROBE no storage: reserve=0, rfloor=2, retract=false, epoch=0), but the
+    /// conforming-peer cause is UNRESOLVED: a deterministic async reproducer
+    /// driving a conforming RetractAck into the real quic_reader lock-drop
+    /// window does NOT reproduce it on either the old or the fixed code (both
+    /// pass), because `on_retract_ack` keeps `limit >= sent` so the resumed
+    /// reader finds `received + n <= limit` with storage still covering
+    /// `[received, sent)`; and the detach path bumps the epoch, so the stale
+    /// read is dropped by the epoch guard. Do not describe RetractAck or detach
+    /// as the established cause of removed backing storage.
+    ///
+    /// Regardless of the trigger, this fix makes the commit atomic: every tail
+    /// is acquired first, and only once storage for the whole chunk is in hand
+    /// is anything committed to the ring. A shortfall then surfaces as a clean
+    /// error with the ring's accounting left intact instead of corrupted.
     fn recv_commit(&self, st: &mut LaneState, data: &[u8]) -> Result<()> {
         let n = data.len();
         if n == 0 {
@@ -468,9 +482,20 @@ impl Lane {
                     tails.push(t);
                 }
                 None => {
-                    // Shortfall: return the partial tail (if it was ours) so
-                    // the ring is exactly as it was, then report the error.
-                    // Dropping `tails` returns every acquired permit.
+                    // Shortfall: report the error. Dropping `tails` returns
+                    // every acquired permit.
+                    //
+                    // PENDING (flagged for consultant acc0's measured verdict,
+                    // do NOT change logic here yet): an earlier comment claimed
+                    // this path returns the pre-existing tail "so the ring is
+                    // exactly as it was". It does NOT — a tail taken via
+                    // `take_tail` above is in `tails` and is dropped here, so a
+                    // pre-existing (possibly non-floor) tail chunk is released
+                    // rather than restored. `received`/`delivered` and the ring
+                    // contents are unchanged (nothing was committed), so the
+                    // accounting invariant still holds; only the spare tail
+                    // capacity differs. Whether that spare should be restored
+                    // awaits the consultant's tail-behaviour review.
                     return Err(Error::Protocol(format!(
                         "lane {}/{}: internal: credit granted without storage",
                         self.chan_id, self.lane
@@ -1376,24 +1401,29 @@ mod tests {
         st.received >= st.delivered && st.rbuf.len() as u64 == st.received - st.delivered
     }
 
-    /// REPRO: receive-reserve/commit interleaving leaks ring bytes.
+    /// REPRO: the PROVEN atomicity failure — a mid-loop storage shortfall
+    /// leaks ring bytes.
     ///
-    /// `recv_task` commits the incoming chunk into `rbuf` segment by segment
-    /// and only afterwards does `received += n`. If storage runs out part way
-    /// through the chunk — the lane has `limit - received >= n` credit, but a
-    /// concurrent `lower_limit`/`recompute_limit` (RetractAck, or detach +
-    /// `retract_unilaterally` on carrier death) released the reservation that
-    /// backed it, and the per-lane floor pool is full — `recv_chunk` returns
-    /// `None` mid-loop and the `?` returns the error with bytes ALREADY in the
-    /// ring but `received` never advanced.
+    /// The old `recv_task` committed the incoming chunk into `rbuf` segment by
+    /// segment and advanced `received += n` only afterwards. IF storage runs
+    /// out part way through the chunk — credit says the bytes are allowed, but
+    /// `recv_chunk` returns `None` because neither the reservation nor the
+    /// floor pool can supply the next chunk — the `?` returns the error with
+    /// bytes ALREADY in the ring but `received` never advanced.
     ///
     /// The ring then holds more bytes than `received - delivered`. The sink
-    /// keeps delivering them, so `delivered` overruns `received` (observed:
-    /// delivered 5671402 > received 5671126, by exactly the leaked sub-chunk
-    /// remainder), `recv_ring_bytes` wraps, and the stats sum overflow-panics.
+    /// keeps delivering them, so `delivered` overruns `received` (field
+    /// observation: delivered 5671402 > received 5671126), `recv_ring_bytes`
+    /// wraps, and the overflow-checked stats sum panics.
     ///
-    /// This drives the exact committed-but-uncounted path deterministically:
-    /// a chunk is granted with credit but storage covers only part of it.
+    /// This test drives the committed-but-uncounted path deterministically by
+    /// presenting a read whose credit exceeds the storage on hand. NOTE: the
+    /// state is set directly to isolate the atomicity bug; it is NOT a claim
+    /// that a conforming peer reaches this shortfall by any particular path.
+    /// How a conforming peer could make `limit - received` exceed `reserve +
+    /// free_cover` in the field is UNRESOLVED (see `recv_commit` and the async
+    /// reproducer): neither a RetractAck nor a detach in the real quic_reader
+    /// lock-drop window reproduces it. The atomicity fix is correct regardless.
     #[test]
     fn recv_commit_partial_storage_does_not_leak_ring_bytes() {
         let recv = Lane::new(2, 0, env());
@@ -1401,8 +1431,9 @@ mod tests {
         // One read of 2*CH + 276 bytes. Credit (limit - received) covers it,
         // but storage covers only 2*CH: reserve is empty and the two floor
         // chunks are the only backing, so the third chunk request fails
-        // mid-loop — exactly as when a RetractAck/detach released the
-        // reservation between the credit grant and this read.
+        // mid-loop. This storage-shortfall state is set directly to isolate
+        // the atomicity bug; it is NOT asserted that a conforming peer reaches
+        // it via a RetractAck or detach (that trigger is unresolved).
         let remainder = 276usize;
         let n: usize = 2 * CHUNK + remainder;
         {
@@ -1745,46 +1776,27 @@ mod tests {
         }
     }
 
-    /// FORCED ORDER F — REAL-STATE causality for the production shortfall
-    /// `PROBE no storage chan=2 lane=0 off=276 n=1420 received=5671126
-    ///  delivered=5600136 limit=5685248 rbuf=71266 reserve=0 rfloor=2
-    ///  granted=65536 epoch=0 retract=false`
-    /// (mem-run/server-1000-flow-kill.log:1002).
+    /// MEASURING TEST — storage cover vs advertised credit on conforming
+    /// receive. Motivated by the field shortfall
+    /// `PROBE no storage ... received=5671126 delivered=5600136 limit=5685248
+    ///  reserve=0 rfloor=2 epoch=0 retract=false` (mem-run:1002), whose state
+    /// is reserve=0 with both floor chunks pinned yet `limit - received`
+    /// positive.
     ///
-    /// The field line has NO retract and NO epoch change at the shortfall: it
-    /// is reserve=0 with BOTH floor chunks pinned, yet `limit - received`
-    /// positive, and `rbuf - (received - delivered) = 71266 - 70990 = 276`,
-    /// i.e. the invariant was ALREADY off by exactly the bytes committed in the
-    /// current partial loop. This test reproduces that causal chain on the
-    /// REAL `recv_commit`, no fabricated credit:
+    /// HYPOTHESIS TESTED AND REFUTED: that ordinary conforming receive opens a
+    /// gap between credit and storage cover (e.g. via floor-chunk granularity).
+    /// It does NOT. MEASURED on the real code: conforming receive keeps
+    /// `limit - received` EXACTLY equal to `reserve + free_cover` at every
+    /// step, because a partially-filled floor chunk's unused tail stays counted
+    /// in `free_cover` via `tail_space`. So a single-threaded conforming
+    /// sequence CANNOT produce the field state.
     ///
-    ///   1. grant via the real `recompute_limit`.
-    ///   2. a first read whose storage runs out mid-loop. On the OLD code this
-    ///      LEAKS: it pins floor chunks and commits bytes into the ring WITHOUT
-    ///      advancing `received`. On the FIXED code it errors atomically,
-    ///      leaving the ring and the floor pool untouched.
-    ///   3. observe the state the field log shows: does a floor chunk stay
-    ///      pinned (rfloor raised) while `received` did not advance, so the
-    ///      storage-cover invariant is broken going forward?
-    ///
-    /// Expected: OLD -> leak pins floor, `rbuf > received - delivered`, cover
-    /// shortfall persists (the field state). FIXED -> clean error, floor pool
-    /// released, invariant intact. The test asserts the FIXED behaviour and, on
-    /// the OLD build, FAILS at the same invariant the production probe tripped.
-    ///
-    /// MEASURED RESULT (not a guess): on the real code, conforming receive
-    /// keeps `limit - received` EXACTLY equal to `reserve + free_cover` at
-    /// every step. The partially-filled floor chunk's remaining bytes stay in
-    /// `free_cover` via `tail_space`, so consuming a floor chunk for a small
-    /// read does NOT open a gap. A single-threaded conforming sequence
-    /// therefore CANNOT produce the field state (`reserve=0`, both floor
-    /// chunks pinned, yet `limit - received = 14122`). That state requires one
-    /// of: (a) the partial-commit LEAK, which pins floor chunks while
-    /// committing bytes WITHOUT advancing `received` (covered by
-    /// `recv_commit_partial_storage...`), or (b) a true concurrent lock-drop
-    /// interleaving in `quic_reader` that this single-threaded harness cannot
-    /// create. This test records (a)'s precondition and asserts the tight
-    /// accounting; it does NOT fabricate the gap.
+    /// Consequently the field shortfall is NOT explained by conforming receive
+    /// alone. It requires either (a) the proven partial-commit atomicity leak
+    /// (covered by `recv_commit_partial_storage...`), or (b) some interleaving
+    /// / non-conforming input not reproduced here. This test does NOT fabricate
+    /// a gap and does NOT claim the field trigger is identified; it asserts the
+    /// tight accounting and will start failing if that ever stops holding.
     #[test]
     fn forced_real_state_receive_keeps_credit_equal_to_cover() {
         let recv = Lane::new(2, 0, env());
