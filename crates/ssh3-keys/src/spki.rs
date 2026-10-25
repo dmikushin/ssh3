@@ -71,6 +71,48 @@ pub fn rsa_private_key(k: &ssh_key::private::RsaKeypair) -> Result<rsa::RsaPriva
     Ok(key)
 }
 
+/// Build an OpenSSH `KeypairData::Rsa` from an `rsa::RsaPrivateKey` loaded
+/// from a PEM PKCS#1 / PKCS#8 file.
+///
+/// ssh-key's own `RsaKeypair::try_from(&rsa::RsaPrivateKey)` goes through the
+/// same broken conversion noted on `rsa_private_key` (it mishandles the
+/// primes), so this constructs the `RsaKeypair` field by field from the
+/// validated components: public (n, e) and private (d, iqmp, p, q), where
+/// iqmp = q^-1 mod p is the CRT coefficient the OpenSSH format stores.
+pub fn rsa_to_keypair(sk: &rsa::RsaPrivateKey) -> Result<KeypairData> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+    use ssh_key::Mpint;
+    use ssh_key::private::{RsaKeypair, RsaPrivateKey};
+    use ssh_key::public::RsaPublicKey;
+
+    sk.validate().map_err(|e| Error::Pkcs8(format!("RSA key invalid: {e}")))?;
+    let primes = sk.primes();
+    if primes.len() != 2 {
+        return Err(Error::Pkcs8(format!(
+            "RSA key has {} prime factors; only 2-prime RSA is supported",
+            primes.len()
+        )));
+    }
+    let iqmp = sk
+        .crt_coefficient()
+        .ok_or_else(|| Error::Pkcs8("RSA key lacks a CRT coefficient (iqmp)".into()))?;
+    let mp = |b: rsa::BigUint, what: &str| {
+        Mpint::from_positive_bytes(&b.to_bytes_be()).map_err(|e| Error::Pkcs8(format!("RSA {what}: {e}")))
+    };
+    let public = RsaPublicKey {
+        e: mp(sk.e().clone(), "e")?,
+        n: mp(sk.n().clone(), "n")?,
+    };
+    let private = RsaPrivateKey {
+        d: mp(sk.d().clone(), "d")?,
+        iqmp: mp(iqmp, "iqmp")?,
+        p: mp(primes[0].clone(), "p")?,
+        q: mp(primes[1].clone(), "q")?,
+    };
+    let kp = RsaKeypair { public, private };
+    Ok(KeypairData::Rsa(kp))
+}
+
 /// Convert a DER SubjectPublicKeyInfo into an OpenSSH public key.
 pub fn public_key_from_spki(spki_der: &[u8]) -> Result<PublicKey> {
     let data = if let Ok(k) = ed25519_dalek::VerifyingKey::from_public_key_der(spki_der) {
