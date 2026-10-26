@@ -1,0 +1,90 @@
+--- saved-mux-controller-47b167.py
++++ controller-mux-recovery.py
+@@ -45,8 +45,11 @@
+  os.link(tmp,p);tmp.unlink();fd=os.open(ROOT,os.O_RDONLY|os.O_DIRECTORY)
+  try:os.fsync(fd)
+  finally:os.close(fd)
++def runtime():
++ immutable(ROOT/'runtime.json')
++ return json.loads((ROOT/'runtime.json').read_text())
+ def identity(role):
+- snapshot=json.loads((ROOT/'runtime.json').read_text());r=snapshot['roles'][role]
++ snapshot=runtime();r=snapshot['roles'][role]
+  if Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=snapshot['boot_id']:raise ValueError('boot changed')
+  if run('/usr/bin/docker','inspect','--format','{{.Id}}',CONTAINER)!=snapshot['container_id']:raise ValueError('container changed')
+  init=snapshot['roles']['init']
+@@ -70,6 +73,33 @@
+   completed=time.time_ns()
+   write('operation-'+role+'-'+sig.name+'-'+str(completed)+'.json',dict(role=role,pid=rec['pid'],start=rec['start'],old_exe_sha256=rec['exe_sha256'],signal=sig.name,operation_returncode=0,attempted_at_ns=completed))
+   return completed
++def process_state(rec,allow_absent=False):
++ try:fields=(Path('/proc')/str(rec['pid'])/'stat').read_text().rsplit(') ',1)[1].split()
++ except FileNotFoundError:
++  if allow_absent:return None
++  raise
++ if fields[19]!=rec['start']:raise ValueError('rollback process PID was reused')
++ return fields[0]
++def managed_child_alive(supervisor):
++ old=runtime()['roles']['go']
++ try:children=(Path('/proc')/str(supervisor['pid'])/'task'/str(supervisor['pid'])/'children').read_text().split()
++ except FileNotFoundError:return False
++ for pid in children:
++  try:
++   proc=Path('/proc')/pid;fields=(proc/'stat').read_text().rsplit(') ',1)[1].split()
++   if fields[0] in ('Z','X') or int(fields[1])!=supervisor['pid']:continue
++   if hashlib.sha256((proc/'exe').read_bytes()).hexdigest()!=old['exe_sha256']:continue
++   if str((proc/'ns/net').readlink())!=runtime()['netns']:continue
++   return True
++  except FileNotFoundError:continue
++ return False
++def resume_verified(role,rec):
++ identity(role)
++ stamp=time.time_ns()
++ write('before-'+role+'-SIGCONT-'+str(stamp)+'.json',dict(pid=rec['pid'],start=rec['start'],signal='SIGCONT',observed_at_ns=stamp))
++ os.kill(rec['pid'],signal.SIGCONT)
++ completed=time.time_ns()
++ write('operation-'+role+'-SIGCONT-'+str(completed)+'.json',dict(pid=rec['pid'],start=rec['start'],signal='SIGCONT',operation_returncode=0,attempted_at_ns=completed))
+ def cancel():
+  with hostlock():
+   if (ROOT/'accepted.json').exists() and not (ROOT/'rollback-begun.json').exists():
+@@ -81,7 +111,39 @@
+   if not (ROOT/'rollback-begun.json').exists():write('rollback-begun.json',dict(at_ns=time.time_ns()))
+  # Container gate serializes cancellation with delayed DockerExec launch.
+  run('/usr/bin/docker','exec',CONTAINER,'bash',S+'/gate.sh','cancel')
+- send('autossh',signal.SIGCONT);send('watchdog',signal.SIGCONT)
++ # Serialize partial rollback decisions, not only individual signals.
++ with hostlock():
++  rec,_=identity('autossh')
++  state=process_state(rec)
++  old_go=runtime()['roles']['go']
++  child_state=process_state(old_go, allow_absent=True)
++  if state=='T':
++   if child_state in (None,'Z'):
++    stamp=time.time_ns()
++    write('before-autossh-SIGUSR1-'+str(stamp)+'.json',dict(pid=rec['pid'],start=rec['start'],signal='SIGUSR1',observed_at_ns=stamp))
++    identity('autossh')
++    if process_state(rec)!='T':raise ValueError('supervisor changed state before queued restart')
++    os.kill(rec['pid'],signal.SIGUSR1)
++    completed=time.time_ns()
++    write('operation-autossh-SIGUSR1-'+str(completed)+'.json',dict(pid=rec['pid'],start=rec['start'],signal='SIGUSR1',operation_returncode=0,attempted_at_ns=completed))
++   identity('autossh')
++   resume_verified('autossh',rec)
++  elif state not in ('S','R','D','I'):
++   raise ValueError('unsupported autossh rollback state')
++ # A running supervisor with a pending clean SIGCHLD is not yet recovery.
++ # Require a verified managed child before releasing a stopped watchdog.
++ deadline=time.monotonic()+3
++ while not managed_child_alive(rec):
++  identity('init');identity('autossh')
++  if time.monotonic()>=deadline:raise ValueError('autossh has not restored a verified managed child')
++  time.sleep(0.02)
++ with hostlock():
++  identity('init');identity('autossh')
++  if not managed_child_alive(rec):raise ValueError('managed child disappeared before watchdog recovery')
++  watch,_=identity('watchdog')
++  state=process_state(watch)
++  if state=='T':resume_verified('watchdog',watch)
++  elif state not in ('S','R','D','I'):raise ValueError('unsupported watchdog rollback state')
+  print('ROLLBACK_RESUMED_UNVERIFIED',flush=True)
+ def load_management():
+  immutable(ROOT/'management-source.sha256')

@@ -1,0 +1,35 @@
+Frozen successful integration source: full-rust-handoff-fixture.py
+SHA256 059622ad35e7de7ee6d56ea1aa9f51e3a18689791445ce1ca8d82d350779c070
+
+This is an exact copy of the measured scratch fixture, NOT a relocatable test.
+Do not execute it directly from this checkpoint: its relative external artifact
+paths assume the original scratch layout. Its real execution was:
+  sudo -n python3 ~/scratch/ssh-udp/rollout-20261025/full-rust-handoff-fixture.py
+TaskOutput bpmttb16x completed rc0. Detailed bounded findings are in
+FULL-RUST-HANDOFF-RESULT.txt. No runtime JSON, key, pin or executable is committed.
+
+Required original scratch dependencies:
+- rollout-build-20261025/dist/ssh3-server, SHA8c6f7e1d... (57bd).
+- keyfmt2-wt/dist/ssh3, SHA22d7ae4e... (12faaaa).
+- rollout-20261025/controller-mux-recovery.py, exact same bytes as the included
+  controller-partial-recovery.py SHA9499690b....
+- rollout-20261025/container-gate-cancel-fix.sh, included source SHA46fbacc....
+- rollout-20261025/fixture-ssh.c, included synthetic baseline source.
+- primary-cutover-20261025/hosts/fsync-path, compiled from included fsync-path.c.
+Frozen integration artifact hashes (relative source names):
+059622ad35e7de7ee6d56ea1aa9f51e3a18689791445ce1ca8d82d350779c070  full-rust-handoff-fixture.py
+dc475f0bed80bd8b41bfcea7af1eb2c60c1112176fa53eaed9de65f587b42082  controller-mux-recovery.patch
+
+Independent read-only review accepted only the measured finite scope: real
+HTTP forwarding through both endpoints and cancel()/repeat-cancel stability.
+It did not evaluate full execute/auth/MUX/remote-release/accept or establish the
+historical production EmptyReply cause. No production deployment is authorized.
+
+The fixture creates its own synthetic credentials and never reads production keys.
+It uses the cached immutable Docker image named in the source, a dedicated normal
+bridge and a free localhost published port. It makes no public-provider calls.
+
+A relocatable version would require explicit binary inputs and a source-built
+helper, followed by a fresh copied-tree run. That change has NOT been made or
+claimed tested. Independent review may checkpoint this frozen evidence source;
+it must not describe it as a portable replay or production acceptance gate.

@@ -1,0 +1,36 @@
+Finite LOCAL integration terminal result (2026-10-26)
+TaskOutput bpmttb16x: completed rc0, awaited with block=true.
+Fixture source SHA256 059622ad35e7de7ee6d56ea1aa9f51e3a18689791445ce1ca8d82d350779c070
+Merged actual saved MUX controller SHA256 9499690bdc6f68c117feac6023c8c0643f79f4683fcc6588a0d1324eafeb153e
+Diff against actual saved 47b167 SHA256 dc475f0bed80bd8b41bfcea7af1eb2c60c1112176fa53eaed9de65f587b42082
+Terminal log SHA256 5ea697b1e9df017c9068b8a775451ab5f49ff3fdeed605ae0bde1ccf754a0bae
+
+Real Rust client: accepted PKCS1-fixed 12faaaa binary SHA22d7ae4e...
+Real Rust server: accepted 57bd binary SHA8c6f7e1d...
+Cached actual image sha256:d12354e0ce77f49e911084e77da10865fbaa4aac19129a2fab366dce15df37fc.
+Normal dedicated Docker bridge (not host network); own published free host port
+and direct container-IP endpoint. No production hosts/provider requests.
+
+Terminal measurements:
+- Synthetic original carrier baseline returned HTTP200, Content-Length0 on both endpoints.
+- Real Rust -L: each upstream request85B, complete response82B; both published
+  localhost and direct container IP delivered exact24B body with HTTP200.
+- Backend events capture request/response/close timestamps. Two requests, no backend errors.
+- Injected local failed-postcheck event then actual controller cancel:
+  queued SIGUSR1 before CONT; same init3265625; one replacement synthetic Go3266426;
+  HTTP200 restored on both endpoints; repeated rollback preserves same child/starttime.
+- No unexpected cancel exceptions are swallowed. Actual production runtime accessor
+  reads a fixture runtime file. Only local parent anchor and identities are adapted.
+
+Limits:
+This script executes real Rust launch plus actual rollback cancel, NOT full production
+execute/auth/MUX/remote-release/accept orchestration. Those are not certified here.
+Synthetic original Go termination exit0 is controlled, not historical field evidence.
+Rust client logs only 'ssh3-rs: OK'; internal close cause/EOF timestamp is NOT available.
+Full upstream200 path passed once; field curl52 cause remains unresolved.
+
+Preflight fixture corrections are preserved separately: watchdog probe env missing;
+readiness tested PID not LISTEN; synthetic baseline has zero-length body; Docker internal
+bridge did not publish the configured port in this environment. Final normal bridge
+matches required DNAT semantics. None of these is a claimed field failure cause.
+All owned fixture server/container/network were cleaned; production was untouched.
