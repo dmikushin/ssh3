@@ -1,0 +1,54 @@
+--- gate.sh
++++ gate.sh
+@@ -16,22 +16,36 @@
+   if [[ -f $S/rust.pid ]]; then
+    read -r p birth < "$S/rust.pid"
+    [[ $p =~ ^[1-9][0-9]*$ && $p != 1 ]] || exit 1
+-   if [[ -e /proc/$p/stat ]]; then
+-    if [[ $(start_of "$p") != "$birth" ]]; then
+-     printf 'recorded Rust PID reused; refusing signal\n' >&2; exit 1
++   snapshot() {
++    local raw
++    if raw=$(cat "/proc/$p/stat"); then
++     raw=${raw##*) }; read -ra state_fields <<< "$raw"
++     [[ ${state_fields[19]} == "$birth" ]] || { printf 'recorded Rust PID reused; refusing signal\n' >&2; return 2; }
++     [[ ${state_fields[0]} != Z ]] || return 3
++     return 0
+     fi
+-    printf 'container gate: terminating owned launcher/Rust PID=%s start=%s\n' "$p" "$birth"
+-    kill -TERM "$p"
+-    exited=no
+-    for attempt in {1..30}; do
+-     if [[ ! -e /proc/$p/stat ]]; then exited=yes; break; fi
+-     state=$(cat "/proc/$p/stat"); state=${state##*) }
+-     if [[ ${state%% *} == Z ]]; then exited=yes; break; fi
+-     [[ $(start_of "$p") == "$birth" ]] || exit 1
+-     sleep 0.1
+-    done
+-    [[ $exited == yes ]] || exit 1
+-   fi
++    # ENOENT after a prior existence check is normal process exit. Any read
++    # failure while the PID still exists remains fatal, never silently ignored.
++    [[ ! -e /proc/$p/stat ]] && return 3
++    printf 'container gate: cannot read owned process identity\n' >&2; return 2
++   }
++   rc=0; snapshot || rc=$?
++   case $rc in
++    3) ;; # Already gone/zombie: cancellation is idempotent.
++    0)
++     printf 'container gate: terminating owned launcher/Rust PID=%s start=%s\n' "$p" "$birth"
++     if ! kill -TERM "$p"; then
++      rc=0; snapshot || rc=$?
++      [[ $rc == 3 ]] || exit 1
++     fi
++     exited=no
++     for attempt in {1..30}; do
++      rc=0; snapshot || rc=$?
++      case $rc in 3) exited=yes; break;; 0) sleep 0.1;; *) exit 1;; esac
++     done
++     [[ $exited == yes ]] || exit 1;;
++    *) exit 1;;
++   esac
+   fi
+   printf 'CANCELLED_OWNED_PROCESS_EXITED\n'; exit 0;;
+  launch)

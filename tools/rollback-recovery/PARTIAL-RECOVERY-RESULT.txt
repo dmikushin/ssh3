@@ -1,0 +1,29 @@
+Scoped LOCAL rollback correction, 2026-10-26
+Candidate controller SHA256 9499690bdc6f68c117feac6023c8c0643f79f4683fcc6588a0d1324eafeb153e
+Partial-phase patch SHA256 675d971c63bd72acbe2cae271d6773c6271a691916557ddbdf7edac25635f496
+Real strict fixture SHA256 ff45dcbe514f02c19992c820e796d90f216842b6b140e37ec399f1ef9f479f78
+Runtime-accessor differential test SHA256 3e9d561347a9c444041e48d49b1c2d408bb6e2b88338371aa0ebdea202f00ed7
+
+Actual TaskOutput bphk44uxz completed rc0: five real isolated Docker cases.
+Cases: before-stop; only-autossh-stop; both-stop-go-alive; go-exited; autossh-resumed.
+Each calls cancel twice, fails on unexpected exception, checks non-zombie child,
+expected original/replacement PID, stable child starttime after repeated cancel,
+same container init and HTTP200. Immutable runtime.json is written by production
+write(); production runtime() loads it. No runtime function injection remains.
+Only trusted fixture parent anchor and external identity/container paths are adapted.
+Five decision models and repeated cancellation controls also pass.
+OLD missing runtime() produces NameError; corrected actual file accessor passes.
+
+Earlier reported fixture passes injected runtime(), masking my missing function.
+Those earlier passes do not establish production correctness. I own that mistake.
+
+Separate gate TOCTOU patch remains a distinct source/diff (46fbacc...);
+queued recovery after a managed clean child exit is still needed. Ten focused
+failure/fast-cancel repetitions were measured on an earlier narrower candidate,
+not on this exact corrected partial-phase source. Do not transfer that result.
+
+Limits: synthetic child exit status 0 is controlled, not proof of historical Go
+status. Runtime PID reuse fails closed. These five executions are not a general
+signal-order proof. No production processes, Oracle reads, SSH, or services were
+modified in this task. Candidate requires independent review before deployment.
+Logs: real-partial-{before-stop,only-autossh-stop,both-stop-go-alive,go-exited,autossh-resumed}.log

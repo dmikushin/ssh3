@@ -1,0 +1,47 @@
+LOCAL ROLLBACK CANDIDATE — NOT DEPLOYMENT ADMISSION
+
+The controller is a frozen operational candidate, not a generally executable
+CLI. Its production root paths and hashes require independently reviewed runtime
+inputs; no runtime identities, keys, pins or compiled binaries are included.
+Do not run this controller against production from this source checkpoint.
+
+Evidence:
+- OLD missing runtime accessor raises NameError; corrected runtime() loads an
+  immutable runtime.json. Fixtures do not inject runtime().
+- Five partial-phase decision models plus repeated cancellation pass.
+- Five real isolated-container cases pass with strict exception propagation:
+  before STOP; only autossh stopped; both stopped with original child alive;
+  original child exited; autossh resumed with watchdog stopped.
+- Every real case checks same init, one non-zombie managed child, expected
+  original/replacement PID, unchanged child starttime after repeated rollback,
+  and HTTP200. The synthetic transport is not a production SSH3 session.
+- From THIS copied source checkpoint: accessor differential, all decision
+  models/repeats and one real go-exited/repeated rollback case pass.
+
+The real fixture requires root, local cc, Docker and the already cached image
+sha256:d12354e0ce77f49e911084e77da10865fbaa4aac19129a2fab366dce15df37fc.
+It does not pull images and uses --network=none. Supply a unique final argument
+for each invocation; existing work directories deliberately refuse reuse.
+Example LOCAL tests (not production commands):
+  sudo -n python3 test-runtime-accessor.py
+  sudo -n python3 test-partial-recovery.py
+  sudo -n python3 regress-real-partial.py go-exited UNIQUE_RUN_NAME
+
+The candidate's runtime() root guard is unchanged. Fixtures adapt only the
+trusted temporary parent anchor and external process/container identities.
+The gate race correction is kept as a separate source/diff. The missing-runtime
+old controller is a deliberate regression specimen, not a deployment alternative.
+
+Limitations and responsibility:
+I introduced the missing runtime() accessor and earlier injected a fixture
+function that masked the error. Those earlier green runs do not validate the
+candidate. The corrected runs above remove that injection.
+The synthetic clean child exit is controlled, not evidence of the historical
+production Go exit status. Five cases are not a universal signal-order proof.
+The older ten focused repetitions are NOT attributed to this exact candidate.
+Observed PID reuse fails closed, but starttime checks followed by kill do NOT
+eliminate the PID-reuse TOCTOU window; this code does not use pidfd.
+Independent review accepted the scoped controller/accessor/model correction.
+The separate gate race patch does NOT inherit that acceptance and still needs
+its own review. No production rollout, EmptyReply fix or Oracle443 cutover is
+established by these artifacts.
