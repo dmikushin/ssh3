@@ -362,9 +362,13 @@ impl Lane {
         if !st.closed {
             st.closed = true;
             // Opt-in close-cause diagnostics: records the receive accounting at
-            // the instant the lane is torn down. `recv_ring_held` > 0 here means
-            // undelivered received bytes are being DISCARDED by this close — the
-            // field curl-52 "held response dropped" signature. No payload/keys.
+            // the instant the lane is torn down. `recv_ring_held` is the count
+            // of received-but-not-yet-delivered bytes still in the ring at close
+            // (accounting-held). A non-zero value means this close happens with
+            // possible undelivered bytes; it does NOT by itself prove they were
+            // dropped (a close may race an in-flight sink write) nor that this
+            // is the field curl-52 cause — the field cause is unproven. No
+            // payload/keys.
             tracing::debug!(
                 component = "lane::close", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
                 received = st.received, delivered = st.delivered,
@@ -1268,9 +1272,10 @@ impl Lane {
             match fin {
                 None => {
                     // The lane was closed (reset/cancel/completion) while the
-                    // sink had nothing to write. If undelivered bytes remain in
-                    // the ring this is an early close that DROPS a held response
-                    // (the field curl-52 signature); otherwise a clean teardown.
+                    // sink had nothing to write. `ring_held` reports any
+                    // received-but-undelivered bytes still in the ring; a
+                    // non-zero value is a close WITH possible undelivered bytes,
+                    // not a proven drop and not a proven field curl-52 cause.
                     let st = self.st.lock().unwrap();
                     let held = st.rbuf.len() as u64;
                     tracing::debug!(
@@ -1308,12 +1313,14 @@ impl Lane {
                     let n = slice.len() as u64;
                     if let Err(e) = sink.write_all(&slice).await {
                         // Local -L socket write failed (peer of the forward
-                        // reset/closed). The held bytes were received but not
-                        // delivered to the local client.
+                        // reset/closed). `write_all` may have written part of
+                        // the slice before erroring, so `attempted_write_bytes`
+                        // is the slice length offered, not a guaranteed-unwritten
+                        // count.
                         let st = self.st.lock().unwrap();
                         tracing::debug!(
                             component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
-                            received = st.received, delivered = st.delivered, held_unwritten = n,
+                            received = st.received, delivered = st.delivered, attempted_write_bytes = n,
                             reason = "local_sink_write_error", error = %e, "sink exit: local socket write failed"
                         );
                         return Err(e.into());
