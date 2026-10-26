@@ -361,6 +361,16 @@ impl Lane {
         let mut st = self.st.lock().unwrap();
         if !st.closed {
             st.closed = true;
+            // Opt-in close-cause diagnostics: records the receive accounting at
+            // the instant the lane is torn down. `recv_ring_held` > 0 here means
+            // undelivered received bytes are being DISCARDED by this close — the
+            // field curl-52 "held response dropped" signature. No payload/keys.
+            tracing::debug!(
+                component = "lane::close", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                received = st.received, delivered = st.delivered,
+                recv_ring_held = st.rbuf.len() as u64, send_ring_held = st.sbuf.len() as u64,
+                "lane close"
+            );
             self.env.stats.send_ring_bytes.fetch_sub(st.sbuf.len() as u64, Ordering::Relaxed);
             self.env.stats.recv_ring_bytes.fetch_sub(st.rbuf.len() as u64, Ordering::Relaxed);
             self.env.stats.credit_outstanding.fetch_sub(st.limit - st.delivered, Ordering::Relaxed);
@@ -1256,21 +1266,67 @@ impl Lane {
             })
             .await;
             match fin {
-                None => return Ok(()),
+                None => {
+                    // The lane was closed (reset/cancel/completion) while the
+                    // sink had nothing to write. If undelivered bytes remain in
+                    // the ring this is an early close that DROPS a held response
+                    // (the field curl-52 signature); otherwise a clean teardown.
+                    let st = self.st.lock().unwrap();
+                    let held = st.rbuf.len() as u64;
+                    tracing::debug!(
+                        component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                        received = st.received, delivered = st.delivered, ring_held = held,
+                        reason = if held > 0 { "closed_with_undelivered_bytes" } else { "closed_idle" },
+                        "sink exit: lane closed"
+                    );
+                    return Ok(());
+                }
                 Some(true) => {
-                    sink.shutdown().await?;
+                    {
+                        let st = self.st.lock().unwrap();
+                        tracing::debug!(
+                            component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                            received = st.received, delivered = st.delivered, ring_held = st.rbuf.len() as u64,
+                            reason = "peer_fin_all_delivered", "sink exit: clean EOF (LaneFin, shutdown)"
+                        );
+                    }
+                    if let Err(e) = sink.shutdown().await {
+                        let st = self.st.lock().unwrap();
+                        tracing::debug!(
+                            component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                            received = st.received, delivered = st.delivered, reason = "sink_shutdown_error",
+                            error = %e, "sink exit: local shutdown failed"
+                        );
+                        return Err(e.into());
+                    }
                     self.st.lock().unwrap().sink_done = true;
                     self.done.notify_waiters();
                     return Ok(());
                 }
                 Some(false) => {
                     let slice = buf.take().expect("a slice to deliver");
-                    sink.write_all(&slice).await?;
                     let n = slice.len() as u64;
+                    if let Err(e) = sink.write_all(&slice).await {
+                        // Local -L socket write failed (peer of the forward
+                        // reset/closed). The held bytes were received but not
+                        // delivered to the local client.
+                        let st = self.st.lock().unwrap();
+                        tracing::debug!(
+                            component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                            received = st.received, delivered = st.delivered, held_unwritten = n,
+                            reason = "local_sink_write_error", error = %e, "sink exit: local socket write failed"
+                        );
+                        return Err(e.into());
+                    }
                     let mut st = self.st.lock().unwrap();
                     // Release the chunk only after the ring has dropped it
                     // too: the slice keeps its permit until here.
                     if st.closed {
+                        tracing::debug!(
+                            component = "lane::sink_task", chan = self.chan_id, lane = self.lane, epoch = st.epoch,
+                            received = st.received, delivered = st.delivered, just_written = n,
+                            reason = "closed_during_write", "sink exit: lane closed mid-delivery"
+                        );
                         return Ok(());
                     }
                     st.rbuf.drain(n as usize);
